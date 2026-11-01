@@ -134,6 +134,7 @@ data class MockUploadedFile(
     val name: String,
     val sizeBytes: Long,
     val mimeType: String,
+    val appProperties: Map<String, String> = emptyMap(),
 )
 
 /**
@@ -179,10 +180,10 @@ class GoogleDriveCloudClient(
                 // 1. Ensure/get media folder
                 val mediaFolderId = ensureSubfolder("media", rootFolderId, token)
 
-                // 2. Duplicate avoidance check in remote media folder
-                val existingFileId = findFileInFolder(originalFileName, mediaFolderId, token)
+                // 2. Duplicate avoidance check in remote media folder using stable Reelix item identity
+                val existingFileId = findMediaFileByItemId(itemId, mediaFolderId, token)
                 if (existingFileId != null) {
-                    ReelixLog.d("File $originalFileName already uploaded to Drive (id=$existingFileId); reusing")
+                    ReelixLog.d("Media for item $itemId already uploaded to Drive (id=$existingFileId); reusing")
                     return@withContext CloudUploadResult.Success(driveFileId = existingFileId, sizeBytes = file.length())
                 }
 
@@ -261,6 +262,10 @@ class GoogleDriveCloudClient(
                     val metadata = JSONObject().apply {
                         put("name", originalFileName)
                         put("parents", org.json.JSONArray().put(mediaFolderId))
+                        put("appProperties", JSONObject().apply {
+                            put("reelix_item_id", itemId)
+                            put("reelix_type", "media")
+                        })
                     }
 
                     fun buildInitRequest(authToken: String): Request = Request.Builder()
@@ -530,6 +535,19 @@ class GoogleDriveCloudClient(
         }
     }
 
+    private fun findMediaFileByItemId(itemId: String, folderId: String, token: String): String? {
+        val q = "'$folderId' in parents and appProperties has { key='reelix_item_id' and value='$itemId' } and trashed = false"
+        val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id,name,appProperties)"
+        val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $token").get().build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val json = JSONObject(resp.body?.string().orEmpty())
+            val arr = json.optJSONArray("files") ?: return null
+            if (arr.length() == 0) return null
+            return arr.getJSONObject(0).getString("id")
+        }
+    }
+
     private fun findFileInFolder(name: String, folderId: String, token: String): String? {
         val q = "name = '$name' and '$folderId' in parents and trashed = false"
         val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
@@ -563,11 +581,20 @@ class MockCloudSyncClient(
         itemId: String,
     ): CloudUploadResult {
         if (!isEnabled) return CloudUploadResult.Failure("Cloud client is disabled")
+
+        // 1. Duplicate avoidance check by reelix_item_id in appProperties (NOT by filename alone)
+        val existing = uploadedFiles.entries.firstOrNull { (_, f) ->
+            f.appProperties["reelix_item_id"] == itemId
+        }
+        if (existing != null) {
+            return CloudUploadResult.Success(driveFileId = existing.key, sizeBytes = existing.value.sizeBytes)
+        }
+
         val uploadKey = buildResumableUploadKey(file, itemId)
         val existingSession = resumableStore.getSessionUri(uploadKey)
 
         if (simulateInterruptionOnce && existingSession == null) {
-            val sessionUri = "https://mock.upload.drive/resumable/${file.name}"
+            val sessionUri = "https://mock.upload.drive/resumable/${itemId}/${file.name}"
             resumableStore.saveSessionUri(uploadKey, sessionUri)
             simulateInterruptionOnce = false
             return CloudUploadResult.Failure("Upload interrupted (simulated network failure)")
@@ -580,11 +607,15 @@ class MockCloudSyncClient(
             lastUploadedOffset = 0L
         }
 
-        val fileId = "drive_${System.currentTimeMillis()}_${file.name}"
+        val fileId = "drive_${itemId}_${System.currentTimeMillis()}_${file.name}"
         uploadedFiles[fileId] = MockUploadedFile(
             name = originalFileName,
             sizeBytes = file.length(),
             mimeType = mimeType,
+            appProperties = mapOf(
+                "reelix_item_id" to itemId,
+                "reelix_type" to "media",
+            ),
         )
         return CloudUploadResult.Success(driveFileId = fileId, sizeBytes = file.length())
     }

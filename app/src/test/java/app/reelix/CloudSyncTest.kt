@@ -621,4 +621,120 @@ class CloudSyncTest {
         val straySearch = container.savedItemRepository.search("Astrophysics", ItemQuery()).first()
         assertTrue(straySearch.none { it.id == itemId })
     }
+
+    @Test
+    fun sameItemSameFileRepeatedUploadReusesExistingDriveFile() = runTest {
+        val client = app.reelix.cloud.MockCloudSyncClient()
+        val testFile = File(testMediaDir, "repeat_video.mp4").apply {
+            writeBytes("repeated upload payload".toByteArray())
+        }
+
+        val res1 = client.uploadMedia(testFile, "video/mp4", "video.mp4", "item-repeat-1")
+        assertTrue(res1 is app.reelix.cloud.CloudUploadResult.Success)
+        val fileId1 = (res1 as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+
+        val res2 = client.uploadMedia(testFile, "video/mp4", "video.mp4", "item-repeat-1")
+        assertTrue(res2 is app.reelix.cloud.CloudUploadResult.Success)
+        val fileId2 = (res2 as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+
+        assertEquals("Same item and same file must reuse the existing Drive file ID", fileId1, fileId2)
+        assertEquals(1, client.uploadedFiles.size)
+    }
+
+    @Test
+    fun differentItemsIdenticalFilenameDifferentContentCreatesSeparateDriveFiles() = runTest {
+        val client = app.reelix.cloud.MockCloudSyncClient()
+        val file1 = File(testMediaDir, "content1.mp4").apply { writeBytes("video payload alpha".toByteArray()) }
+        val file2 = File(testMediaDir, "content2.mp4").apply { writeBytes("completely different payload beta".toByteArray()) }
+
+        val res1 = client.uploadMedia(file1, "video/mp4", "reel.mp4", "item-alpha")
+        val res2 = client.uploadMedia(file2, "video/mp4", "reel.mp4", "item-beta")
+
+        assertTrue(res1 is app.reelix.cloud.CloudUploadResult.Success)
+        assertTrue(res2 is app.reelix.cloud.CloudUploadResult.Success)
+
+        val id1 = (res1 as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+        val id2 = (res2 as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+
+        assertFalse("Different items with identical filename must create separate Drive files", id1 == id2)
+        assertEquals(2, client.uploadedFiles.size)
+    }
+
+    @Test
+    fun differentItemsIdenticalFilenameAndIdenticalSizeCreatesSeparateDriveFiles() = runTest {
+        val client = app.reelix.cloud.MockCloudSyncClient()
+        val sameBytes = "10_bytes!!".toByteArray()
+        val file1 = File(testMediaDir, "f1.mp4").apply { writeBytes(sameBytes) }
+        val file2 = File(testMediaDir, "f2.mp4").apply { writeBytes(sameBytes) }
+
+        val res1 = client.uploadMedia(file1, "video/mp4", "reel.mp4", "item-same-size-1")
+        val res2 = client.uploadMedia(file2, "video/mp4", "reel.mp4", "item-same-size-2")
+
+        assertTrue(res1 is app.reelix.cloud.CloudUploadResult.Success)
+        assertTrue(res2 is app.reelix.cloud.CloudUploadResult.Success)
+
+        val id1 = (res1 as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+        val id2 = (res2 as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+
+        assertFalse(
+            "Different items with identical filename AND identical file size must still have separate identities",
+            id1 == id2,
+        )
+        assertEquals(2, client.uploadedFiles.size)
+    }
+
+    @Test
+    fun existingDriveFileWithoutReelixMetadataNotIncorrectlyReused() = runTest {
+        val client = app.reelix.cloud.MockCloudSyncClient()
+        // Simulate a pre-existing file in Drive without Reelix appProperties
+        client.uploadedFiles["un_tagged_id_999"] = app.reelix.cloud.MockUploadedFile(
+            name = "shared_reel.mp4",
+            sizeBytes = 256,
+            mimeType = "video/mp4",
+            appProperties = emptyMap(),
+        )
+
+        val testFile = File(testMediaDir, "local_shared_reel.mp4").apply {
+            writeBytes(ByteArray(256) { 7 })
+        }
+
+        val res = client.uploadMedia(testFile, "video/mp4", "shared_reel.mp4", "item-new-tagged")
+        assertTrue(res is app.reelix.cloud.CloudUploadResult.Success)
+        val createdId = (res as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+
+        assertFalse(
+            "An existing Drive file without Reelix appProperties must not be incorrectly reused",
+            createdId == "un_tagged_id_999",
+        )
+        assertEquals(2, client.uploadedFiles.size)
+        assertEquals("item-new-tagged", client.uploadedFiles[createdId]?.appProperties?.get("reelix_item_id"))
+    }
+
+    @Test
+    fun retryAfterInterruptedUploadCorrectItemResumesItsOwnSession() = runTest {
+        val client = app.reelix.cloud.MockCloudSyncClient()
+        client.simulateInterruptionOnce = true
+        val testFile = File(testMediaDir, "interrupted_demo.mp4").apply {
+            writeBytes(ByteArray(2048) { (it % 256).toByte() })
+        }
+
+        // 1. First attempt for item-interrupted-A fails due to simulated interruption
+        val firstResultA = client.uploadMedia(testFile, "video/mp4", "demo.mp4", "item-interrupted-A")
+        assertTrue(firstResultA is app.reelix.cloud.CloudUploadResult.Failure)
+
+        // 2. Upload for a different item (item-B) with the exact same file
+        val resultB = client.uploadMedia(testFile, "video/mp4", "demo.mp4", "item-B")
+        assertTrue(resultB is app.reelix.cloud.CloudUploadResult.Success)
+        assertEquals("Item B must start a fresh upload and not resume Item A's session", 0L, client.lastUploadedOffset)
+
+        // 3. Retry upload for item-interrupted-A
+        val retryResultA = client.uploadMedia(testFile, "video/mp4", "demo.mp4", "item-interrupted-A")
+        assertTrue(retryResultA is app.reelix.cloud.CloudUploadResult.Success)
+        assertEquals("Item A retry must resume from its own saved offset", testFile.length() / 2, client.lastUploadedOffset)
+
+        val idA = (retryResultA as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+        val idB = (resultB as app.reelix.cloud.CloudUploadResult.Success).driveFileId
+        assertFalse("Item A and Item B must have separate Drive files", idA == idB)
+        assertEquals(2, client.uploadedFiles.size)
+    }
 }

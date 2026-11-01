@@ -131,18 +131,23 @@ class TestLiveGoogleDriveIntegration(unittest.TestCase):
         self.created_file_ids: List[str] = []
 
     def tearDown(self):
+        cleanup_errors: List[str] = []
         if hasattr(self, "client") and hasattr(self, "created_file_ids"):
             try:
                 service = self.client._get_service()
                 for fid in self.created_file_ids:
                     try:
                         service.files().delete(fileId=fid).execute()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as e:
+                        cleanup_errors.append(f"Failed to delete test file {fid}: {e}")
+            except Exception as e:
+                cleanup_errors.append(f"Failed to initialize Drive service for cleanup: {e}")
+
         if hasattr(self, "test_temp_dir") and self.test_temp_dir.exists():
             shutil.rmtree(self.test_temp_dir, ignore_errors=True)
+
+        if cleanup_errors:
+            logger.warning("Live Drive cleanup issues encountered: %s", "; ".join(cleanup_errors))
 
     def test_live_01_oauth_authentication_and_root_vault(self):
         """Operations 1, 2, 3: Verifies OAuth auth, root Reelix_Vault creation in 'root', and subfolder access."""
@@ -261,6 +266,7 @@ class TestLiveEndToEnd(unittest.TestCase):
     """Categorized full end-to-end integration test combining live Drive and Gemini."""
 
     def tearDown(self):
+        cleanup_errors: List[str] = []
         if hasattr(self, "test_job_id") and hasattr(self, "storage"):
             try:
                 service = self.storage._get_service()
@@ -268,9 +274,15 @@ class TestLiveEndToEnd(unittest.TestCase):
                 query = f"'{jobs_folder}' in parents and name = '{self.test_job_id}.json' and trashed = false"
                 res = service.files().list(q=query, fields="files(id)").execute()
                 for f in res.get("files", []):
-                    service.files().delete(fileId=f["id"]).execute()
-            except Exception:
-                pass
+                    try:
+                        service.files().delete(fileId=f["id"]).execute()
+                    except Exception as e:
+                        cleanup_errors.append(f"Failed to delete test manifest {f['id']}: {e}")
+            except Exception as e:
+                cleanup_errors.append(f"Failed to query test manifest {self.test_job_id}: {e}")
+
+        if cleanup_errors:
+            logger.warning("Live E2E cleanup issues encountered: %s", "; ".join(cleanup_errors))
 
     def test_full_pipeline_run(self):
         """Operation 9: Complete worker pipeline cycle against live external services."""

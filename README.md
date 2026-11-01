@@ -6,10 +6,18 @@ Reelix is a single-user, local-first Android knowledge vault for capturing, orga
 
 ---
 
-## What's New in Phase 3.4: Final Corrections & Controlled Verification
+## What's New in Phase 3.5: Google Drive Upload Identity Correction
 
-Phase 3.4 delivers complete reliability corrections and controlled live verification readiness:
+Phase 3.5 delivers complete upload identity isolation in Google Drive and robust duplicate detection:
 
+- **Google Drive Metadata Identity (`appProperties`):**
+  Uploaded media files in `Reelix_Vault/media` are stamped with custom Drive metadata:
+  `appProperties: {"reelix_item_id": itemId, "reelix_type": "media"}`.
+  1. Duplicate detection searches strictly by `appProperties has { key='reelix_item_id' and value='<itemId>' }` instead of filename alone.
+  2. Preserves the original human-readable filename in Drive.
+  3. Ensures retries for the same item reuse the existing Drive file.
+  4. Guarantees different items with identical filenames or identical file sizes create separate Drive files and never collide.
+  5. Un-tagged pre-existing Drive files without Reelix metadata are never falsely associated with new items.
 - **Stable Item-Isolated Resumable Upload Identity:**
   Upload session keys strictly require and incorporate a stable Reelix item identifier alongside canonical file path, file length, and last modified timestamp (`item_${itemId}_${canonicalPath}_${length}_${lastModified}`):
   1. Prevents cross-item session collisions when different items share identical files or temporary paths.
@@ -17,7 +25,7 @@ Phase 3.4 delivers complete reliability corrections and controlled live verifica
   3. Modifying a file produces a distinct key, preventing stale session resumption.
   4. Automatically invalidates legacy un-versioned sessions via schema migration (`__schema_version__ = 2`) in `SharedPreferencesResumableUploadStore`.
 - **Failed-Job Offline Search Indexing:**
-  `CloudSyncRepository` now triggers `SearchIndexer.reindex(itemId)` for `FAILED` jobs:
+  `CloudSyncRepository` triggers `SearchIndexer.reindex(itemId)` for `FAILED` jobs:
   1. Preserves and offline-indexes partial transcripts or metadata synchronized before job failure in Room FTS4.
   2. Reindexes items without results cleanly, ensuring legitimate user metadata (e.g. title) remains searchable while preventing stray or incorrect search entries.
 - **Strict Gemini Model Enforcement:**
@@ -40,7 +48,7 @@ Phase 3.4 delivers complete reliability corrections and controlled live verifica
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                            REELIX CLOUD ARCHITECTURE                         │
-│                           Phase 3.4 Verified Pipeline                        │
+│                           Phase 3.5 Verified Pipeline                        │
 └──────────────────────────────────────────────────────────────────────────────┘
    [ Instagram / Share Sheet ]
                 │
@@ -197,7 +205,7 @@ OK (skipped=5)
 Output:
 ```text
 BUILD SUCCESSFUL
-54 tests completed, 0 failed, 0 skipped
+59 tests completed, 0 failed, 0 skipped
 ```
 
 ### 3. Build Android Debug APK
