@@ -1,5 +1,6 @@
 package app.reelix.cloud
 
+import android.content.Context
 import app.reelix.core.ReelixLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -13,6 +14,7 @@ import okio.BufferedSink
 import org.json.JSONObject
 import java.io.File
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 sealed interface CloudUploadResult {
@@ -26,11 +28,47 @@ interface ResumableUploadStore {
     fun removeSession(key: String)
 }
 
+/** In-memory store for fast local unit testing without Android Context dependencies. */
 class InMemoryResumableUploadStore : ResumableUploadStore {
     private val map = ConcurrentHashMap<String, String>()
     override fun getSessionUri(key: String): String? = map[key]
     override fun saveSessionUri(key: String, uri: String) { map[key] = uri }
     override fun removeSession(key: String) { map.remove(key) }
+}
+
+/**
+ * Persistent Android SharedPreferences-backed store for Google Drive resumable upload sessions.
+ * Preserves upload session URIs across application termination, process death, and device restarts.
+ * Stored in private SharedPreferences (MODE_PRIVATE).
+ * Never logs session URIs.
+ */
+class SharedPreferencesResumableUploadStore(
+    context: Context,
+) : ResumableUploadStore {
+    private val prefs = context.applicationContext.getSharedPreferences(
+        "reelix_resumable_upload_sessions",
+        Context.MODE_PRIVATE,
+    )
+
+    override fun getSessionUri(key: String): String? {
+        return prefs.getString(key, null)
+    }
+
+    override fun saveSessionUri(key: String, uri: String) {
+        prefs.edit().putString(key, uri).apply()
+    }
+
+    override fun removeSession(key: String) {
+        prefs.edit().remove(key).apply()
+    }
+}
+
+/** Generates a stable SHA-256 key based on canonical path, length, and modification timestamp. */
+fun buildResumableUploadKey(file: File, itemId: String? = null): String {
+    val raw = "${itemId.orEmpty()}_${file.canonicalPath}_${file.length()}_${file.lastModified()}"
+    val md = MessageDigest.getInstance("SHA-256")
+    val digest = md.digest(raw.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { "%02x".format(it) }
 }
 
 /**
@@ -124,7 +162,7 @@ class GoogleDriveCloudClient(
                 }
 
                 val totalLength = file.length()
-                val uploadKey = "${file.name}_$totalLength"
+                val uploadKey = buildResumableUploadKey(file)
                 var sessionUri = resumableStore.getSessionUri(uploadKey)
                 var resumeOffset = 0L
 
@@ -495,7 +533,7 @@ class MockCloudSyncClient(
 
     override suspend fun uploadMedia(file: File, mimeType: String, originalFileName: String): CloudUploadResult {
         if (!isEnabled) return CloudUploadResult.Failure("Cloud client is disabled")
-        val uploadKey = "${file.name}_${file.length()}"
+        val uploadKey = buildResumableUploadKey(file)
         val existingSession = resumableStore.getSessionUri(uploadKey)
 
         if (simulateInterruptionOnce && existingSession == null) {

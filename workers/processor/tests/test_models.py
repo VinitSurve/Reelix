@@ -27,7 +27,7 @@ class TestModels(unittest.TestCase):
             key_takeaways=["Hoist state"],
             important_concepts=["Unidirectional data flow"],
             actionable_steps=["Pass events upwards"],
-            model_name="gemini-3.8-flash",
+            model_name="gemini-3.6-flash",
             generated_at=1730450000000,
         )
 

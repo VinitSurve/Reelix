@@ -238,6 +238,72 @@ class TestDriveClient(unittest.TestCase):
             updated = self.client.update_job(my_job)
             self.assertFalse(updated, "Update must fail if remote lease was reclaimed by another worker")
 
+    def test_update_job_fails_if_already_settled(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "file-1", "name": "item-settled.json"}]
+        }
+
+        # Remote file was already marked COMPLETED
+        remote_manifest = JobManifest(
+            item_id="item-settled",
+            source="URL",
+            status=JobStatus.COMPLETED,
+            claimed_by="worker-fast",
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            my_job = JobManifest(
+                item_id="item-settled",
+                source="URL",
+                status=JobStatus.PROCESSING,
+                claimed_by="worker-slow",
+                created_at=1000,
+                updated_at=1000,
+            )
+            updated = self.client.update_job(my_job)
+            self.assertFalse(updated, "Stale worker must not overwrite an already settled job")
+
+    def test_update_job_fails_if_remote_version_ahead(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "file-1", "name": "item-version.json"}]
+        }
+
+        # Remote file has version 3
+        remote_manifest = JobManifest(
+            item_id="item-version",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-beta",
+            version=3,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            my_job = JobManifest(
+                item_id="item-version",
+                source="URL",
+                status=JobStatus.PROCESSING,
+                claimed_by="worker-beta",
+                version=1,  # Stale local version
+                created_at=1000,
+                updated_at=1000,
+            )
+            updated = self.client.update_job(my_job)
+            self.assertFalse(updated, "Stale worker version must not overwrite newer remote version")
+
     def test_root_vault_auto_discovery_and_creation(self):
         empty_config = WorkerConfig(
             gdrive_service_account_json='{"type": "service_account"}',

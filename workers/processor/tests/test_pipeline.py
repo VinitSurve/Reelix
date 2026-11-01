@@ -69,7 +69,7 @@ class FakeAnalyzer:
                 key_takeaways=["takeaway1"],
                 important_concepts=["concept1"],
                 actionable_steps=["step1"],
-                model_name="gemini-3.8-flash",
+                model_name="gemini-3.6-flash",
                 generated_at=1000,
             ),
         )
@@ -151,13 +151,14 @@ class TestPipeline(unittest.TestCase):
             item_id="item-retry-test",
             source="URL",
             status=JobStatus.QUEUED,
+            caption="Valid post caption about design systems",
             created_at=1000,
             updated_at=1000,
             retry_count=0,
             max_retries=2,
             stages=StageStates(
-                audio_extraction=StageStatus.PENDING,
-                transcription=StageStatus.PENDING,
+                audio_extraction=StageStatus.SKIPPED,
+                transcription=StageStatus.SKIPPED,
                 gemini_analysis=StageStatus.PENDING,
             ),
         )
@@ -219,6 +220,7 @@ class TestPipeline(unittest.TestCase):
             item_id="item-collision-test",
             source="URL",
             status=JobStatus.QUEUED,
+            caption="Post with valid content for concurrency testing",
             created_at=1000,
             updated_at=1000,
             stages=StageStates(
@@ -259,6 +261,7 @@ class TestPipeline(unittest.TestCase):
         stale_job = JobManifest(
             item_id="item-stale-lease",
             source="URL",
+            caption="Stale post recovered caption",
             status=JobStatus.PROCESSING,
             claimed_by="dead-runner",
             claimed_at=now_ms - (30 * 60 * 1000),
@@ -326,6 +329,107 @@ class TestPipeline(unittest.TestCase):
         # Attempting to process directly should be rejected
         claimed = pipeline.process_job(active_job)
         self.assertFalse(claimed, "Active job with valid lease must not be claimed")
+
+    def test_url_only_job_without_metadata_marked_partial_without_retries(self):
+        job = JobManifest(
+            item_id="item-url-only-empty",
+            source="URL",
+            original_url="https://www.instagram.com/reel/xyz123/",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            media=None,
+            caption=None,
+            user_notes=None,
+        )
+        self.storage.update_job(job)
+
+        fake_analyzer = FakeAnalyzer(success=True)
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            gemini_analyzer=fake_analyzer,
+        )
+
+        success = pipeline.process_job(job)
+        self.assertTrue(success)
+
+        updated = self.storage.get_job("item-url-only-empty")
+        self.assertEqual(JobStatus.PARTIAL, updated.status)
+        self.assertEqual(0, updated.retry_count, "Should not increment retries")
+        self.assertEqual(
+            "URL-only item without media or metadata; share reel video or provide notes",
+            updated.error_message,
+        )
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.gemini_analysis)
+        self.assertEqual(0, fake_analyzer.called, "Gemini must not be called with empty text")
+
+    def test_url_only_job_with_caption_analyzed_successfully(self):
+        job = JobManifest(
+            item_id="item-url-with-caption",
+            source="URL",
+            original_url="https://www.instagram.com/reel/abc456/",
+            caption="Jetpack Compose architecture tips and tricks for state holders",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            media=None,
+            user_notes=None,
+        )
+        self.storage.update_job(job)
+
+        fake_analyzer = FakeAnalyzer(success=True)
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            gemini_analyzer=fake_analyzer,
+        )
+
+        success = pipeline.process_job(job)
+        self.assertTrue(success)
+
+        updated = self.storage.get_job("item-url-with-caption")
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
+        self.assertEqual(1, fake_analyzer.called)
+        self.assertIsNotNone(updated.results.analysis)
+        self.assertEqual("AI summary", updated.results.analysis.summary)
+
+    def test_url_only_job_with_user_notes_analyzed_successfully(self):
+        job = JobManifest(
+            item_id="item-url-with-notes",
+            source="URL",
+            original_url="https://www.instagram.com/reel/ghi789/",
+            user_notes="Key notes on clean architecture in Android Kotlin apps",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            media=None,
+            caption=None,
+        )
+        self.storage.update_job(job)
+
+        fake_analyzer = FakeAnalyzer(success=True)
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            gemini_analyzer=fake_analyzer,
+        )
+
+        success = pipeline.process_job(job)
+        self.assertTrue(success)
+
+        updated = self.storage.get_job("item-url-with-notes")
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
+        self.assertEqual(1, fake_analyzer.called)
+        self.assertIsNotNone(updated.results.analysis)
 
 
 if __name__ == "__main__":

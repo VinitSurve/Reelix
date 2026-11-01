@@ -85,7 +85,7 @@ class GeminiAnalysisResult:
             key_takeaways=data.get("key_takeaways", []),
             important_concepts=data.get("important_concepts", []),
             actionable_steps=data.get("actionable_steps", []),
-            model_name=data.get("model_name", "gemini-3.8-flash"),
+            model_name=data.get("model_name", "gemini-3.6-flash"),
             generated_at=data.get("generated_at", 0),
         )
 
@@ -119,6 +119,8 @@ class JobManifest:
     updated_at: int
     version: int = 1
     original_url: Optional[str] = None
+    caption: Optional[str] = None
+    user_notes: Optional[str] = None
     status: JobStatus = JobStatus.QUEUED
     claimed_by: Optional[str] = None
     claimed_at: Optional[int] = None
@@ -160,6 +162,8 @@ class JobManifest:
             item_id=data["item_id"],
             source=data.get("source", "MEDIA_SHARE"),
             original_url=data.get("original_url"),
+            caption=data.get("caption"),
+            user_notes=data.get("user_notes"),
             status=JobStatus(data.get("status", JobStatus.QUEUED.value)),
             claimed_by=data.get("claimed_by"),
             claimed_at=data.get("claimed_at"),

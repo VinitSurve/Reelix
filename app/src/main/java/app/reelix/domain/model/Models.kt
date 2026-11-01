@@ -88,6 +88,7 @@ data class ItemListEntry(
     /** Honest status badge label reflecting actual pipeline achievements rather than generic "Processed". */
     val primaryStatusLabel: String
         get() = when {
+            isNeedsAttention && !isMediaAvailable -> "Media needed"
             isNeedsAttention -> "Needs attention"
             isAiEnriched -> "AI enriched"
             isTranscribed -> "Transcribed"

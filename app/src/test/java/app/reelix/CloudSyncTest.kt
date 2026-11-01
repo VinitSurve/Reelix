@@ -91,7 +91,7 @@ class CloudSyncTest {
                     keyTakeaways = listOf("Use Dispatchers.IO for disk operations", "Always respect cancellation"),
                     importantConcepts = listOf("Structured Concurrency", "CoroutineScope"),
                     actionableSteps = listOf("Wrap calls in viewModelScope.launch", "Avoid GlobalScope"),
-                    modelName = "gemini-3.8-flash",
+                    modelName = "gemini-3.6-flash",
                     generatedAt = 1730000500000L,
                 ),
             ),
@@ -128,7 +128,7 @@ class CloudSyncTest {
         assertEquals("Kotlin Coroutines", parsed.results.analysis!!.mainTopic)
         assertEquals(listOf("android", "kotlin", "concurrency"), parsed.results.analysis!!.tags)
         assertEquals(listOf("Structured Concurrency", "CoroutineScope"), parsed.results.analysis!!.importantConcepts)
-        assertEquals("gemini-3.8-flash", parsed.results.analysis!!.modelName)
+        assertEquals("gemini-3.6-flash", parsed.results.analysis!!.modelName)
     }
 
     @Test
@@ -230,7 +230,7 @@ class CloudSyncTest {
                     keyTakeaways = listOf("Use FTS4 for fast local search", "Index transcripts and summaries"),
                     importantConcepts = listOf("Virtual Table", "Match Query"),
                     actionableSteps = listOf("Create entity extending Fts4", "Call reindex after inserts"),
-                    modelName = "gemini-3.8-flash",
+                    modelName = "gemini-3.6-flash",
                     generatedAt = container.clock.now(),
                 ),
             ),
@@ -301,7 +301,7 @@ class CloudSyncTest {
         val firstResult = client.uploadMedia(testFile, "video/mp4", testFile.name)
         assertTrue("First attempt should fail with simulated network failure", firstResult is app.reelix.cloud.CloudUploadResult.Failure)
 
-        val uploadKey = "${testFile.name}_${testFile.length()}"
+        val uploadKey = app.reelix.cloud.buildResumableUploadKey(testFile)
         val savedSession = client.resumableStore.getSessionUri(uploadKey)
         assertNotNull("Resumable session URI should be preserved after interruption", savedSession)
 
@@ -404,5 +404,41 @@ class CloudSyncTest {
         // Must NOT be marked COMPLETED when analysis is missing
         assertEquals(ProcessingStatus.NEEDS_ATTENTION, item!!.processingStatus)
         assertTrue(item.lastError!!.contains("Missing or empty analysis"))
+    }
+
+    @Test
+    fun sharedPreferencesResumableUploadStoreSurvivesProcessRecreation() {
+        val testFile = File(testMediaDir, "persistent_video.mp4").apply {
+            writeBytes("test file content for persistence".toByteArray())
+        }
+        val key = app.reelix.cloud.buildResumableUploadKey(testFile)
+        val dummySessionUri = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=abc123session"
+
+        // 1. Initial process instance writes session URI to persistent store
+        val store1 = app.reelix.cloud.SharedPreferencesResumableUploadStore(context)
+        store1.saveSessionUri(key, dummySessionUri)
+        assertEquals(dummySessionUri, store1.getSessionUri(key))
+
+        // 2. Simulate process termination and recreation: instantiate fresh store with application context
+        val store2 = app.reelix.cloud.SharedPreferencesResumableUploadStore(context)
+        val recoveredUri = store2.getSessionUri(key)
+        assertEquals("Session URI must survive process recreation in SharedPreferences", dummySessionUri, recoveredUri)
+
+        // 3. Removal cleans up session
+        store2.removeSession(key)
+        val store3 = app.reelix.cloud.SharedPreferencesResumableUploadStore(context)
+        assertEquals("Session URI must be null after removal", null, store3.getSessionUri(key))
+    }
+
+    @Test
+    fun stableUploadKeyGenerationDifferentiatesDifferentFilesWithSameName() {
+        val dir1 = File(testMediaDir, "dir1").apply { mkdirs() }
+        val dir2 = File(testMediaDir, "dir2").apply { mkdirs() }
+        val f1 = File(dir1, "video.mp4").apply { writeBytes("video 1".toByteArray()) }
+        val f2 = File(dir2, "video.mp4").apply { writeBytes("longer video 2 payload".toByteArray()) }
+
+        val key1 = app.reelix.cloud.buildResumableUploadKey(f1)
+        val key2 = app.reelix.cloud.buildResumableUploadKey(f2)
+        assertFalse("Different file paths/lengths must produce distinct keys even with identical filenames", key1 == key2)
     }
 }

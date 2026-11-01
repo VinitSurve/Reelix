@@ -15,6 +15,8 @@ data class CloudJobManifest(
     val itemId: String,
     val source: String,
     val originalUrl: String? = null,
+    val caption: String? = null,
+    val userNotes: String? = null,
     val status: String = "QUEUED",
     val claimedBy: String? = null,
     val claimedAt: Long? = null,
@@ -35,6 +37,8 @@ data class CloudJobManifest(
         root.put("item_id", itemId)
         root.put("source", source)
         if (originalUrl != null) root.put("original_url", originalUrl)
+        if (caption != null) root.put("caption", caption)
+        if (userNotes != null) root.put("user_notes", userNotes)
         root.put("status", status)
         if (claimedBy != null) root.put("claimed_by", claimedBy)
         if (claimedAt != null) root.put("claimed_at", claimedAt)
@@ -123,7 +127,7 @@ data class CloudJobManifest(
                     keyTakeaways = it.optJSONArray("key_takeaways")?.toStringList() ?: emptyList(),
                     importantConcepts = it.optJSONArray("important_concepts")?.toStringList() ?: emptyList(),
                     actionableSteps = it.optJSONArray("actionable_steps")?.toStringList() ?: emptyList(),
-                    modelName = it.optString("model_name", "gemini-3.8-flash"),
+                    modelName = it.optString("model_name", "gemini-3.6-flash"),
                     generatedAt = it.optLong("generated_at", 0L),
                 )
             }
@@ -141,6 +145,8 @@ data class CloudJobManifest(
                 itemId = root.getString("item_id"),
                 source = root.optString("source", "MEDIA_SHARE"),
                 originalUrl = root.optString("original_url").takeIf { it.isNotBlank() },
+                caption = root.optString("caption").takeIf { it.isNotBlank() },
+                userNotes = root.optString("user_notes").takeIf { it.isNotBlank() },
                 status = root.optString("status", "QUEUED"),
                 claimedBy = root.optString("claimed_by").takeIf { it.isNotBlank() },
                 claimedAt = if (root.has("claimed_at")) root.optLong("claimed_at") else null,

@@ -189,6 +189,7 @@ class DefaultAppContainer(
             folderIdProvider = { settingsRepository.current().cloudDriveFolderId },
             tokenProvider = { settingsRepository.getValidDriveAccessToken() },
             tokenRefresher = { settingsRepository.refreshCloudDriveAccessToken() },
+            resumableStore = app.reelix.cloud.SharedPreferencesResumableUploadStore(appContext),
         )
     }
 

@@ -99,9 +99,13 @@ class CloudProcessingPipeline:
 
         try:
             # 1. Media Retrieval & Audio Extraction
-            if (
-                job.media is not None
-                and job.stages.audio_extraction != StageStatus.SUCCEEDED
+            if job.media is None:
+                if job.stages.audio_extraction == StageStatus.PENDING:
+                    job.stages.audio_extraction = StageStatus.SKIPPED
+                if job.stages.transcription == StageStatus.PENDING:
+                    job.stages.transcription = StageStatus.SKIPPED
+            elif (
+                job.stages.audio_extraction != StageStatus.SUCCEEDED
                 and job.stages.audio_extraction != StageStatus.SKIPPED
             ):
                 ext = Path(job.media.file_name).suffix or ".mp4"
@@ -152,15 +156,39 @@ class CloudProcessingPipeline:
                     logger.warning("No audio file available for transcription on item %s", job.item_id)
                     job.stages.transcription = StageStatus.SKIPPED
 
+            # Check for URL-only job with no media and no text metadata
+            usable_text = any(
+                bool(t and t.strip())
+                for t in [job.results.transcript, job.caption, job.user_notes]
+            )
+            if job.media is None and not usable_text:
+                logger.info(
+                    "Job %s is URL-only with no media, caption, or notes; manual input required",
+                    job.item_id,
+                )
+                job.stages.audio_extraction = StageStatus.SKIPPED
+                job.stages.transcription = StageStatus.SKIPPED
+                job.stages.gemini_analysis = StageStatus.SKIPPED
+                job.status = JobStatus.PARTIAL
+                job.error_message = (
+                    "URL-only item without media or metadata; share reel video or provide notes"
+                )
+                job.updated_at = int(time.time() * 1000)
+                self.storage.update_job(job)
+                return True
+
             # 3. Gemini Content Intelligence & Structured Enrichment
             if job.stages.gemini_analysis != StageStatus.SUCCEEDED:
-                # Text for analysis is gathered from transcript, URL, or media filename
                 transcript_text = job.results.transcript
                 title = job.media.file_name if job.media else None
+                caption = job.caption
+                notes = job.user_notes
 
                 ai_res = self.gemini_analyzer.analyze(
                     title=title,
+                    caption=caption,
                     transcript=transcript_text,
+                    notes=notes,
                 )
                 if not ai_res.success:
                     return self._handle_job_failure(job, f"Gemini enrichment failed: {ai_res.error}")

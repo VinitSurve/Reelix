@@ -75,7 +75,7 @@ class MockStorageClient(StorageClient):
                 lease = existing.lease_timeout_ms or self.default_lease_ms
                 if existing.claimed_at and (now_ms - existing.claimed_at) < lease:
                     return False
-            elif existing.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            elif existing.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL):
                 return False
 
         now_ms = int(time.time() * 1000)
@@ -96,13 +96,16 @@ class MockStorageClient(StorageClient):
 
     def update_job(self, job: JobManifest) -> bool:
         existing = self.get_job(job.item_id)
-        if (
-            existing
-            and existing.claimed_by
-            and job.claimed_by
-            and existing.claimed_by != job.claimed_by
-        ):
-            return False
+        if existing:
+            if existing.claimed_by and job.claimed_by and existing.claimed_by != job.claimed_by:
+                return False
+            if existing.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL) and job.status == JobStatus.PROCESSING:
+                return False
+            if (existing.version or 1) > (job.version or 1):
+                return False
+            job.version = (existing.version or 1) + 1
+        else:
+            job.version = 1
 
         job_file = self.jobs_dir / f"{job.item_id}.json"
         job_file.write_text(job.to_json(), encoding="utf-8")

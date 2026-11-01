@@ -10,14 +10,18 @@ from workers.processor.src.stages.gemini_analyzer import GeminiAnalyzer
 class TestGeminiAnalyzer(unittest.TestCase):
 
     def setUp(self):
-        self.analyzer = GeminiAnalyzer(api_key="test-api-key", model="gemini-3.8-flash")
+        self.analyzer = GeminiAnalyzer(api_key="test-api-key", model="gemini-3.6-flash")
+
+    def test_default_model_is_gemini_3_6_flash(self):
+        default_analyzer = GeminiAnalyzer(api_key="key")
+        self.assertEqual("gemini-3.6-flash", default_analyzer.model)
 
     def test_model_allowlist_validation(self):
-        # Permitted models
-        a1 = GeminiAnalyzer(api_key="key", model="gemini-3.8-flash")
-        self.assertEqual("gemini-3.8-flash", a1.model)
-        a2 = GeminiAnalyzer(api_key="key", model="gemini-3.6-flash")
-        self.assertEqual("gemini-3.6-flash", a2.model)
+        # Permitted models: gemini-3.6-flash (default) and gemini-3.8-flash (alternative)
+        a1 = GeminiAnalyzer(api_key="key", model="gemini-3.6-flash")
+        self.assertEqual("gemini-3.6-flash", a1.model)
+        a2 = GeminiAnalyzer(api_key="key", model="gemini-3.8-flash")
+        self.assertEqual("gemini-3.8-flash", a2.model)
 
         # Disallowed models must raise ValueError
         for disallowed in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gpt-4"]:
@@ -93,7 +97,7 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertEqual(2, len(res.result.key_takeaways))
         self.assertEqual(2, len(res.result.important_concepts))
         self.assertEqual(3, len(res.result.actionable_steps))
-        self.assertEqual("gemini-3.8-flash", res.result.model_name)
+        self.assertEqual("gemini-3.6-flash", res.result.model_name)
 
     @patch("urllib.request.urlopen")
     def test_empty_gemini_response_rejected(self, mock_urlopen):

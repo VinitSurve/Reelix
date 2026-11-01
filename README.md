@@ -6,39 +6,37 @@ Reelix is a single-user, local-first Android knowledge vault for capturing, orga
 
 ---
 
-## What's New in Phase 3.2: Drive API Correctness, Concurrency & Live Integration Readiness
+## What's New in Phase 3.3: Final Reliability Corrections, Gemini 3.6 Free-Tier Default & Persistent Upload Recovery
 
-Phase 3.2 solidifies cloud processing reliability, API correctness, and concurrency guarantees:
+Phase 3.3 finalizes cloud processing reliability, API correctness, and concurrency guarantees:
 
-- **Strict Gemini Model Restriction:** Reelix strictly allows **only two Google AI Studio models**:
-  - `gemini-3.8-flash` (Default)
-  - `gemini-3.6-flash` (Allowed Alternative)
-  Both models are available on Google AI Studio's **Free Tier** ($0 cost, no Google Cloud billing account, no credit card required). An allowlist enforces valid models across Python config, workflow inputs, and Android manifests; any invalid model fails fast before making an API call.
-- **Google Drive API Concurrency Architecture:** Google Drive API v3 does not enforce HTTP `If-Match` or atomic Compare-And-Swap (CAS) on File resource updates. Reelix solves concurrency with a robust multi-layer design:
-  1. *Workflow Serialization:* GitHub Actions enforces `concurrency: group: reelix-processing, cancel-in-progress: false`, ensuring only one runner executes at a time.
-  2. *Active Lease Protection:* Any job in `PROCESSING` with a lease under 15 minutes is strictly protected from being claimed or overwritten by another worker.
-  3. *Stale Lease Recovery:* Abandoned or stalled jobs (> 15 minutes) are safely reclaimed and retried.
-  4. *Read-After-Write Verification:* Workers write their unique `runner_id` and lease timestamp, then immediately re-read the remote manifest. If a race collision occurs and another worker won the write, the losing worker detects the mismatch and immediately aborts without processing or corrupting data.
-  5. *Lease Ownership Check on Updates:* Workers verify remote lease ownership before committing stage updates.
-- **Root Vault Authorization under `drive.file` Scope:**
-  The `drive.file` OAuth scope only grants access to files and folders created or opened by the app. A folder manually created by the user in the Google Drive web UI is inaccessible under `drive.file`. Reelix automatically searches for or creates its own `Reelix_Vault` folder under `'root'` (`parents: ['root']`) using the authorized API. Both the Android app and GitHub Actions share this authorized root folder.
-- **Android Resumable Upload Recovery:**
-  Implements the full Google Drive Resumable Upload recovery protocol:
-  1. Persists upload session URIs across network interruptions and app restarts.
-  2. Queries the server for uploaded byte range (`PUT` with `Content-Range: bytes */<length>`).
-  3. Parses `308 Resume Incomplete` (`Range: bytes=0-<lastByte>`) and resumes streaming from `lastByte + 1`.
-  4. Detects already-completed uploads (`200/201`), avoiding duplicate file creation.
-  5. Handles expired sessions (`404/410`) by seamlessly restarting fresh sessions.
-  6. Refreshes OAuth tokens on HTTP 401 without destroying in-progress upload sessions.
-- **Honest Completion States:**
-  - `COMPLETED`: Marked only when all required stages succeeded and produced non-empty results (non-empty summary, takeaways, and transcript). Empty Gemini responses or missing transcripts are never treated as successful.
-  - `PARTIAL`: Preserves successful stage results (e.g. transcript) in SQLite, marks `NEEDS_ATTENTION`, and indexes partial results in Room FTS4 for offline searchability.
-  - `FAILED`: Marked when all stages fail or retries are exhausted.
+- **Gemini Free-Tier Default (`gemini-3.6-flash`):**
+  Reelix strictly allows **only two Google AI Studio models**:
+  - `gemini-3.6-flash` (Default)
+  - `gemini-3.8-flash` (Allowed Alternative)
+  Google AI Studio's Standard Free Tier provides free input and output tokens for `gemini-3.6-flash`. Reelix defaults to `gemini-3.6-flash` to ensure 100% zero-cost operation without requiring a credit card or Google Cloud billing account. `gemini-3.8-flash` remains available as an explicitly selectable permitted alternative. Automatic fallback to other models is strictly forbidden and rejected at configuration, workflow, and manifest validation.
+- **Durable App-Private Resumable Upload Sessions:**
+  Android-backed `SharedPreferencesResumableUploadStore` persists resumable Google Drive upload session URIs in app-private storage across process restarts:
+  1. Sessions survive app termination and background process kills.
+  2. Sessions are keyed by stable SHA-256 identity (`canonicalPath + length + lastModified`), preventing collisions across files with identical names.
+  3. Session URIs are securely stored and never emitted to logs.
+  4. Automatically resumes byte streams via `308 Resume Incomplete` queries and clears expired (`404/410`) sessions.
+- **Single-Writer Concurrency Architecture:**
+  Google Drive API v3 does not offer native atomic CAS or server-side file locking. Concurrency is guaranteed via:
+  1. *Workflow Serialization:* GitHub Actions enforces `concurrency: group: reelix-processing, cancel-in-progress: false`, ensuring exactly one cloud worker runs at any time.
+  2. *Local Execution Safeguard:* Local CLI worker runs require explicit `--confirm-local` flag or `ALLOW_LOCAL_WORKER=1` environment variable to prevent accidental concurrent writes against active cloud queues.
+  3. *TOCTOU Guardrails:* Workers verify remote lease ownership, settled statuses (`COMPLETED`, `FAILED`, `PARTIAL`), and version monotonicity before committing stage updates.
+- **URL-Only / Manual-Input-Required Processing:**
+  When a link is shared from Instagram without public media or caption text:
+  1. Reelix detects URL-only jobs before calling Gemini, avoiding empty-text API failures and infinite retry loops.
+  2. The job is marked `PARTIAL` with a clear explanation (`URL-only item without media or metadata; share reel video or provide notes`).
+  3. The item remains offline-searchable in Room FTS4 and displays a "Manual input needed" badge with guidance to share the video directly via Android share sheet or add personal notes.
+  4. If user notes or post captions are present, Gemini structured analysis proceeds normally.
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                            REELIX CLOUD ARCHITECTURE                         │
-│                           Phase 3.2 Verified Pipeline                        │
+│                           Phase 3.3 Verified Pipeline                        │
 └──────────────────────────────────────────────────────────────────────────────┘
    [ Instagram / Share Sheet ]
                 │
@@ -46,7 +44,7 @@ Phase 3.2 solidifies cloud processing reliability, API correctness, and concurre
    [ Android Reelix App ]
     - Receives URLs & Shared Media (video/audio)
     - Saves locally to Room SQLite + App-Private Storage
-    - Resumable streaming upload to Google Drive queue (session recovery, 0 heap buffering)
+    - Persistent Resumable Streaming Upload (SharedPreferencesResumableUploadStore)
                 │
                 ▼
    [ Persistent Cloud Storage: Google Drive (Personal My Drive under drive.file) ]
@@ -57,11 +55,11 @@ Phase 3.2 solidifies cloud processing reliability, API correctness, and concurre
                 │
                 ▼
    [ GitHub Actions Runner (Scheduled Cron / Manual Dispatch) ]
-    - Serialized concurrency (cancel-in-progress: false)
+    - Serialized concurrency: group: reelix-processing, cancel-in-progress: false
     - Application lease claim + Read-After-Write verification
     - FFmpeg: Extracts 16kHz 16-bit mono WAV audio
     - Whisper: CPU speech transcription (OpenAI Whisper base model with weight caching)
-    - Google AI Studio Gemini API: Structured knowledge extraction (gemini-3.8-flash)
+    - Google AI Studio Gemini API: Structured knowledge extraction (gemini-3.6-flash default)
     - Writes verified results back to jobs/<item_id>.json in Google Drive
                 │
                 ▼
@@ -70,7 +68,7 @@ Phase 3.2 solidifies cloud processing reliability, API correctness, and concurre
     - Downloads transcripts & structured Gemini intelligence
     - Honest state transition: COMPLETED vs PARTIAL vs FAILED
     - Stores into Room database & populates normalized AI tags
-    - Re-indexes SQLite FTS4 for instant offline search (even for partial transcripts)
+    - Re-indexes SQLite FTS4 for instant offline search (even for partial transcripts/metadata)
 ```
 
 ---
@@ -79,7 +77,7 @@ Phase 3.2 solidifies cloud processing reliability, API correctness, and concurre
 
 Reelix strictly adheres to the zero-cost principle:
 1. **Google Drive API (v3):** Standard Google accounts provide 15GB of persistent storage. Enabling Google Drive API in a personal GCP project requires **no billing account and no payment card**.
-2. **Google AI Studio (Gemini 3.8 Flash & Gemini 3.6 Flash):** Available on Google AI Studio's **Free Tier** with 1M token context windows, rate limits sufficient for personal usage, and **$0 cost** with no billing account required.
+2. **Google AI Studio (Gemini 3.6 Flash & Gemini 3.8 Flash):** `gemini-3.6-flash` is available on Google AI Studio's **Standard Free Tier** with free input and output tokens, 1M token context windows, rate limits sufficient for personal usage, and **$0 cost** with no billing account required.
 3. **GitHub Actions:** GitHub provides free runner minutes monthly for workflows.
 4. **Whisper:** Open-source OpenAI Whisper runs on GitHub Actions CPU runners with weight caching (`actions/cache@v4`).
 
@@ -121,7 +119,7 @@ python workers/processor/scripts/get_oauth_token.py
 ### 3. Get a Free Gemini API Key
 1. Go to [Google AI Studio](https://aistudio.google.com/).
 2. Click **Get API key** and create an API key (no credit card or billing account needed).
-3. Permitted models are `gemini-3.8-flash` (default) and `gemini-3.6-flash`.
+3. Permitted models are `gemini-3.6-flash` (default) and `gemini-3.8-flash`.
 
 ### 4. Add GitHub Repository Secrets
 In your GitHub repository (`https://github.com/VinitSurve/Reelix`), navigate to **Settings → Secrets and variables → Actions** and add:
@@ -130,7 +128,7 @@ In your GitHub repository (`https://github.com/VinitSurve/Reelix`), navigate to 
 - `GDRIVE_REFRESH_TOKEN`: The generated refresh token.
 - `GDRIVE_FOLDER_ID`: The authorized `Reelix_Vault` folder ID.
 - `GEMINI_API_KEY`: Your free Gemini API key.
-- `GEMINI_MODEL`: (Optional, defaults to `gemini-3.8-flash`; allowed alternative: `gemini-3.6-flash`).
+- `GEMINI_MODEL`: (Optional, defaults to `gemini-3.6-flash`; allowed alternative: `gemini-3.8-flash`).
 
 ### 5. Configure Reelix Android App
 1. Open Reelix on your device.
@@ -151,10 +149,10 @@ python3 -m unittest discover -s workers/processor/tests -v
 ```
 Output:
 ```text
-Ran 36 tests in 0.362s
+Ran 48 tests in 0.373s
 OK (skipped=5)
 ```
-*(31 unit & mock integration tests passed; 5 live external tests explicitly skipped when live credentials are not set)*
+*(43 unit & mock integration tests passed; 5 live external tests explicitly skipped when live credentials are not set)*
 
 ### 2. Run Android Unit Tests
 ```bash
@@ -163,7 +161,7 @@ OK (skipped=5)
 Output:
 ```text
 BUILD SUCCESSFUL
-46 tests completed, 0 failed, 0 skipped
+48 tests completed, 0 failed, 0 skipped
 ```
 
 ### 3. Build Android Debug APK

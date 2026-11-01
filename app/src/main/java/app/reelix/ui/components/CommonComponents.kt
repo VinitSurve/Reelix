@@ -97,7 +97,7 @@ fun ItemHonestStatusBadge(label: String, isAttention: Boolean, isAwaiting: Boole
         isAttention -> scheme.errorContainer to scheme.onErrorContainer
         isAwaiting -> scheme.surfaceVariant to scheme.onSurfaceVariant
         label == "AI enriched" -> scheme.primaryContainer to scheme.onPrimaryContainer
-        label == "Transcribed" -> scheme.tertiaryContainer to scheme.onTertiaryContainer
+        label == "Transcribed" || label == "Media needed" || label == "Manual input needed" -> scheme.tertiaryContainer to scheme.onTertiaryContainer
         label == "Media available" || label == "Audio extracted" -> scheme.secondaryContainer to scheme.onSecondaryContainer
         else -> scheme.secondaryContainer.copy(alpha = 0.7f) to scheme.onSecondaryContainer
     }
@@ -105,17 +105,27 @@ fun ItemHonestStatusBadge(label: String, isAttention: Boolean, isAwaiting: Boole
 }
 
 @Composable
-fun ProcessingStatusBadge(status: ProcessingStatus, modifier: Modifier = Modifier) {
+fun ProcessingStatusBadge(
+    status: ProcessingStatus,
+    errorMessage: String? = null,
+    isMediaAvailable: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
     val scheme = MaterialTheme.colorScheme
-    val (bg, fg) = when (status) {
-        ProcessingStatus.COMPLETED -> scheme.primaryContainer to scheme.onPrimaryContainer
-        ProcessingStatus.NEEDS_ATTENTION -> scheme.errorContainer to scheme.onErrorContainer
-        ProcessingStatus.QUEUED,
-        ProcessingStatus.PROCESSING,
-        ProcessingStatus.WAITING_RETRY,
-        -> scheme.surfaceVariant to scheme.onSurfaceVariant
+    val isManualInput = status == ProcessingStatus.NEEDS_ATTENTION &&
+        (!isMediaAvailable || errorMessage?.let {
+            it.contains("URL-only", ignoreCase = true) ||
+            it.contains("without media", ignoreCase = true) ||
+            it.contains("manual", ignoreCase = true)
+        } == true)
+
+    val (bg, fg, label) = when {
+        status == ProcessingStatus.COMPLETED -> Triple(scheme.primaryContainer, scheme.onPrimaryContainer, status.label)
+        isManualInput -> Triple(scheme.tertiaryContainer, scheme.onTertiaryContainer, "Manual input needed")
+        status == ProcessingStatus.NEEDS_ATTENTION -> Triple(scheme.errorContainer, scheme.onErrorContainer, status.label)
+        else -> Triple(scheme.surfaceVariant, scheme.onSurfaceVariant, status.label)
     }
-    Pill(text = status.label, containerColor = bg, contentColor = fg, modifier = modifier)
+    Pill(text = label, containerColor = bg, contentColor = fg, modifier = modifier)
 }
 
 @Composable

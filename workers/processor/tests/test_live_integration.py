@@ -54,6 +54,7 @@ class TestMockIntegration(unittest.TestCase):
         manifest = JobManifest(
             item_id="mock-item-1",
             source="URL",
+            caption="Mock pipeline integration test",
             status=JobStatus.QUEUED,
             created_at=int(time.time() * 1000),
             updated_at=int(time.time() * 1000),
@@ -82,7 +83,7 @@ class TestMockIntegration(unittest.TestCase):
                         key_takeaways=["Point 1"],
                         important_concepts=["Concept 1"],
                         actionable_steps=["Step 1"],
-                        model_name="gemini-3.8-flash",
+                        model_name="gemini-3.6-flash",
                         generated_at=int(time.time() * 1000),
                     ),
                 )
@@ -127,8 +128,19 @@ class TestLiveGoogleDriveIntegration(unittest.TestCase):
         self.config = WorkerConfig.from_env()
         self.client = GoogleDriveStorageClient(self.config)
         self.test_temp_dir = Path(tempfile.mkdtemp(prefix="reelix_live_drive_"))
+        self.created_file_ids: List[str] = []
 
     def tearDown(self):
+        if hasattr(self, "client") and hasattr(self, "created_file_ids"):
+            try:
+                service = self.client._get_service()
+                for fid in self.created_file_ids:
+                    try:
+                        service.files().delete(fileId=fid).execute()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         if hasattr(self, "test_temp_dir") and self.test_temp_dir.exists():
             shutil.rmtree(self.test_temp_dir, ignore_errors=True)
 
@@ -152,6 +164,7 @@ class TestLiveGoogleDriveIntegration(unittest.TestCase):
         # Upload audio/media
         uploaded_id = self.client.upload_audio(test_file, item_id="test-checksum-check")
         self.assertIsNotNone(uploaded_id, "Upload to Drive must return a file ID")
+        self.created_file_ids.append(uploaded_id)
 
         # Download back and verify checksum
         download_dest = self.test_temp_dir / "downloaded.mp4"
@@ -167,6 +180,7 @@ class TestLiveGoogleDriveIntegration(unittest.TestCase):
         manifest = JobManifest(
             item_id=item_id,
             source="URL",
+            caption="Live manifest lifecycle test",
             status=JobStatus.QUEUED,
             created_at=int(time.time() * 1000),
             updated_at=int(time.time() * 1000),
@@ -175,6 +189,17 @@ class TestLiveGoogleDriveIntegration(unittest.TestCase):
         # Create
         created_ok = self.client.update_job(manifest)
         self.assertTrue(created_ok, "Job manifest creation in Drive must succeed")
+
+        # Track file ID for cleanup
+        try:
+            service = self.client._get_service()
+            jobs_folder = self.client._ensure_subfolder("jobs")
+            query = f"'{jobs_folder}' in parents and name = '{item_id}.json' and trashed = false"
+            res = service.files().list(q=query, fields="files(id)").execute()
+            for f in res.get("files", []):
+                self.created_file_ids.append(f["id"])
+        except Exception:
+            pass
 
         # Claim
         claimed_ok = self.client.claim_job(manifest, runner_id="test-live-runner")
@@ -205,7 +230,7 @@ class TestLiveGeminiIntegration(unittest.TestCase):
             self.skipTest(
                 "Skipped: Live Gemini tests require LIVE_INTEGRATION_TESTS=1 and GEMINI_API_KEY in environment."
             )
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
         self.analyzer = GeminiAnalyzer(
             api_key=os.environ["GEMINI_API_KEY"],
             model=self.model,
@@ -235,6 +260,18 @@ class TestLiveGeminiIntegration(unittest.TestCase):
 class TestLiveEndToEnd(unittest.TestCase):
     """Categorized full end-to-end integration test combining live Drive and Gemini."""
 
+    def tearDown(self):
+        if hasattr(self, "test_job_id") and hasattr(self, "storage"):
+            try:
+                service = self.storage._get_service()
+                jobs_folder = self.storage._ensure_subfolder("jobs")
+                query = f"'{jobs_folder}' in parents and name = '{self.test_job_id}.json' and trashed = false"
+                res = service.files().list(q=query, fields="files(id)").execute()
+                for f in res.get("files", []):
+                    service.files().delete(fileId=f["id"]).execute()
+            except Exception:
+                pass
+
     def test_full_pipeline_run(self):
         """Operation 9: Complete worker pipeline cycle against live external services."""
         can_run = (
@@ -251,15 +288,16 @@ class TestLiveEndToEnd(unittest.TestCase):
             )
 
         config = WorkerConfig.from_env()
-        storage = GoogleDriveStorageClient(config)
+        self.storage = GoogleDriveStorageClient(config)
         analyzer = GeminiAnalyzer(api_key=config.gemini_api_key, model=config.gemini_model)
-        pipeline = CloudProcessingPipeline(config=config, storage=storage, gemini_analyzer=analyzer)
+        pipeline = CloudProcessingPipeline(config=config, storage=self.storage, gemini_analyzer=analyzer)
 
-        # Create live queued job
-        item_id = f"e2e-live-test-{int(time.time())}"
+        # Create isolated live queued job with valid content
+        self.test_job_id = f"e2e-live-test-{int(time.time())}"
         job = JobManifest(
-            item_id=item_id,
+            item_id=self.test_job_id,
             source="URL",
+            caption="Live end-to-end integration test of Reelix processing pipeline with Gemini analysis",
             status=JobStatus.QUEUED,
             created_at=int(time.time() * 1000),
             updated_at=int(time.time() * 1000),
@@ -269,16 +307,17 @@ class TestLiveEndToEnd(unittest.TestCase):
                 gemini_analysis=StageStatus.PENDING,
             ),
         )
-        storage.update_job(job)
+        self.storage.update_job(job)
 
-        # Execute
-        summary = pipeline.run_batch()
-        self.assertTrue(summary.total_found >= 1)
+        # Execute single test job directly to avoid touching other queued jobs in user vault
+        success = pipeline.process_job(job)
+        self.assertTrue(success)
 
-        completed_job = storage.get_job(item_id)
+        completed_job = self.storage.get_job(self.test_job_id)
         self.assertIsNotNone(completed_job)
         self.assertEqual(JobStatus.COMPLETED, completed_job.status)
         self.assertIsNotNone(completed_job.results.analysis)
+        self.assertEqual(config.gemini_model, completed_job.results.analysis.model_name)
 
 
 if __name__ == "__main__":

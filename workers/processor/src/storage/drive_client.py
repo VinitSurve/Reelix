@@ -243,7 +243,7 @@ class GoogleDriveStorageClient(StorageClient):
                         job.item_id, current_manifest.claimed_by
                     )
                     return False
-            elif current_manifest.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            elif current_manifest.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL):
                 logger.info("Job %s is already settled (%s); aborting claim", job.item_id, current_manifest.status.value)
                 return False
         except Exception as e:
@@ -290,7 +290,11 @@ class GoogleDriveStorageClient(StorageClient):
             return False
 
     def update_job(self, job: JobManifest) -> bool:
-        """Persists updated job manifest to Drive with lease verification."""
+        """Persists updated job manifest to Drive with lease ownership verification.
+
+        Guarantees that a worker whose lease has been lost or stolen cannot overwrite
+        another worker's manifest, protecting against time-of-check/time-of-use races.
+        """
         service = self._get_service()
         jobs_folder = self._ensure_subfolder("jobs")
         filename = f"{job.item_id}.json"
@@ -304,10 +308,11 @@ class GoogleDriveStorageClient(StorageClient):
 
         if files:
             remote_file_id = files[0]["id"]
-            # Concurrency check: verify remote manifest is still owned by this runner if in processing
             try:
                 remote_bytes = self._download_bytes(remote_file_id)
                 remote_manifest = JobManifest.from_json(remote_bytes.decode("utf-8"))
+
+                # Concurrency check 1: Lease ownership check
                 if (
                     remote_manifest.claimed_by
                     and job.claimed_by
@@ -318,17 +323,54 @@ class GoogleDriveStorageClient(StorageClient):
                         job.item_id, remote_manifest.claimed_by, job.claimed_by
                     )
                     return False
+
+                # Concurrency check 2: Do not overwrite settled jobs
+                if remote_manifest.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL) and job.status == JobStatus.PROCESSING:
+                    logger.warning(
+                        "Cannot update job %s: remote manifest is already settled (%s). Aborting update.",
+                        job.item_id, remote_manifest.status.value
+                    )
+                    return False
+
+                # Concurrency check 3: Version ordering
+                if (remote_manifest.version or 1) > (job.version or 1):
+                    logger.warning(
+                        "Cannot update job %s: remote manifest version (%d) is newer than local (%d). Aborting update.",
+                        job.item_id, remote_manifest.version, job.version
+                    )
+                    return False
+
+                job.version = (remote_manifest.version or 1) + 1
             except Exception as e:
                 logger.warning("Could not verify remote lease before update for %s: %s", job.item_id, e)
+                return False
 
             body_bytes = job.to_json().encode("utf-8")
             media_body = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json")
-            service.files().update(
-                fileId=remote_file_id,
-                media_body=media_body,
-                fields="id, modifiedTime, version",
-            ).execute()
+            try:
+                service.files().update(
+                    fileId=remote_file_id,
+                    media_body=media_body,
+                    fields="id, modifiedTime, version",
+                ).execute()
+            except Exception as e:
+                logger.error("Failed to update manifest for %s on Drive: %s", job.item_id, e)
+                return False
+
+            # Post-write verification
+            try:
+                verified_bytes = self._download_bytes(remote_file_id)
+                verified = JobManifest.from_json(verified_bytes.decode("utf-8"))
+                if job.claimed_by and verified.claimed_by and verified.claimed_by != job.claimed_by:
+                    logger.error(
+                        "Post-update collision detected for %s: claimed by %s instead of %s",
+                        job.item_id, verified.claimed_by, job.claimed_by
+                    )
+                    return False
+            except Exception as e:
+                logger.warning("Post-update verification error for %s: %s", job.item_id, e)
         else:
+            job.version = 1
             body_bytes = job.to_json().encode("utf-8")
             media_body = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json")
             file_metadata = {
@@ -336,11 +378,15 @@ class GoogleDriveStorageClient(StorageClient):
                 "parents": [jobs_folder],
                 "mimeType": "application/json",
             }
-            service.files().create(
-                body=file_metadata,
-                media_body=media_body,
-                fields="id, modifiedTime, version",
-            ).execute()
+            try:
+                service.files().create(
+                    body=file_metadata,
+                    media_body=media_body,
+                    fields="id, modifiedTime, version",
+                ).execute()
+            except Exception as e:
+                logger.error("Failed to create manifest for %s on Drive: %s", job.item_id, e)
+                return False
 
         return True
 

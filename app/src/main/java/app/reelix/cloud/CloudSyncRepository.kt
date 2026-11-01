@@ -66,6 +66,8 @@ class CloudSyncRepository(
             itemId = itemId,
             source = item.source.name,
             originalUrl = item.originalUrl,
+            caption = item.caption ?: item.userCaption,
+            userNotes = item.userNotes,
             status = "QUEUED",
             createdAt = item.createdAt,
             updatedAt = clock.now(),

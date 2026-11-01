@@ -8,13 +8,16 @@ from pathlib import Path
 from typing import Optional
 
 
-ALLOWED_GEMINI_MODELS = ("gemini-3.8-flash", "gemini-3.6-flash")
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+# Strictly restricted allowlist:
+# gemini-3.6-flash is the verified free-tier default (free input and output on Google AI Studio).
+# gemini-3.8-flash is an explicitly selectable permitted alternative.
+ALLOWED_GEMINI_MODELS = ("gemini-3.6-flash", "gemini-3.8-flash")
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 
 @dataclass
 class WorkerConfig:
-    # Google Gemini AI settings (Strictly restricted to gemini-3.8-flash and gemini-3.6-flash on Free Tier)
+    # Google Gemini AI settings (Strictly restricted to gemini-3.6-flash and gemini-3.8-flash on Free Tier)
     gemini_api_key: Optional[str] = None
     gemini_model: str = DEFAULT_GEMINI_MODEL
 

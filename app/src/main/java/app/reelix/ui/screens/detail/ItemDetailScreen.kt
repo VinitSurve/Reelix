@@ -276,7 +276,11 @@ fun ItemDetailScreen(
                                     Pill(text = "Copy #${item.copyIndex + 1}")
                                 }
                                 Spacer(Modifier.weight(1f))
-                                ProcessingStatusBadge(item.processingStatus)
+                                ProcessingStatusBadge(
+                                    status = item.processingStatus,
+                                    errorMessage = item.lastError,
+                                    isMediaAvailable = item.isMediaAvailable,
+                                )
                             }
                             Spacer(Modifier.height(10.dp))
 
@@ -338,21 +342,37 @@ fun ItemDetailScreen(
                     // 2. Error / Attention Banner (when present)
                     if (!item.lastError.isNullOrBlank()) {
                         item(key = "error_banner") {
+                            val isManualInputRequired = item.lastError.contains("URL-only", ignoreCase = true) ||
+                                item.lastError.contains("without media", ignoreCase = true) ||
+                                item.lastError.contains("manual", ignoreCase = true) ||
+                                (!item.isMediaAvailable && item.isNeedsAttention)
+
                             Surface(
                                 shape = RoundedCornerShape(14.dp),
-                                color = MaterialTheme.colorScheme.errorContainer,
-                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                                color = if (isManualInputRequired) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.errorContainer,
+                                contentColor = if (isManualInputRequired) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onErrorContainer,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Column(modifier = Modifier.padding(16.dp)) {
-                                    Text("Processing issue", style = MaterialTheme.typography.titleSmall)
+                                    Text(
+                                        text = if (isManualInputRequired) "Manual input required" else "Processing issue",
+                                        style = MaterialTheme.typography.titleSmall,
+                                    )
                                     Spacer(Modifier.height(4.dp))
                                     Text(item.lastError, style = MaterialTheme.typography.bodyMedium)
-                                    Spacer(Modifier.height(10.dp))
-                                    OutlinedButton(onClick = viewModel::retryFailed) {
-                                        Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("Retry failed stage")
+                                    if (isManualInputRequired) {
+                                        Spacer(Modifier.height(6.dp))
+                                        Text(
+                                            "Instagram URLs do not include public media. Share the reel video directly to Reelix or add personal notes below to enable knowledge extraction.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                        )
+                                    } else {
+                                        Spacer(Modifier.height(10.dp))
+                                        OutlinedButton(onClick = viewModel::retryFailed) {
+                                            Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Retry failed stage")
+                                        }
                                     }
                                 }
                             }
