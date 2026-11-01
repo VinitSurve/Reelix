@@ -4,7 +4,7 @@ Explicit test categories:
 - Mock integration tests: execute offline without external network or credentials.
 - Live Google Drive tests: verify real OAuth 2.0 authentication on personal My Drive under drive.file,
   Reelix_Vault creation in 'root', upload/download checksums, and manifest operations.
-- Live Gemini tests: verify real Gemini API calls strictly using permitted models (gemini-3.8-flash / gemini-3.6-flash).
+- Live Gemini tests: verify real Gemini API calls strictly using gemini-3.6-flash (permitted alternative: gemini-3.8-flash).
 - Full end-to-end tests: verify complete worker processing cycle against live services.
 
 Live tests are explicitly skipped unless LIVE_INTEGRATION_TESTS=1 and external credentials are provided in the environment.
@@ -230,7 +230,7 @@ class TestLiveGeminiIntegration(unittest.TestCase):
             self.skipTest(
                 "Skipped: Live Gemini tests require LIVE_INTEGRATION_TESTS=1 and GEMINI_API_KEY in environment."
             )
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        self.model = "gemini-3.6-flash"
         self.analyzer = GeminiAnalyzer(
             api_key=os.environ["GEMINI_API_KEY"],
             model=self.model,
@@ -288,8 +288,10 @@ class TestLiveEndToEnd(unittest.TestCase):
             )
 
         config = WorkerConfig.from_env()
+        # Live verification strictly uses gemini-3.6-flash
+        config.gemini_model = "gemini-3.6-flash"
         self.storage = GoogleDriveStorageClient(config)
-        analyzer = GeminiAnalyzer(api_key=config.gemini_api_key, model=config.gemini_model)
+        analyzer = GeminiAnalyzer(api_key=config.gemini_api_key, model="gemini-3.6-flash")
         pipeline = CloudProcessingPipeline(config=config, storage=self.storage, gemini_analyzer=analyzer)
 
         # Create isolated live queued job with valid content
@@ -317,7 +319,7 @@ class TestLiveEndToEnd(unittest.TestCase):
         self.assertIsNotNone(completed_job)
         self.assertEqual(JobStatus.COMPLETED, completed_job.status)
         self.assertIsNotNone(completed_job.results.analysis)
-        self.assertEqual(config.gemini_model, completed_job.results.analysis.model_name)
+        self.assertEqual("gemini-3.6-flash", completed_job.results.analysis.model_name)
 
 
 if __name__ == "__main__":

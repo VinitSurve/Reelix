@@ -45,27 +45,47 @@ class InMemoryResumableUploadStore : ResumableUploadStore {
 class SharedPreferencesResumableUploadStore(
     context: Context,
 ) : ResumableUploadStore {
+    companion object {
+        const val PREFS_NAME = "reelix_resumable_upload_sessions"
+        const val KEY_SCHEMA_VERSION = "__schema_version__"
+        const val CURRENT_SCHEMA_VERSION = 2
+    }
+
     private val prefs = context.applicationContext.getSharedPreferences(
-        "reelix_resumable_upload_sessions",
+        PREFS_NAME,
         Context.MODE_PRIVATE,
-    )
+    ).also { sp ->
+        // Invalidate legacy un-versioned sessions that lacked stable item IDs
+        val version = sp.getInt(KEY_SCHEMA_VERSION, 1)
+        if (version < CURRENT_SCHEMA_VERSION) {
+            sp.edit().clear().putInt(KEY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION).apply()
+        }
+    }
 
     override fun getSessionUri(key: String): String? {
+        if (key == KEY_SCHEMA_VERSION) return null
         return prefs.getString(key, null)
     }
 
     override fun saveSessionUri(key: String, uri: String) {
+        if (key == KEY_SCHEMA_VERSION) return
         prefs.edit().putString(key, uri).apply()
     }
 
     override fun removeSession(key: String) {
+        if (key == KEY_SCHEMA_VERSION) return
         prefs.edit().remove(key).apply()
     }
 }
 
-/** Generates a stable SHA-256 key based on canonical path, length, and modification timestamp. */
-fun buildResumableUploadKey(file: File, itemId: String? = null): String {
-    val raw = "${itemId.orEmpty()}_${file.canonicalPath}_${file.length()}_${file.lastModified()}"
+/**
+ * Generates a stable SHA-256 key combining Reelix item identity and file metadata.
+ * Differentiates different items sharing the same file or identical file names,
+ * while allowing legitimate retries of the same item and unchanged file to resume.
+ */
+fun buildResumableUploadKey(file: File, itemId: String): String {
+    require(itemId.isNotBlank()) { "itemId must not be blank" }
+    val raw = "item_${itemId.trim()}_${file.canonicalPath}_${file.length()}_${file.lastModified()}"
     val md = MessageDigest.getInstance("SHA-256")
     val digest = md.digest(raw.toByteArray(Charsets.UTF_8))
     return digest.joinToString("") { "%02x".format(it) }
@@ -104,7 +124,7 @@ class OffsetFileRequestBody(
 
 interface CloudSyncClient {
     suspend fun isConfigured(): Boolean
-    suspend fun uploadMedia(file: File, mimeType: String, originalFileName: String): CloudUploadResult
+    suspend fun uploadMedia(file: File, mimeType: String, originalFileName: String, itemId: String): CloudUploadResult
     suspend fun submitJobManifest(manifest: CloudJobManifest): Boolean
     suspend fun fetchJobManifest(itemId: String): CloudJobManifest?
     suspend fun listCompletedJobs(): List<CloudJobManifest>
@@ -139,7 +159,12 @@ class GoogleDriveCloudClient(
         return !token.isNullOrBlank()
     }
 
-    override suspend fun uploadMedia(file: File, mimeType: String, originalFileName: String): CloudUploadResult =
+    override suspend fun uploadMedia(
+        file: File,
+        mimeType: String,
+        originalFileName: String,
+        itemId: String,
+    ): CloudUploadResult =
         withContext(Dispatchers.IO) {
             if (!file.exists()) {
                 return@withContext CloudUploadResult.Failure("Media file does not exist on disk: ${file.absolutePath}")
@@ -162,7 +187,7 @@ class GoogleDriveCloudClient(
                 }
 
                 val totalLength = file.length()
-                val uploadKey = buildResumableUploadKey(file)
+                val uploadKey = buildResumableUploadKey(file, itemId)
                 var sessionUri = resumableStore.getSessionUri(uploadKey)
                 var resumeOffset = 0L
 
@@ -531,9 +556,14 @@ class MockCloudSyncClient(
 
     override suspend fun isConfigured(): Boolean = isEnabled
 
-    override suspend fun uploadMedia(file: File, mimeType: String, originalFileName: String): CloudUploadResult {
+    override suspend fun uploadMedia(
+        file: File,
+        mimeType: String,
+        originalFileName: String,
+        itemId: String,
+    ): CloudUploadResult {
         if (!isEnabled) return CloudUploadResult.Failure("Cloud client is disabled")
-        val uploadKey = buildResumableUploadKey(file)
+        val uploadKey = buildResumableUploadKey(file, itemId)
         val existingSession = resumableStore.getSessionUri(uploadKey)
 
         if (simulateInterruptionOnce && existingSession == null) {

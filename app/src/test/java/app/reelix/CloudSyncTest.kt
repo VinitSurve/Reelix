@@ -20,6 +20,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -296,17 +297,18 @@ class CloudSyncTest {
         }
         val client = container.fakeCloudClient
         client.simulateInterruptionOnce = true
+        val itemId = "test-item-resumable-1"
 
         // First attempt: interrupted
-        val firstResult = client.uploadMedia(testFile, "video/mp4", testFile.name)
+        val firstResult = client.uploadMedia(testFile, "video/mp4", testFile.name, itemId)
         assertTrue("First attempt should fail with simulated network failure", firstResult is app.reelix.cloud.CloudUploadResult.Failure)
 
-        val uploadKey = app.reelix.cloud.buildResumableUploadKey(testFile)
+        val uploadKey = app.reelix.cloud.buildResumableUploadKey(testFile, itemId)
         val savedSession = client.resumableStore.getSessionUri(uploadKey)
         assertNotNull("Resumable session URI should be preserved after interruption", savedSession)
 
         // Second attempt: resumes from preserved session URI
-        val secondResult = client.uploadMedia(testFile, "video/mp4", testFile.name)
+        val secondResult = client.uploadMedia(testFile, "video/mp4", testFile.name, itemId)
         assertTrue("Second attempt should succeed by recovering session", secondResult is app.reelix.cloud.CloudUploadResult.Success)
         assertEquals("Should have resumed from byte offset", testFile.length() / 2, client.lastUploadedOffset)
         assertEquals("Session URI should be cleaned up on completion", null, client.resumableStore.getSessionUri(uploadKey))
@@ -411,7 +413,7 @@ class CloudSyncTest {
         val testFile = File(testMediaDir, "persistent_video.mp4").apply {
             writeBytes("test file content for persistence".toByteArray())
         }
-        val key = app.reelix.cloud.buildResumableUploadKey(testFile)
+        val key = app.reelix.cloud.buildResumableUploadKey(testFile, "item-persist-123")
         val dummySessionUri = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=abc123session"
 
         // 1. Initial process instance writes session URI to persistent store
@@ -437,8 +439,186 @@ class CloudSyncTest {
         val f1 = File(dir1, "video.mp4").apply { writeBytes("video 1".toByteArray()) }
         val f2 = File(dir2, "video.mp4").apply { writeBytes("longer video 2 payload".toByteArray()) }
 
-        val key1 = app.reelix.cloud.buildResumableUploadKey(f1)
-        val key2 = app.reelix.cloud.buildResumableUploadKey(f2)
+        val key1 = app.reelix.cloud.buildResumableUploadKey(f1, "item-same")
+        val key2 = app.reelix.cloud.buildResumableUploadKey(f2, "item-same")
         assertFalse("Different file paths/lengths must produce distinct keys even with identical filenames", key1 == key2)
+    }
+
+    @Test
+    fun differentItemsWithIdenticalFileProduceDistinctUploadKeys() {
+        val testFile = File(testMediaDir, "shared_source.mp4").apply {
+            writeBytes("shared video payload".toByteArray())
+        }
+        val keyItemA = app.reelix.cloud.buildResumableUploadKey(testFile, "item-alpha")
+        val keyItemB = app.reelix.cloud.buildResumableUploadKey(testFile, "item-beta")
+
+        assertFalse(
+            "Two different Reelix items sharing the same physical file must have distinct upload keys",
+            keyItemA == keyItemB,
+        )
+    }
+
+    @Test
+    fun retriesForSameItemAndUnchangedFileReuseSameSession() {
+        val testFile = File(testMediaDir, "retry_source.mp4").apply {
+            writeBytes("payload for retry test".toByteArray())
+        }
+        val keyAttempt1 = app.reelix.cloud.buildResumableUploadKey(testFile, "item-retry-1")
+        val keyAttempt2 = app.reelix.cloud.buildResumableUploadKey(testFile, "item-retry-1")
+
+        assertEquals(
+            "Retries for the same item and unchanged file must produce identical keys to resume session",
+            keyAttempt1,
+            keyAttempt2,
+        )
+    }
+
+    @Test
+    fun changedFileForSameItemProducesDistinctUploadKey() {
+        val testFile = File(testMediaDir, "modifiable.mp4").apply {
+            writeBytes("initial bytes".toByteArray())
+        }
+        val key1 = app.reelix.cloud.buildResumableUploadKey(testFile, "item-mod-1")
+
+        // Modify file length and modification time
+        testFile.appendText(" appended more bytes")
+        val key2 = app.reelix.cloud.buildResumableUploadKey(testFile, "item-mod-1")
+
+        assertFalse(
+            "A modified file for the same item must produce a distinct key to prevent resuming old wrong session",
+            key1 == key2,
+        )
+    }
+
+    @Test
+    fun legacySessionsInvalidatedOnStoreMigration() {
+        // Populate a legacy store with v1 data (no schema version set)
+        val legacyPrefs = context.applicationContext.getSharedPreferences(
+            app.reelix.cloud.SharedPreferencesResumableUploadStore.PREFS_NAME,
+            android.content.Context.MODE_PRIVATE,
+        )
+        legacyPrefs.edit()
+            .putString("legacy_key_without_item_id", "https://drive.google.com/upload/legacy_session")
+            .remove(app.reelix.cloud.SharedPreferencesResumableUploadStore.KEY_SCHEMA_VERSION)
+            .commit()
+
+        // Initializing the store should detect schema_version < 2 and clear legacy ambiguous sessions
+        val migratedStore = app.reelix.cloud.SharedPreferencesResumableUploadStore(context)
+        val legacyVal = migratedStore.getSessionUri("legacy_key_without_item_id")
+        assertNull("Legacy session keys without item ID isolation must be invalidated on upgrade", legacyVal)
+    }
+
+    @Test
+    fun failedJobWithPartialResultsPreservesTranscriptAndIndexesInFts4() = runTest {
+        val testFile = File(testMediaDir, "failed_with_transcript.mp4").apply {
+            writeBytes("sample video for failed job".toByteArray())
+        }
+        val outcome = container.savedItemRepository.saveMediaItem(
+            media = ImportedMedia(testFile, "video/mp4", testFile.length(), 10000L, testFile.name),
+            associatedUrl = "https://www.instagram.com/p/failed_test_url/",
+            source = SaveSource.MEDIA_SHARE,
+        )
+        val itemId = (outcome as MediaSaveOutcome.Saved).itemId
+
+        // Cloud manifest is FAILED, but audio extraction and transcription had already succeeded
+        val failedManifest = CloudJobManifest(
+            itemId = itemId,
+            source = "MEDIA_SHARE",
+            status = "FAILED",
+            errorMessage = "Gemini API 500: Server internal error during analysis",
+            createdAt = container.clock.now() - 30_000L,
+            updatedAt = container.clock.now(),
+            stages = CloudStageStates(
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "FAILED",
+            ),
+            results = CloudJobResults(
+                transcript = "Astrophysics and gravitational wave astronomy detection principles",
+                transcriptModel = "base",
+                analysis = null,
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = failedManifest
+
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+
+        val item = container.savedItemRepository.getItem(itemId)
+        assertNotNull(item)
+        assertEquals(ProcessingStatus.NEEDS_ATTENTION, item!!.processingStatus)
+        assertEquals(StageStatus.SUCCEEDED, item.transcriptionStatus)
+        assertEquals(StageStatus.FAILED, item.analysisStatus)
+        assertTrue(item.lastError!!.contains("Gemini API 500"))
+
+        // Verify transcript is preserved in Room
+        val results = container.savedItemRepository.latestResults(itemId)
+        val transcriptRes = results.firstOrNull { it.stage == ProcessingStage.TRANSCRIPTION }
+        assertNotNull(transcriptRes)
+        assertTrue(transcriptRes!!.transcript!!.contains("gravitational wave"))
+
+        // Verify FTS4 offline search finds the item via the preserved transcript!
+        val search = container.savedItemRepository.search("astrophysics", ItemQuery()).first()
+        assertEquals(1, search.size)
+        assertEquals(itemId, search.first().id)
+    }
+
+    @Test
+    fun failedJobWithoutResultsDoesNotCauseIncorrectSearchEntries() = runTest {
+        val testFile = File(testMediaDir, "failed_empty.mp4").apply {
+            writeBytes("dummy content".toByteArray())
+        }
+        val outcome = container.savedItemRepository.saveMediaItem(
+            media = ImportedMedia(testFile, "video/mp4", testFile.length(), 10000L, testFile.name),
+            associatedUrl = "https://www.instagram.com/p/failed_empty_url/",
+            source = SaveSource.MEDIA_SHARE,
+        )
+        val itemId = (outcome as MediaSaveOutcome.Saved).itemId
+
+        // Item has title set by user
+        container.savedItemRepository.updateUserMetadata(
+            id = itemId,
+            metadata = app.reelix.domain.model.UserMetadata(
+                title = "Kubernetes Cluster Architecture Guide",
+                caption = null,
+                transcript = null,
+                notes = null,
+                category = null,
+                tags = emptyList(),
+            ),
+        )
+
+        // Cloud manifest is FAILED with ZERO results produced
+        val failedManifest = CloudJobManifest(
+            itemId = itemId,
+            source = "MEDIA_SHARE",
+            status = "FAILED",
+            errorMessage = "Download media failed: 404 Not Found in storage",
+            createdAt = container.clock.now() - 30_000L,
+            updatedAt = container.clock.now(),
+            stages = CloudStageStates(
+                audioExtraction = "FAILED",
+                transcription = "PENDING",
+                geminiAnalysis = "PENDING",
+            ),
+            results = CloudJobResults(),
+        )
+        container.fakeCloudClient.jobs[itemId] = failedManifest
+
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+
+        val item = container.savedItemRepository.getItem(itemId)
+        assertNotNull(item)
+        assertEquals(ProcessingStatus.NEEDS_ATTENTION, item!!.processingStatus)
+
+        // FTS4 should index its legitimate user metadata cleanly
+        val legitSearch = container.savedItemRepository.search("Kubernetes", ItemQuery()).first()
+        assertEquals(1, legitSearch.size)
+        assertEquals(itemId, legitSearch.first().id)
+
+        // Non-existent keywords should NOT return any search hits
+        val straySearch = container.savedItemRepository.search("Astrophysics", ItemQuery()).first()
+        assertTrue(straySearch.none { it.id == itemId })
     }
 }

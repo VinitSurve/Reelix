@@ -44,6 +44,7 @@ class CloudSyncRepository(
                 file = mediaFile,
                 mimeType = mimeType,
                 originalFileName = item.mediaFileName ?: mediaFile.name,
+                itemId = itemId,
             )
             when (uploadRes) {
                 is CloudUploadResult.Success -> {
@@ -246,6 +247,7 @@ class CloudSyncRepository(
                         lastError = errorMsg,
                         now = now,
                     )
+                    indexer.reindex(manifest.itemId)
                     processingDao.insertEvent(
                         ProcessingEventEntity(
                             savedItemId = manifest.itemId,

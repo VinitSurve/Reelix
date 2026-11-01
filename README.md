@@ -6,21 +6,25 @@ Reelix is a single-user, local-first Android knowledge vault for capturing, orga
 
 ---
 
-## What's New in Phase 3.3: Final Reliability Corrections, Gemini 3.6 Free-Tier Default & Persistent Upload Recovery
+## What's New in Phase 3.4: Final Corrections & Controlled Verification
 
-Phase 3.3 finalizes cloud processing reliability, API correctness, and concurrency guarantees:
+Phase 3.4 delivers complete reliability corrections and controlled live verification readiness:
 
-- **Gemini Free-Tier Default (`gemini-3.6-flash`):**
-  Reelix strictly allows **only two Google AI Studio models**:
-  - `gemini-3.6-flash` (Default)
+- **Stable Item-Isolated Resumable Upload Identity:**
+  Upload session keys strictly require and incorporate a stable Reelix item identifier alongside canonical file path, file length, and last modified timestamp (`item_${itemId}_${canonicalPath}_${length}_${lastModified}`):
+  1. Prevents cross-item session collisions when different items share identical files or temporary paths.
+  2. Guarantees legitimate retries of the same item and unchanged file safely resume from stored sessions.
+  3. Modifying a file produces a distinct key, preventing stale session resumption.
+  4. Automatically invalidates legacy un-versioned sessions via schema migration (`__schema_version__ = 2`) in `SharedPreferencesResumableUploadStore`.
+- **Failed-Job Offline Search Indexing:**
+  `CloudSyncRepository` now triggers `SearchIndexer.reindex(itemId)` for `FAILED` jobs:
+  1. Preserves and offline-indexes partial transcripts or metadata synchronized before job failure in Room FTS4.
+  2. Reindexes items without results cleanly, ensuring legitimate user metadata (e.g. title) remains searchable while preventing stray or incorrect search entries.
+- **Strict Gemini Model Enforcement:**
+  Active Reelix processing is strictly restricted to:
+  - `gemini-3.6-flash` (Default — verified zero-cost on Google AI Studio Standard Free Tier)
   - `gemini-3.8-flash` (Allowed Alternative)
-  Google AI Studio's Standard Free Tier provides free input and output tokens for `gemini-3.6-flash`. Reelix defaults to `gemini-3.6-flash` to ensure 100% zero-cost operation without requiring a credit card or Google Cloud billing account. `gemini-3.8-flash` remains available as an explicitly selectable permitted alternative. Automatic fallback to other models is strictly forbidden and rejected at configuration, workflow, and manifest validation.
-- **Durable App-Private Resumable Upload Sessions:**
-  Android-backed `SharedPreferencesResumableUploadStore` persists resumable Google Drive upload session URIs in app-private storage across process restarts:
-  1. Sessions survive app termination and background process kills.
-  2. Sessions are keyed by stable SHA-256 identity (`canonicalPath + length + lastModified`), preventing collisions across files with identical names.
-  3. Session URIs are securely stored and never emitted to logs.
-  4. Automatically resumes byte streams via `308 Resume Incomplete` queries and clears expired (`404/410`) sessions.
+  Live integration verification is strictly restricted to `gemini-3.6-flash`. Automatic fallback to other models is forbidden and fails fast before any API call.
 - **Single-Writer Concurrency Architecture:**
   Google Drive API v3 does not offer native atomic CAS or server-side file locking. Concurrency is guaranteed via:
   1. *Workflow Serialization:* GitHub Actions enforces `concurrency: group: reelix-processing, cancel-in-progress: false`, ensuring exactly one cloud worker runs at any time.
@@ -36,8 +40,40 @@ Phase 3.3 finalizes cloud processing reliability, API correctness, and concurren
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                            REELIX CLOUD ARCHITECTURE                         │
-│                           Phase 3.3 Verified Pipeline                        │
+│                           Phase 3.4 Verified Pipeline                        │
 └──────────────────────────────────────────────────────────────────────────────┘
+   [ Instagram / Share Sheet ]
+                │
+                ▼
+   [ Android Reelix App ]
+    - Receives URLs & Shared Media (video/audio)
+    - Saves locally to Room SQLite + App-Private Storage
+    - Item-isolated Resumable Streaming Upload (SharedPreferencesResumableUploadStore)
+                │
+                ▼
+   [ Persistent Cloud Storage: Google Drive (Personal My Drive under drive.file) ]
+    ├── Reelix_Vault/ (Auto-created in 'root' via API)
+    │   ├── jobs/<item_id>.json   (Leased manifests with Read-After-Write verification)
+    │   ├── media/<item_id>_*     (Raw shared media files)
+    │   └── audio/<item_id>.wav   (Extracted 16kHz mono WAV files)
+                │
+                ▼
+   [ GitHub Actions Runner (Scheduled Cron / Manual Dispatch) ]
+    - Serialized concurrency: group: reelix-processing, cancel-in-progress: false
+    - Application lease claim + Read-After-Write verification
+    - FFmpeg: Extracts 16kHz 16-bit mono WAV audio
+    - Whisper: CPU speech transcription (OpenAI Whisper base model with weight caching)
+    - Google AI Studio Gemini API: Structured knowledge extraction (gemini-3.6-flash default)
+    - Writes verified results back to jobs/<item_id>.json in Google Drive
+                │
+                ▼
+   [ Android Reelix Sync ]
+    - WorkManager CloudSyncWorker / Settings "Sync results now"
+    - Downloads transcripts & structured Gemini intelligence
+    - Honest state transition: COMPLETED vs PARTIAL vs FAILED
+    - Stores into Room database & populates normalized AI tags
+    - Re-indexes SQLite FTS4 for instant offline search (including partial and failed jobs)
+```
    [ Instagram / Share Sheet ]
                 │
                 ▼
@@ -161,7 +197,7 @@ OK (skipped=5)
 Output:
 ```text
 BUILD SUCCESSFUL
-48 tests completed, 0 failed, 0 skipped
+54 tests completed, 0 failed, 0 skipped
 ```
 
 ### 3. Build Android Debug APK
