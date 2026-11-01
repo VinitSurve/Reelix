@@ -10,13 +10,19 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import app.reelix.core.ReelixLog
 import app.reelix.integrations.analysis.ConnectionTestResult
 import app.reelix.integrations.analysis.OpenAiCompatibleAnalysisProvider
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import okhttp3.FormBody
 import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
 import java.io.IOException
 
 interface SettingsRepository {
@@ -27,6 +33,16 @@ interface SettingsRepository {
     fun apiKey(): String?
     suspend fun recordRun(at: Long, summary: String)
     suspend fun testAiConnection(baseUrl: String, model: String, apiKey: String?): ConnectionTestResult
+    fun cloudDriveAccessToken(): String?
+    fun cloudDriveRefreshToken(): String?
+    suspend fun setCloudDriveCredentials(
+        accessToken: String?,
+        refreshToken: String? = null,
+        clientId: String? = null,
+        clientSecret: String? = null,
+    )
+    suspend fun refreshCloudDriveAccessToken(): String?
+    suspend fun getValidDriveAccessToken(): String?
     suspend fun clear()
 }
 
@@ -34,7 +50,7 @@ private val Context.reelixDataStore: DataStore<Preferences> by preferencesDataSt
 
 fun Context.settingsDataStore(): DataStore<Preferences> = applicationContext.reelixDataStore
 
-/** DataStore-backed settings. The API key is held by [SecretStore], never in plain preferences. */
+/** DataStore-backed settings. Sensitive keys are encrypted with AES-256-GCM in [SecretStore], never in plain preferences. */
 class DataStoreSettingsRepository(
     private val dataStore: DataStore<Preferences>,
     private val secretStore: SecretStore,
@@ -55,7 +71,6 @@ class DataStoreSettingsRepository(
         val analysisModel = stringPreferencesKey("analysis_model")
         val cloudProcessingEnabled = booleanPreferencesKey("cloud_processing_enabled")
         val cloudDriveFolderId = stringPreferencesKey("cloud_drive_folder_id")
-        val cloudDriveToken = stringPreferencesKey("cloud_drive_token")
         val lastRunAt = longPreferencesKey("last_run_at")
         val lastRunSummary = stringPreferencesKey("last_run_summary")
     }
@@ -85,7 +100,8 @@ class DataStoreSettingsRepository(
             ),
             cloudProcessingEnabled = p[Keys.cloudProcessingEnabled] ?: defaults.cloudProcessingEnabled,
             cloudDriveFolderId = p[Keys.cloudDriveFolderId] ?: defaults.cloudDriveFolderId,
-            cloudDriveToken = p[Keys.cloudDriveToken] ?: defaults.cloudDriveToken,
+            hasCloudDriveToken = secretStore.get(CLOUD_DRIVE_TOKEN_ALIAS) != null,
+            hasCloudDriveRefreshToken = secretStore.get(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS) != null,
             lastRunAt = p[Keys.lastRunAt],
             lastRunSummary = p[Keys.lastRunSummary],
         )
@@ -108,7 +124,6 @@ class DataStoreSettingsRepository(
             p[Keys.analysisModel] = next.analysis.model.trim()
             p[Keys.cloudProcessingEnabled] = next.cloudProcessingEnabled
             p[Keys.cloudDriveFolderId] = next.cloudDriveFolderId.trim()
-            p[Keys.cloudDriveToken] = next.cloudDriveToken.trim()
         }
     }
 
@@ -118,6 +133,86 @@ class DataStoreSettingsRepository(
     }
 
     override fun apiKey(): String? = secretStore.get(API_KEY_ALIAS)
+
+    override fun cloudDriveAccessToken(): String? = secretStore.get(CLOUD_DRIVE_TOKEN_ALIAS)
+
+    override fun cloudDriveRefreshToken(): String? = secretStore.get(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS)
+
+    override suspend fun setCloudDriveCredentials(
+        accessToken: String?,
+        refreshToken: String?,
+        clientId: String?,
+        clientSecret: String?,
+    ) {
+        if (accessToken.isNullOrBlank()) {
+            secretStore.remove(CLOUD_DRIVE_TOKEN_ALIAS)
+        } else {
+            secretStore.put(CLOUD_DRIVE_TOKEN_ALIAS, accessToken.trim())
+        }
+        if (refreshToken.isNullOrBlank()) {
+            secretStore.remove(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS)
+        } else {
+            secretStore.put(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS, refreshToken.trim())
+        }
+        if (clientId.isNullOrBlank()) {
+            secretStore.remove(CLOUD_DRIVE_CLIENT_ID_ALIAS)
+        } else {
+            secretStore.put(CLOUD_DRIVE_CLIENT_ID_ALIAS, clientId.trim())
+        }
+        if (clientSecret.isNullOrBlank()) {
+            secretStore.remove(CLOUD_DRIVE_CLIENT_SECRET_ALIAS)
+        } else {
+            secretStore.put(CLOUD_DRIVE_CLIENT_SECRET_ALIAS, clientSecret.trim())
+        }
+        // Touch DataStore to notify observers
+        dataStore.edit { p ->
+            p[Keys.cloudProcessingEnabled] = p[Keys.cloudProcessingEnabled] ?: false
+        }
+    }
+
+    override suspend fun refreshCloudDriveAccessToken(): String? = withContext(Dispatchers.IO) {
+        val refreshToken = secretStore.get(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS) ?: return@withContext null
+        val clientId = secretStore.get(CLOUD_DRIVE_CLIENT_ID_ALIAS)
+        val clientSecret = secretStore.get(CLOUD_DRIVE_CLIENT_SECRET_ALIAS)
+
+        val formBuilder = FormBody.Builder()
+            .add("grant_type", "refresh_token")
+            .add("refresh_token", refreshToken)
+        if (!clientId.isNullOrBlank()) formBuilder.add("client_id", clientId)
+        if (!clientSecret.isNullOrBlank()) formBuilder.add("client_secret", clientSecret)
+
+        val request = Request.Builder()
+            .url("https://oauth2.googleapis.com/token")
+            .post(formBuilder.build())
+            .build()
+
+        try {
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    ReelixLog.w("Failed to refresh Google Drive OAuth token (${response.code})")
+                    return@withContext null
+                }
+                val body = response.body?.string().orEmpty()
+                val json = JSONObject(body)
+                val newAccessToken = json.optString("access_token")
+                if (newAccessToken.isNotBlank()) {
+                    secretStore.put(CLOUD_DRIVE_TOKEN_ALIAS, newAccessToken)
+                    ReelixLog.d("Successfully refreshed Google Drive OAuth access token")
+                    return@withContext newAccessToken
+                }
+                null
+            }
+        } catch (e: Exception) {
+            ReelixLog.w("Exception during Google Drive OAuth token refresh", e)
+            null
+        }
+    }
+
+    override suspend fun getValidDriveAccessToken(): String? {
+        val current = cloudDriveAccessToken()
+        if (!current.isNullOrBlank()) return current
+        return refreshCloudDriveAccessToken()
+    }
 
     override suspend fun recordRun(at: Long, summary: String) {
         dataStore.edit { p ->
@@ -140,10 +235,18 @@ class DataStoreSettingsRepository(
 
     override suspend fun clear() {
         secretStore.remove(API_KEY_ALIAS)
+        secretStore.remove(CLOUD_DRIVE_TOKEN_ALIAS)
+        secretStore.remove(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS)
+        secretStore.remove(CLOUD_DRIVE_CLIENT_ID_ALIAS)
+        secretStore.remove(CLOUD_DRIVE_CLIENT_SECRET_ALIAS)
         dataStore.edit { it.clear() }
     }
 
     companion object {
-        const val API_KEY_ALIAS = "analysis_api_key"
+        private const val API_KEY_ALIAS = "analysis_api_key"
+        private const val CLOUD_DRIVE_TOKEN_ALIAS = "cloud_drive_token"
+        private const val CLOUD_DRIVE_REFRESH_TOKEN_ALIAS = "cloud_drive_refresh_token"
+        private const val CLOUD_DRIVE_CLIENT_ID_ALIAS = "cloud_drive_client_id"
+        private const val CLOUD_DRIVE_CLIENT_SECRET_ALIAS = "cloud_drive_client_secret"
     }
 }

@@ -83,3 +83,4 @@ class FFmpegAudioExtractor:
             if output_wav.exists():
                 output_wav.unlink(missing_ok=True)
             return AudioExtractionOutcome(success=False, error=f"Unexpected error running ffmpeg: {e}")
+

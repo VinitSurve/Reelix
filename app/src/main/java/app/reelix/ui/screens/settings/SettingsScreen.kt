@@ -284,18 +284,24 @@ class SettingsViewModel(
     fun saveCloudConfig(
         enabled: Boolean,
         folderId: String,
-        token: String,
+        tokenInput: String,
+        refreshTokenInput: String = "",
     ) {
         viewModelScope.launch {
+            if (tokenInput.isNotBlank() || refreshTokenInput.isNotBlank()) {
+                settingsRepository.setCloudDriveCredentials(
+                    accessToken = tokenInput.ifBlank { null },
+                    refreshToken = refreshTokenInput.ifBlank { null },
+                )
+            }
             settingsRepository.update {
                 it.copy(
                     cloudProcessingEnabled = enabled,
                     cloudDriveFolderId = folderId.trim(),
-                    cloudDriveToken = token.trim(),
                 )
             }
             scheduler.syncPeriodicSchedule()
-            _feedback.value = "Cloud processing configuration saved."
+            _feedback.value = "Cloud processing configuration saved in Android Keystore."
         }
     }
 
@@ -409,7 +415,8 @@ fun SettingsScreen(
 
     var cloudEnabled by remember(settings.cloudProcessingEnabled) { mutableStateOf(settings.cloudProcessingEnabled) }
     var cloudFolderId by remember(settings.cloudDriveFolderId) { mutableStateOf(settings.cloudDriveFolderId) }
-    var cloudToken by remember(settings.cloudDriveToken) { mutableStateOf(settings.cloudDriveToken) }
+    var cloudToken by rememberSaveable { mutableStateOf("") }
+    var cloudRefreshToken by rememberSaveable { mutableStateOf("") }
     val isSyncingCloud by viewModel.isSyncingCloud.collectAsStateWithLifecycle()
 
     val modelPickerLauncher = rememberLauncherForActivityResult(
@@ -501,11 +508,31 @@ fun SettingsScreen(
                         OutlinedTextField(
                             value = cloudToken,
                             onValueChange = { cloudToken = it },
-                            label = { Text("Google Drive Access Token / API Key") },
-                            placeholder = { Text("OAuth Bearer token or Service Account Token") },
+                            label = {
+                                Text(
+                                    if (settings.hasCloudDriveToken) "Replace Access Token (Stored in Keystore)"
+                                    else "Google Drive Access Token (Stored in Keystore)"
+                                )
+                            },
+                            placeholder = { Text("Bearer access token") },
                             visualTransformation = PasswordVisualTransformation(),
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth().testTag("cloud_token_input"),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = cloudRefreshToken,
+                            onValueChange = { cloudRefreshToken = it },
+                            label = {
+                                Text(
+                                    if (settings.hasCloudDriveRefreshToken) "Replace Refresh Token (Stored in Keystore)"
+                                    else "OAuth Refresh Token (Recommended for auto-refresh)"
+                                )
+                            },
+                            placeholder = { Text("1//04... OAuth refresh token") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("cloud_refresh_token_input"),
                         )
                         Spacer(Modifier.height(10.dp))
                         Row(
@@ -514,7 +541,9 @@ fun SettingsScreen(
                         ) {
                             Button(
                                 onClick = {
-                                    viewModel.saveCloudConfig(cloudEnabled, cloudFolderId, cloudToken)
+                                    viewModel.saveCloudConfig(cloudEnabled, cloudFolderId, cloudToken, cloudRefreshToken)
+                                    cloudToken = ""
+                                    cloudRefreshToken = ""
                                 },
                                 modifier = Modifier.testTag("save_cloud_config_button"),
                             ) {

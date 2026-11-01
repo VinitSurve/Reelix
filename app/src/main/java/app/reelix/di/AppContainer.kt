@@ -186,8 +186,9 @@ class DefaultAppContainer(
     override val cloudSyncClient: app.reelix.cloud.CloudSyncClient by lazy {
         app.reelix.cloud.GoogleDriveCloudClient(
             client = httpClient,
-            folderIdProvider = { kotlinx.coroutines.runBlocking { settingsRepository.current().cloudDriveFolderId } },
-            tokenProvider = { kotlinx.coroutines.runBlocking { settingsRepository.current().cloudDriveToken } },
+            folderIdProvider = { settingsRepository.current().cloudDriveFolderId },
+            tokenProvider = { settingsRepository.getValidDriveAccessToken() },
+            tokenRefresher = { settingsRepository.refreshCloudDriveAccessToken() },
         )
     }
 

@@ -12,9 +12,15 @@ from typing import Optional
 class WorkerConfig:
     # Google Gemini AI settings
     gemini_api_key: Optional[str] = None
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemini-2.5-flash"
 
-    # Google Drive persistent storage settings
+    # Google Drive persistent storage settings (OAuth 2.0 on behalf of personal Google account)
+    gdrive_client_id: Optional[str] = None
+    gdrive_client_secret: Optional[str] = None
+    gdrive_refresh_token: Optional[str] = None
+    gdrive_access_token: Optional[str] = None
+
+    # Legacy / Shared Drive Service Account settings (optional fallback)
     gdrive_service_account_json: Optional[str] = None
     gdrive_service_account_path: Optional[str] = None
     gdrive_folder_id: Optional[str] = None
@@ -24,6 +30,7 @@ class WorkerConfig:
     whisper_model: str = "base"
     work_dir: Path = Path("/tmp/reelix_worker")
     runner_id: str = "local-runner"
+    lease_timeout_ms: int = 900_000  # 15 minutes lease before an active job can be reclaimed
 
     # Testing / Dry-run mode
     mock_mode: bool = False
@@ -40,7 +47,11 @@ class WorkerConfig:
 
         return cls(
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            gdrive_client_id=os.getenv("GDRIVE_CLIENT_ID"),
+            gdrive_client_secret=os.getenv("GDRIVE_CLIENT_SECRET"),
+            gdrive_refresh_token=os.getenv("GDRIVE_REFRESH_TOKEN"),
+            gdrive_access_token=os.getenv("GDRIVE_ACCESS_TOKEN"),
             gdrive_service_account_json=os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON"),
             gdrive_service_account_path=os.getenv("GDRIVE_SERVICE_ACCOUNT_PATH"),
             gdrive_folder_id=os.getenv("GDRIVE_FOLDER_ID"),
@@ -48,5 +59,6 @@ class WorkerConfig:
             whisper_model=os.getenv("WHISPER_MODEL", "base"),
             work_dir=work_dir,
             runner_id=runner_id,
-            mock_mode=os.getenv("REELIX_MOCK_MODE", "false").lower() in ("true", "1", "yes"),
+            lease_timeout_ms=int(os.getenv("LEASE_TIMEOUT_MS", "900000")),
+            mock_mode=os.getenv("MOCK_STORAGE", "").lower() in ("true", "1", "yes"),
         )

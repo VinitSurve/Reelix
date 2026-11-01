@@ -91,7 +91,7 @@ class CloudSyncTest {
                     keyTakeaways = listOf("Use Dispatchers.IO for disk operations", "Always respect cancellation"),
                     importantConcepts = listOf("Structured Concurrency", "CoroutineScope"),
                     actionableSteps = listOf("Wrap calls in viewModelScope.launch", "Avoid GlobalScope"),
-                    modelName = "gemini-1.5-flash",
+                    modelName = "gemini-2.5-flash",
                     generatedAt = 1730000500000L,
                 ),
             ),
@@ -128,7 +128,7 @@ class CloudSyncTest {
         assertEquals("Kotlin Coroutines", parsed.results.analysis!!.mainTopic)
         assertEquals(listOf("android", "kotlin", "concurrency"), parsed.results.analysis!!.tags)
         assertEquals(listOf("Structured Concurrency", "CoroutineScope"), parsed.results.analysis!!.importantConcepts)
-        assertEquals("gemini-1.5-flash", parsed.results.analysis!!.modelName)
+        assertEquals("gemini-2.5-flash", parsed.results.analysis!!.modelName)
     }
 
     @Test
@@ -156,9 +156,11 @@ class CloudSyncTest {
             it.copy(
                 cloudProcessingEnabled = true,
                 cloudDriveFolderId = "folder_root_123",
-                cloudDriveToken = "token_abc",
             )
         }
+        container.settingsRepository.setCloudDriveCredentials(
+            accessToken = "token_abc",
+        )
 
         val uploaded = container.cloudSyncRepository.uploadPendingItem(itemId)
         assertTrue("Pending item should be successfully uploaded to mock cloud", uploaded)
@@ -228,7 +230,7 @@ class CloudSyncTest {
                     keyTakeaways = listOf("Use FTS4 for fast local search", "Index transcripts and summaries"),
                     importantConcepts = listOf("Virtual Table", "Match Query"),
                     actionableSteps = listOf("Create entity extending Fts4", "Call reindex after inserts"),
-                    modelName = "gemini-1.5-flash",
+                    modelName = "gemini-2.5-flash",
                     generatedAt = container.clock.now(),
                 ),
             ),

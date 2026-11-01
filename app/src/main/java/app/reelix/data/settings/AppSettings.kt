@@ -24,7 +24,8 @@ data class AppSettings(
     val analysis: AnalysisProviderSettings = AnalysisProviderSettings(),
     val cloudProcessingEnabled: Boolean = false,
     val cloudDriveFolderId: String = "",
-    val cloudDriveToken: String = "",
+    val hasCloudDriveToken: Boolean = false,
+    val hasCloudDriveRefreshToken: Boolean = false,
     val lastRunAt: Long? = null,
     val lastRunSummary: String? = null,
 ) {

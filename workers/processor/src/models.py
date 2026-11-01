@@ -84,7 +84,7 @@ class GeminiAnalysisResult:
             key_takeaways=data.get("key_takeaways", []),
             important_concepts=data.get("important_concepts", []),
             actionable_steps=data.get("actionable_steps", []),
-            model_name=data.get("model_name", "gemini-1.5-flash"),
+            model_name=data.get("model_name", "gemini-2.5-flash"),
             generated_at=data.get("generated_at", 0),
         )
 
@@ -121,6 +121,8 @@ class JobManifest:
     status: JobStatus = JobStatus.QUEUED
     claimed_by: Optional[str] = None
     claimed_at: Optional[int] = None
+    lease_timeout_ms: Optional[int] = 900_000
+    etag: Optional[str] = None
     retry_count: int = 0
     max_retries: int = 3
     error_message: Optional[str] = None
@@ -160,6 +162,8 @@ class JobManifest:
             status=JobStatus(data.get("status", JobStatus.QUEUED.value)),
             claimed_by=data.get("claimed_by"),
             claimed_at=data.get("claimed_at"),
+            lease_timeout_ms=data.get("lease_timeout_ms", 900_000),
+            etag=data.get("etag"),
             created_at=data.get("created_at", 0),
             updated_at=data.get("updated_at", 0),
             retry_count=data.get("retry_count", 0),

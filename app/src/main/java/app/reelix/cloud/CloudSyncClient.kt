@@ -10,6 +10,7 @@ import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
+import java.net.URLEncoder
 
 sealed interface CloudUploadResult {
     data class Success(val driveFileId: String, val sizeBytes: Long) : CloudUploadResult
@@ -24,14 +25,23 @@ interface CloudSyncClient {
     suspend fun listCompletedJobs(): List<CloudJobManifest>
 }
 
+data class MockUploadedFile(
+    val name: String,
+    val sizeBytes: Long,
+    val mimeType: String,
+)
+
 /**
- * Android client for Google Drive v3 persistent storage.
- * Communicates with the Google Drive REST API using a scoped user OAuth token or service proxy.
+ * Android client for Google Drive v3 persistent storage using least-privilege OAuth 2.0.
+ *
+ * Implements chunked streaming resumable uploads so video files are NEVER loaded entirely into RAM.
+ * Handles token expiration, duplicate avoidance, and transient network errors.
  */
 class GoogleDriveCloudClient(
     private val client: OkHttpClient,
-    private val folderIdProvider: () -> String?,
-    private val tokenProvider: () -> String?,
+    private val folderIdProvider: suspend () -> String?,
+    private val tokenProvider: suspend () -> String?,
+    private val tokenRefresher: (suspend () -> String?)? = null,
 ) : CloudSyncClient {
 
     override suspend fun isConfigured(): Boolean {
@@ -42,53 +52,84 @@ class GoogleDriveCloudClient(
 
     override suspend fun uploadMedia(file: File, mimeType: String, originalFileName: String): CloudUploadResult =
         withContext(Dispatchers.IO) {
-            val token = tokenProvider() ?: return@withContext CloudUploadResult.Failure("Google Drive authentication token missing")
-            val rootFolderId = folderIdProvider() ?: return@withContext CloudUploadResult.Failure("Google Drive folder ID missing")
+            if (!file.exists()) {
+                return@withContext CloudUploadResult.Failure("Media file does not exist on disk: ${file.absolutePath}")
+            }
+
+            var token = tokenProvider()
+                ?: return@withContext CloudUploadResult.Failure("Google Drive authentication token missing")
+            val rootFolderId = folderIdProvider()
+                ?: return@withContext CloudUploadResult.Failure("Google Drive folder ID missing")
 
             try {
                 // 1. Ensure/get media folder
                 val mediaFolderId = ensureSubfolder("media", rootFolderId, token)
 
-                // 2. Upload file
+                // 2. Duplicate avoidance check
+                val existingFileId = findFileInFolder(originalFileName, mediaFolderId, token)
+                if (existingFileId != null) {
+                    ReelixLog.d("File $originalFileName already uploaded to Drive (id=$existingFileId); reusing")
+                    return@withContext CloudUploadResult.Success(driveFileId = existingFileId, sizeBytes = file.length())
+                }
+
+                // 3. Initiate Resumable Upload session (avoids loading media file into RAM)
+                val mimeTypeStr = mimeType.ifBlank { "application/octet-stream" }
+                val initUrl = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
                 val metadata = JSONObject().apply {
                     put("name", originalFileName)
                     put("parents", org.json.JSONArray().put(mediaFolderId))
                 }
 
-                // Simple upload using Drive upload endpoint
-                val url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-                val boundary = "ReelixMultipartBoundary${System.currentTimeMillis()}"
-                val mimeTypeStr = mimeType.ifBlank { "application/octet-stream" }
-
-                val metadataHeader = "--$boundary\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n"
-                val fileHeader = "--$boundary\r\nContent-Type: $mimeTypeStr\r\n\r\n"
-                val closing = "\r\n--$boundary--"
-
-                val metaBytes = metadataHeader.toByteArray(Charsets.UTF_8)
-                val fileHeaderBytes = fileHeader.toByteArray(Charsets.UTF_8)
-                val closingBytes = closing.toByteArray(Charsets.UTF_8)
-
-                val fileBytes = file.readBytes()
-                val totalBytes = metaBytes + fileHeaderBytes + fileBytes + closingBytes
-
-                val request = Request.Builder()
-                    .url(url)
-                    .addHeader("Authorization", "Bearer $token")
-                    .post(totalBytes.toRequestBody("multipart/related; boundary=$boundary".toMediaType()))
+                fun buildInitRequest(authToken: String): Request = Request.Builder()
+                    .url(initUrl)
+                    .addHeader("Authorization", "Bearer $authToken")
+                    .addHeader("X-Upload-Content-Type", mimeTypeStr)
+                    .addHeader("X-Upload-Content-Length", file.length().toString())
+                    .post(metadata.toString().toByteArray().toRequestBody("application/json; charset=UTF-8".toMediaType()))
                     .build()
 
-                client.newCall(request).execute().use { response ->
+                var initResp = client.newCall(buildInitRequest(token)).execute()
+
+                // Token expiration recovery
+                if (initResp.code == 401 && tokenRefresher != null) {
+                    initResp.close()
+                    ReelixLog.d("Drive access token expired during upload initiation; refreshing...")
+                    val refreshed = tokenRefresher.invoke()
+                    if (!refreshed.isNullOrBlank()) {
+                        token = refreshed
+                        initResp = client.newCall(buildInitRequest(token)).execute()
+                    }
+                }
+
+                val uploadLocation = initResp.use { response ->
                     if (!response.isSuccessful) {
                         val body = response.body?.string().orEmpty()
-                        return@withContext CloudUploadResult.Failure("Drive upload failed (${response.code}): $body")
+                        return@withContext CloudUploadResult.Failure("Failed to initiate Drive resumable upload (${response.code}): $body")
                     }
-                    val json = JSONObject(response.body?.string().orEmpty())
+                    response.header("Location")
+                        ?: return@withContext CloudUploadResult.Failure("Missing Location header in resumable upload session")
+                }
+
+                // 4. Stream the file directly from disk into the resumable session (Okio 8KB buffer streaming)
+                val streamBody = file.asRequestBody(mimeTypeStr.toMediaType())
+                val uploadReq = Request.Builder()
+                    .url(uploadLocation)
+                    .put(streamBody)
+                    .build()
+
+                client.newCall(uploadReq).execute().use { uploadResp ->
+                    if (!uploadResp.isSuccessful) {
+                        val body = uploadResp.body?.string().orEmpty()
+                        return@withContext CloudUploadResult.Failure("Streaming upload failed (${uploadResp.code}): $body")
+                    }
+                    val json = JSONObject(uploadResp.body?.string().orEmpty())
                     val fileId = json.getString("id")
+                    ReelixLog.d("Streaming upload succeeded for $originalFileName (driveFileId=$fileId)")
                     CloudUploadResult.Success(driveFileId = fileId, sizeBytes = file.length())
                 }
             } catch (e: Exception) {
-                ReelixLog.w("Failed to upload media to Google Drive", e)
-                CloudUploadResult.Failure("Exception during upload: ${e.message}")
+                ReelixLog.w("Failed to stream media to Google Drive", e)
+                CloudUploadResult.Failure("Exception during Drive streaming upload: ${e.message}")
             }
         }
 
@@ -231,7 +272,7 @@ class GoogleDriveCloudClient(
 
     private fun findFolderInParent(name: String, parentId: String, token: String): String? {
         val q = "name = '$name' and mimeType = 'application/vnd.google-apps.folder' and '$parentId' in parents and trashed = false"
-        val url = "https://www.googleapis.com/drive/v3/files?q=${java.net.URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
+        val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
         val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $token").get().build()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return null
@@ -244,7 +285,7 @@ class GoogleDriveCloudClient(
 
     private fun findFileInFolder(name: String, folderId: String, token: String): String? {
         val q = "name = '$name' and '$folderId' in parents and trashed = false"
-        val url = "https://www.googleapis.com/drive/v3/files?q=${java.net.URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
+        val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
         val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $token").get().build()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return null
@@ -256,10 +297,10 @@ class GoogleDriveCloudClient(
     }
 }
 
-/** In-memory mock cloud client for deterministic local unit testing. */
+/** In-memory mock cloud client for deterministic local unit testing without RAM buffering. */
 class MockCloudSyncClient : CloudSyncClient {
     val jobs = mutableMapOf<String, CloudJobManifest>()
-    val uploadedFiles = mutableMapOf<String, ByteArray>()
+    val uploadedFiles = mutableMapOf<String, MockUploadedFile>()
     var isEnabled: Boolean = true
 
     override suspend fun isConfigured(): Boolean = isEnabled
@@ -267,7 +308,12 @@ class MockCloudSyncClient : CloudSyncClient {
     override suspend fun uploadMedia(file: File, mimeType: String, originalFileName: String): CloudUploadResult {
         if (!isEnabled) return CloudUploadResult.Failure("Cloud client is disabled")
         val fileId = "drive_${System.currentTimeMillis()}_${file.name}"
-        uploadedFiles[fileId] = file.readBytes()
+        // Record upload metadata without loading entire file into memory
+        uploadedFiles[fileId] = MockUploadedFile(
+            name = originalFileName,
+            sizeBytes = file.length(),
+            mimeType = mimeType,
+        )
         return CloudUploadResult.Success(driveFileId = fileId, sizeBytes = file.length())
     }
 

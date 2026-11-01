@@ -69,7 +69,7 @@ class FakeAnalyzer:
                 key_takeaways=["takeaway1"],
                 important_concepts=["concept1"],
                 actionable_steps=["step1"],
-                model_name="gemini-1.5-flash",
+                model_name="gemini-2.5-flash",
                 generated_at=1000,
             ),
         )
@@ -183,6 +183,121 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(JobStatus.FAILED, j2.status)
         self.assertEqual(2, j2.retry_count)
 
+    def test_concurrent_worker_claim_collision_rejected(self):
+        job = JobManifest(
+            item_id="item-collision-test",
+            source="URL",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            stages=StageStates(
+                audio_extraction=StageStatus.SUCCEEDED,
+                transcription=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.SUCCEEDED,
+            ),
+        )
+        self.storage.update_job(job)
+
+        pipeline_a = CloudProcessingPipeline(
+            config=WorkerConfig(work_dir=self.test_dir / "work_a", runner_id="runner-A"),
+            storage=self.storage,
+            gemini_analyzer=FakeAnalyzer(success=True),
+        )
+        pipeline_b = CloudProcessingPipeline(
+            config=WorkerConfig(work_dir=self.test_dir / "work_b", runner_id="runner-B"),
+            storage=self.storage,
+            gemini_analyzer=FakeAnalyzer(success=True),
+        )
+
+        job_a = self.storage.get_job("item-collision-test")
+        job_b = self.storage.get_job("item-collision-test")
+
+        # Worker A claims the job with job_a's ETag
+        claimed_a = pipeline_a.process_job(job_a)
+        self.assertTrue(claimed_a)
+
+        # Worker B tries to claim using stale ETag from before Worker A claimed it
+        claimed_b = pipeline_b.process_job(job_b)
+        self.assertFalse(claimed_b, "Worker B should be rejected due to ETag mismatch or active lease")
+
+    def test_stale_processing_job_reclaimed_after_lease_expires(self):
+        import time
+
+        now_ms = int(time.time() * 1000)
+        # Job marked PROCESSING 30 minutes ago (lease is 15 minutes)
+        stale_job = JobManifest(
+            item_id="item-stale-lease",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="dead-runner",
+            claimed_at=now_ms - (30 * 60 * 1000),
+            lease_timeout_ms=15 * 60 * 1000,
+            created_at=now_ms - 3600000,
+            updated_at=now_ms - 1800000,
+            stages=StageStates(
+                audio_extraction=StageStatus.SUCCEEDED,
+                transcription=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.SUCCEEDED,
+            ),
+        )
+        self.storage.update_job(stale_job)
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            gemini_analyzer=FakeAnalyzer(success=True),
+        )
+
+        # list_queued_jobs should pick up the stale job
+        queued = self.storage.list_queued_jobs(limit=5)
+        self.assertTrue(any(j.item_id == "item-stale-lease" for j in queued))
+
+        # Running batch should successfully reclaim and complete it
+        summary = pipeline.run_batch()
+        self.assertEqual(1, summary.succeeded)
+
+        completed = self.storage.get_job("item-stale-lease")
+        self.assertEqual(JobStatus.COMPLETED, completed.status)
+        self.assertEqual(self.config.runner_id, completed.claimed_by)
+
+    def test_active_processing_job_not_stolen(self):
+        import time
+
+        now_ms = int(time.time() * 1000)
+        # Job marked PROCESSING 1 minute ago (lease is 15 minutes)
+        active_job = JobManifest(
+            item_id="item-active-lease",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="active-runner-xyz",
+            claimed_at=now_ms - (60 * 1000),
+            lease_timeout_ms=15 * 60 * 1000,
+            created_at=now_ms - 120000,
+            updated_at=now_ms - 60000,
+            stages=StageStates(
+                audio_extraction=StageStatus.SUCCEEDED,
+                transcription=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.SUCCEEDED,
+            ),
+        )
+        self.storage.update_job(active_job)
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            gemini_analyzer=FakeAnalyzer(success=True),
+        )
+
+        # list_queued_jobs should NOT pick up an active job
+        queued = self.storage.list_queued_jobs(limit=5)
+        self.assertFalse(any(j.item_id == "item-active-lease" for j in queued))
+
+        # Attempting to process directly should be rejected
+        claimed = pipeline.process_job(active_job)
+        self.assertFalse(claimed, "Active job with valid lease must not be claimed")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

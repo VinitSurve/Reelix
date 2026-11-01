@@ -82,3 +82,4 @@ class WhisperTranscriber:
                 duration_seconds=elapsed,
                 error=f"Whisper inference error: {e}",
             )
+

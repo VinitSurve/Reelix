@@ -10,7 +10,7 @@ from workers.processor.src.stages.gemini_analyzer import GeminiAnalyzer
 class TestGeminiAnalyzer(unittest.TestCase):
 
     def setUp(self):
-        self.analyzer = GeminiAnalyzer(api_key="test-api-key", model="gemini-1.5-flash")
+        self.analyzer = GeminiAnalyzer(api_key="test-api-key", model="gemini-2.5-flash")
 
     def test_missing_api_key_returns_error(self):
         no_key = GeminiAnalyzer(api_key=None)
@@ -81,8 +81,9 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertEqual(2, len(res.result.key_takeaways))
         self.assertEqual(2, len(res.result.important_concepts))
         self.assertEqual(3, len(res.result.actionable_steps))
-        self.assertEqual("gemini-1.5-flash", res.result.model_name)
+        self.assertEqual("gemini-2.5-flash", res.result.model_name)
 
 
 if __name__ == "__main__":
     unittest.main()
+

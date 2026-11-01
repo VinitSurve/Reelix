@@ -18,6 +18,8 @@ data class CloudJobManifest(
     val status: String = "QUEUED",
     val claimedBy: String? = null,
     val claimedAt: Long? = null,
+    val leaseTimeoutMs: Long? = 900_000L,
+    val etag: String? = null,
     val createdAt: Long,
     val updatedAt: Long,
     val retryCount: Int = 0,
@@ -36,6 +38,8 @@ data class CloudJobManifest(
         root.put("status", status)
         if (claimedBy != null) root.put("claimed_by", claimedBy)
         if (claimedAt != null) root.put("claimed_at", claimedAt)
+        if (leaseTimeoutMs != null) root.put("lease_timeout_ms", leaseTimeoutMs)
+        if (etag != null) root.put("etag", etag)
         root.put("created_at", createdAt)
         root.put("updated_at", updatedAt)
         root.put("retry_count", retryCount)
@@ -119,7 +123,7 @@ data class CloudJobManifest(
                     keyTakeaways = it.optJSONArray("key_takeaways")?.toStringList() ?: emptyList(),
                     importantConcepts = it.optJSONArray("important_concepts")?.toStringList() ?: emptyList(),
                     actionableSteps = it.optJSONArray("actionable_steps")?.toStringList() ?: emptyList(),
-                    modelName = it.optString("model_name", "gemini-1.5-flash"),
+                    modelName = it.optString("model_name", "gemini-2.5-flash"),
                     generatedAt = it.optLong("generated_at", 0L),
                 )
             }
@@ -140,6 +144,8 @@ data class CloudJobManifest(
                 status = root.optString("status", "QUEUED"),
                 claimedBy = root.optString("claimed_by").takeIf { it.isNotBlank() },
                 claimedAt = if (root.has("claimed_at")) root.optLong("claimed_at") else null,
+                leaseTimeoutMs = if (root.has("lease_timeout_ms")) root.optLong("lease_timeout_ms") else 900_000L,
+                etag = root.optString("etag").takeIf { it.isNotBlank() },
                 createdAt = root.optLong("created_at", 0L),
                 updatedAt = root.optLong("updated_at", 0L),
                 retryCount = root.optInt("retry_count", 0),

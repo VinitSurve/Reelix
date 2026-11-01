@@ -31,9 +31,7 @@ class TestDriveClient(unittest.TestCase):
     def test_ensure_subfolder_creates_when_missing(self):
         mock_service = MagicMock()
         mock_files = mock_service.files()
-        # Not found initially
         mock_files.list().execute.return_value = {"files": []}
-        # Created
         mock_files.create().execute.return_value = {"id": "new-subfolder-789"}
         self.client._service = mock_service
 
@@ -47,7 +45,7 @@ class TestDriveClient(unittest.TestCase):
 
         mock_files = mock_service.files()
         mock_files.list().execute.return_value = {
-            "files": [{"id": "file-1", "name": "job1.json"}]
+            "files": [{"id": "file-1", "name": "job1.json", "etag": "etag-123"}]
         }
 
         sample_manifest = JobManifest(
@@ -63,6 +61,55 @@ class TestDriveClient(unittest.TestCase):
             self.assertEqual(1, len(jobs))
             self.assertEqual("item-drive-1", jobs[0].item_id)
             self.assertEqual(JobStatus.QUEUED, jobs[0].status)
+            self.assertEqual("etag-123", jobs[0].etag)
+
+    @patch("google.oauth2.credentials.Credentials")
+    @patch("googleapiclient.discovery.build")
+    def test_oauth_credentials_initialization(self, mock_build, mock_creds_cls):
+        oauth_config = WorkerConfig(
+            gdrive_client_id="client-id-xyz",
+            gdrive_client_secret="client-secret-123",
+            gdrive_refresh_token="refresh-token-abc",
+            gdrive_folder_id="root-folder-123",
+        )
+        client = GoogleDriveStorageClient(oauth_config)
+        mock_creds_instance = MagicMock()
+        mock_creds_cls.return_value = mock_creds_instance
+
+        service = client._get_service()
+        self.assertIsNotNone(service)
+        mock_creds_instance.refresh.assert_called_once()
+        mock_build.assert_called_once()
+
+    def test_missing_credentials_raises_descriptive_error(self):
+        empty_config = WorkerConfig(gdrive_folder_id="root-folder-123")
+        client = GoogleDriveStorageClient(empty_config)
+        with self.assertRaises(ValueError) as ctx:
+            client._get_service()
+        self.assertIn("GDRIVE_CLIENT_ID", str(ctx.exception))
+        self.assertIn("GDRIVE_REFRESH_TOKEN", str(ctx.exception))
+
+    def test_claim_job_etag_mismatch_returns_false(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "file-1", "name": "item-etag.json", "etag": "etag-NEW"}]
+        }
+
+        job = JobManifest(
+            item_id="item-etag",
+            source="URL",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        # Calling claim_job with an expected older ETag "etag-OLD" should be rejected
+        claimed = self.client.claim_job(job, expected_etag="etag-OLD")
+        self.assertFalse(claimed)
 
 
 if __name__ == "__main__":

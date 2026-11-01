@@ -188,3 +188,4 @@ class GeminiAnalyzer:
         if isinstance(val, str) and val.strip():
             return [line.strip() for line in val.split("\n") if line.strip()]
         return []
+

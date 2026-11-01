@@ -14,12 +14,17 @@ class StorageClient(abc.ABC):
 
     @abc.abstractmethod
     def list_queued_jobs(self, limit: int = 5) -> List[JobManifest]:
-        """Lists pending or due jobs."""
+        """Lists pending or due jobs (including stale processing jobs)."""
         pass
 
     @abc.abstractmethod
     def get_job(self, item_id: str) -> Optional[JobManifest]:
         """Fetches the manifest for a specific item ID."""
+        pass
+
+    @abc.abstractmethod
+    def claim_job(self, job: JobManifest, expected_etag: Optional[str] = None) -> bool:
+        """Attempts to claim a job with lease checking and ETag precondition."""
         pass
 
     @abc.abstractmethod

@@ -82,8 +82,33 @@ class FakeSettingsRepository(
     override suspend fun testAiConnection(baseUrl: String, model: String, apiKey: String?): ConnectionTestResult =
         nextConnectionTestResult
 
+    override fun cloudDriveAccessToken(): String? = secrets.get("cloud_drive_token")
+    override fun cloudDriveRefreshToken(): String? = secrets.get("cloud_drive_refresh_token")
+
+    override suspend fun setCloudDriveCredentials(
+        accessToken: String?,
+        refreshToken: String?,
+        clientId: String?,
+        clientSecret: String?,
+    ) {
+        if (accessToken.isNullOrBlank()) secrets.remove("cloud_drive_token") else secrets.put("cloud_drive_token", accessToken.trim())
+        if (refreshToken.isNullOrBlank()) secrets.remove("cloud_drive_refresh_token") else secrets.put("cloud_drive_refresh_token", refreshToken.trim())
+        state.update {
+            it.copy(
+                hasCloudDriveToken = secrets.get("cloud_drive_token") != null,
+                hasCloudDriveRefreshToken = secrets.get("cloud_drive_refresh_token") != null,
+            )
+        }
+    }
+
+    override suspend fun refreshCloudDriveAccessToken(): String? = cloudDriveAccessToken()
+
+    override suspend fun getValidDriveAccessToken(): String? = cloudDriveAccessToken()
+
     override suspend fun clear() {
         secrets.remove("api_key")
+        secrets.remove("cloud_drive_token")
+        secrets.remove("cloud_drive_refresh_token")
         state.value = AppSettings()
     }
 }

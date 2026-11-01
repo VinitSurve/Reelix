@@ -17,7 +17,7 @@ on:
       gemini_model:
         description: "Gemini model version"
         required: false
-        default: "gemini-1.5-flash"
+        default: "gemini-2.5-flash"
 
 concurrency:
   group: reelix-processing
@@ -62,9 +62,12 @@ jobs:
       - name: Execute Cloud Processing Pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-1.5-flash' }}
+          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           MAX_JOBS_PER_RUN: ${{ github.event.inputs.max_jobs || '5' }}
           WHISPER_MODEL: ${{ github.event.inputs.whisper_model || 'base' }}
         run: |

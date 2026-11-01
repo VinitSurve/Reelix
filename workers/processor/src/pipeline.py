@@ -78,11 +78,19 @@ class CloudProcessingPipeline:
         logger.info("========================================")
 
         now_ms = int(time.time() * 1000)
+        prev_etag = job.etag
         job.status = JobStatus.PROCESSING
         job.claimed_by = self.config.runner_id
         job.claimed_at = now_ms
         job.updated_at = now_ms
-        self.storage.update_job(job)
+        job.lease_timeout_ms = self.config.lease_timeout_ms
+
+        if not self.storage.claim_job(job, expected_etag=prev_etag):
+            logger.warning(
+                "Could not claim job %s (concurrent worker claimed it or lease still active); skipping",
+                job.item_id,
+            )
+            return False
 
         job_dir = self.config.work_dir / job.item_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -196,3 +204,4 @@ class CloudProcessingPipeline:
 
         self.storage.update_job(job)
         return False
+
