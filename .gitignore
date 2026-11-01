@@ -26,4 +26,10 @@ secrets.properties
 google-services.json
 client_secret*.json
 credentials*.json
+service_account*.json
 
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

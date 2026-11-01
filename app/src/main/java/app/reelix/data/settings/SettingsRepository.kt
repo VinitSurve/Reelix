@@ -53,6 +53,9 @@ class DataStoreSettingsRepository(
         val analysisEnabled = booleanPreferencesKey("analysis_enabled")
         val analysisBaseUrl = stringPreferencesKey("analysis_base_url")
         val analysisModel = stringPreferencesKey("analysis_model")
+        val cloudProcessingEnabled = booleanPreferencesKey("cloud_processing_enabled")
+        val cloudDriveFolderId = stringPreferencesKey("cloud_drive_folder_id")
+        val cloudDriveToken = stringPreferencesKey("cloud_drive_token")
         val lastRunAt = longPreferencesKey("last_run_at")
         val lastRunSummary = stringPreferencesKey("last_run_summary")
     }
@@ -80,6 +83,9 @@ class DataStoreSettingsRepository(
                 model = p[Keys.analysisModel].orEmpty(),
                 hasApiKey = secretStore.get(API_KEY_ALIAS) != null,
             ),
+            cloudProcessingEnabled = p[Keys.cloudProcessingEnabled] ?: defaults.cloudProcessingEnabled,
+            cloudDriveFolderId = p[Keys.cloudDriveFolderId] ?: defaults.cloudDriveFolderId,
+            cloudDriveToken = p[Keys.cloudDriveToken] ?: defaults.cloudDriveToken,
             lastRunAt = p[Keys.lastRunAt],
             lastRunSummary = p[Keys.lastRunSummary],
         )
@@ -100,6 +106,9 @@ class DataStoreSettingsRepository(
             p[Keys.analysisEnabled] = next.analysis.enabled
             p[Keys.analysisBaseUrl] = next.analysis.baseUrl.trim()
             p[Keys.analysisModel] = next.analysis.model.trim()
+            p[Keys.cloudProcessingEnabled] = next.cloudProcessingEnabled
+            p[Keys.cloudDriveFolderId] = next.cloudDriveFolderId.trim()
+            p[Keys.cloudDriveToken] = next.cloudDriveToken.trim()
         }
     }
 

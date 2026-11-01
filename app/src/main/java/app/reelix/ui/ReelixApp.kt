@@ -255,6 +255,7 @@ private fun ReelixNavHost(
                     scheduler = container.processingScheduler,
                     storageInspector = container.storageInspector,
                     modelManager = container.transcriptionModelManager,
+                    cloudSyncRepository = container.cloudSyncRepository,
                 ),
             )
             SettingsScreen(viewModel = vm)

@@ -201,6 +201,7 @@ class TestAppContainer(
     val fakeAudioExtractor: FakeAudioExtractor = FakeAudioExtractor(),
     val fakeModelManager: FakeTranscriptionModelManager = FakeTranscriptionModelManager(),
     val fakeScheduler: RecordingProcessingScheduler = RecordingProcessingScheduler(),
+    val fakeCloudClient: app.reelix.cloud.MockCloudSyncClient = app.reelix.cloud.MockCloudSyncClient(),
     acquisitionProvider: ContentAcquisitionProvider = UrlOnlyAcquisitionProvider(),
     metadataExtractor: MetadataExtractor = object : MetadataExtractor {
         override val id: String = "unavailable-test"
@@ -268,6 +269,17 @@ class TestAppContainer(
         mediaStorage = mediaStorage,
         contentResolver = context.contentResolver,
         settingsRepository = settingsRepository,
+    )
+
+    override val cloudSyncClient: app.reelix.cloud.CloudSyncClient = fakeCloudClient
+
+    override val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository = app.reelix.cloud.CloudSyncRepository(
+        db = database,
+        savedItemRepository = savedItemRepository,
+        cloudClient = cloudSyncClient,
+        settingsRepository = settingsRepository,
+        indexer = indexer,
+        clock = clock,
     )
 
     fun close() {

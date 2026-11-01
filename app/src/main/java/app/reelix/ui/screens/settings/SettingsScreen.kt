@@ -96,6 +96,7 @@ class SettingsViewModel(
     private val scheduler: ProcessingScheduler,
     private val storageInspector: StorageInspector,
     private val modelManager: TranscriptionModelManager,
+    private val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository? = null,
 ) : ViewModel() {
 
     val settings: StateFlow<AppSettings> = settingsRepository.settings
@@ -121,6 +122,9 @@ class SettingsViewModel(
 
     private val _isTestingConnection = MutableStateFlow(false)
     val isTestingConnection: StateFlow<Boolean> = _isTestingConnection.asStateFlow()
+
+    private val _isSyncingCloud = MutableStateFlow(false)
+    val isSyncingCloud: StateFlow<Boolean> = _isSyncingCloud.asStateFlow()
 
     init {
         refreshStorage()
@@ -265,6 +269,59 @@ class SettingsViewModel(
         }
     }
 
+    fun setCloudProcessingEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            settingsRepository.update { it.copy(cloudProcessingEnabled = enabled) }
+            scheduler.syncPeriodicSchedule()
+            _feedback.value = if (enabled) {
+                "Cloud processing enabled. Heavy stages offloaded to GitHub Actions."
+            } else {
+                "Cloud processing disabled. Using local device processing."
+            }
+        }
+    }
+
+    fun saveCloudConfig(
+        enabled: Boolean,
+        folderId: String,
+        token: String,
+    ) {
+        viewModelScope.launch {
+            settingsRepository.update {
+                it.copy(
+                    cloudProcessingEnabled = enabled,
+                    cloudDriveFolderId = folderId.trim(),
+                    cloudDriveToken = token.trim(),
+                )
+            }
+            scheduler.syncPeriodicSchedule()
+            _feedback.value = "Cloud processing configuration saved."
+        }
+    }
+
+    fun syncCloudNow() {
+        viewModelScope.launch {
+            val repo = cloudSyncRepository
+            if (repo == null) {
+                _feedback.value = "Cloud sync repository is unavailable."
+                return@launch
+            }
+            _isSyncingCloud.value = true
+            try {
+                val synced = withContext(Dispatchers.IO) { repo.syncCompletedJobs() }
+                _feedback.value = if (synced > 0) {
+                    "Synced $synced completed cloud job(s)."
+                } else {
+                    "Cloud sync complete. No new completed jobs found in Drive."
+                }
+            } catch (e: Exception) {
+                _feedback.value = "Cloud sync error: ${e.message}"
+            } finally {
+                _isSyncingCloud.value = false
+            }
+        }
+    }
+
     fun removeStoredApiKey() {
         viewModelScope.launch {
             settingsRepository.setApiKey(null)
@@ -311,10 +368,18 @@ class SettingsViewModel(
             scheduler: ProcessingScheduler,
             storageInspector: StorageInspector,
             modelManager: TranscriptionModelManager,
+            cloudSyncRepository: app.reelix.cloud.CloudSyncRepository? = null,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                SettingsViewModel(settingsRepository, savedItemRepository, scheduler, storageInspector, modelManager) as T
+                SettingsViewModel(
+                    settingsRepository = settingsRepository,
+                    savedItemRepository = savedItemRepository,
+                    scheduler = scheduler,
+                    storageInspector = storageInspector,
+                    modelManager = modelManager,
+                    cloudSyncRepository = cloudSyncRepository,
+                ) as T
         }
     }
 }
@@ -341,6 +406,11 @@ fun SettingsScreen(
     var aiBaseUrl by remember(settings.analysis.baseUrl) { mutableStateOf(settings.analysis.baseUrl) }
     var aiModel by remember(settings.analysis.model) { mutableStateOf(settings.analysis.model) }
     var newApiKey by rememberSaveable { mutableStateOf("") }
+
+    var cloudEnabled by remember(settings.cloudProcessingEnabled) { mutableStateOf(settings.cloudProcessingEnabled) }
+    var cloudFolderId by remember(settings.cloudDriveFolderId) { mutableStateOf(settings.cloudDriveFolderId) }
+    var cloudToken by remember(settings.cloudDriveToken) { mutableStateOf(settings.cloudDriveToken) }
+    val isSyncingCloud by viewModel.isSyncingCloud.collectAsStateWithLifecycle()
 
     val modelPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -403,7 +473,73 @@ fun SettingsScreen(
                     }
                 }
 
-                // 2. Offline Speech Recognition (Whisper)
+                // 2. Cloud Processing (GitHub Actions & Google Drive)
+                item(key = "cloud_processing") {
+                    SettingsCard(title = "Cloud processing (GitHub Actions & Google Drive)") {
+                        Text(
+                            text = "Offload CPU-heavy audio extraction (FFmpeg), speech transcription (Whisper), and AI enrichment (Gemini) to free GitHub Actions runners, using Google Drive for durable storage.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        ToggleRow(
+                            title = "Enable cloud offloading",
+                            subtitle = "Saves phone battery and storage by processing video/audio in GitHub Actions.",
+                            checked = cloudEnabled,
+                            onCheckedChange = { cloudEnabled = it },
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = cloudFolderId,
+                            onValueChange = { cloudFolderId = it },
+                            label = { Text("Google Drive Folder ID") },
+                            placeholder = { Text("e.g. 1a2B3c4D5e...") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("cloud_folder_id_input"),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = cloudToken,
+                            onValueChange = { cloudToken = it },
+                            label = { Text("Google Drive Access Token / API Key") },
+                            placeholder = { Text("OAuth Bearer token or Service Account Token") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("cloud_token_input"),
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Button(
+                                onClick = {
+                                    viewModel.saveCloudConfig(cloudEnabled, cloudFolderId, cloudToken)
+                                },
+                                modifier = Modifier.testTag("save_cloud_config_button"),
+                            ) {
+                                Text("Save cloud config")
+                            }
+                            OutlinedButton(
+                                onClick = viewModel::syncCloudNow,
+                                enabled = !isSyncingCloud,
+                                modifier = Modifier.testTag("sync_cloud_now_button"),
+                            ) {
+                                if (isSyncingCloud) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Syncing...")
+                                } else {
+                                    Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Sync results now")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Offline Speech Recognition (Whisper)
                 item(key = "offline_transcription") {
                     SettingsCard(title = "Offline speech recognition") {
                         Text(

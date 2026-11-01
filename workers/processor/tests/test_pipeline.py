@@ -1,0 +1,188 @@
+"""Unit tests for the end-to-end cloud processing pipeline orchestrator."""
+
+import shutil
+import unittest
+from pathlib import Path
+
+from workers.processor.src.config import WorkerConfig
+from workers.processor.src.models import (
+    GeminiAnalysisResult,
+    JobManifest,
+    JobStatus,
+    MediaInfo,
+    StageStates,
+    StageStatus,
+)
+from workers.processor.src.pipeline import CloudProcessingPipeline
+from workers.processor.src.stages.audio_extractor import AudioExtractionOutcome
+from workers.processor.src.stages.gemini_analyzer import GeminiAnalysisOutcome
+from workers.processor.src.stages.transcriber import TranscriptionOutcome
+from workers.processor.src.storage.mock_storage import MockStorageClient
+
+
+class FakeExtractor:
+    def __init__(self, success: bool = True, no_audio: bool = False):
+        self.success = success
+        self.no_audio = no_audio
+        self.called = 0
+
+    def extract(self, input_video: Path, output_wav: Path, timeout_seconds: int = 180):
+        self.called += 1
+        if self.no_audio:
+            return AudioExtractionOutcome(success=False, no_audio_track=True, error="No audio")
+        if not self.success:
+            return AudioExtractionOutcome(success=False, error="Extraction failed")
+        output_wav.write_bytes(b"dummy wav data")
+        return AudioExtractionOutcome(success=True, wav_path=output_wav, size_bytes=100)
+
+
+class FakeTranscriber:
+    def __init__(self, success: bool = True):
+        self.success = success
+        self.called = 0
+
+    def transcribe(self, wav_path: Path):
+        self.called += 1
+        if not self.success:
+            return TranscriptionOutcome(success=False, error="Whisper failed")
+        return TranscriptionOutcome(success=True, transcript="Transcribed speech content", model_name="base")
+
+
+class FakeAnalyzer:
+    def __init__(self, success: bool = True):
+        self.success = success
+        self.called = 0
+
+    def analyze(self, title=None, caption=None, transcript=None, notes=None):
+        self.called += 1
+        if not self.success:
+            return GeminiAnalysisOutcome(success=False, error="Gemini quota exceeded")
+        return GeminiAnalysisOutcome(
+            success=True,
+            result=GeminiAnalysisResult(
+                summary="AI summary",
+                detailed_summary="AI detailed summary",
+                main_topic="Topic",
+                category="General",
+                keywords=["k1", "k2"],
+                tags=["t1"],
+                key_takeaways=["takeaway1"],
+                important_concepts=["concept1"],
+                actionable_steps=["step1"],
+                model_name="gemini-1.5-flash",
+                generated_at=1000,
+            ),
+        )
+
+
+class TestPipeline(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir = Path("/tmp/test_reelix_pipeline")
+        self.test_dir.mkdir(parents=True, exist_ok=True)
+        self.config = WorkerConfig(
+            work_dir=self.test_dir / "work",
+            runner_id="test-runner",
+            max_jobs_per_run=5,
+        )
+        self.storage = MockStorageClient(root_dir=self.test_dir / "storage")
+
+    def tearDown(self):
+        if self.test_dir.exists():
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_end_to_end_job_processing_success(self):
+        # 1. Register fake media in mock storage
+        media_file = self.test_dir / "input.mp4"
+        media_file.write_bytes(b"video bytes")
+        self.storage.register_media("media-file-123", media_file)
+
+        # 2. Put queued job into mock storage
+        job = JobManifest(
+            item_id="item-pipeline-1",
+            source="MEDIA_SHARE",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            media=MediaInfo(
+                file_name="input.mp4",
+                mime_type="video/mp4",
+                drive_file_id="media-file-123",
+                size_bytes=100,
+            ),
+        )
+        self.storage.update_job(job)
+
+        extractor = FakeExtractor()
+        transcriber = FakeTranscriber()
+        analyzer = FakeAnalyzer()
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            audio_extractor=extractor,
+            transcriber=transcriber,
+            gemini_analyzer=analyzer,
+        )
+
+        summary = pipeline.run_batch()
+        self.assertEqual(1, summary.total_found)
+        self.assertEqual(1, summary.succeeded)
+        self.assertEqual(0, summary.failed)
+
+        # Check job in storage
+        completed_job = self.storage.get_job("item-pipeline-1")
+        self.assertIsNotNone(completed_job)
+        self.assertEqual(JobStatus.COMPLETED, completed_job.status)
+        self.assertEqual(StageStatus.SUCCEEDED, completed_job.stages.audio_extraction)
+        self.assertEqual(StageStatus.SUCCEEDED, completed_job.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, completed_job.stages.gemini_analysis)
+        self.assertEqual("Transcribed speech content", completed_job.results.transcript)
+        self.assertIsNotNone(completed_job.results.analysis)
+        self.assertEqual("Topic", completed_job.results.analysis.main_topic)
+
+        # Verify stages were each called once
+        self.assertEqual(1, extractor.called)
+        self.assertEqual(1, transcriber.called)
+        self.assertEqual(1, analyzer.called)
+
+    def test_job_failure_schedules_retry_until_max_retries(self):
+        job = JobManifest(
+            item_id="item-retry-test",
+            source="URL",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            retry_count=0,
+            max_retries=2,
+            stages=StageStates(
+                audio_extraction=StageStatus.SUCCEEDED,
+                transcription=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.PENDING,
+            ),
+        )
+        self.storage.update_job(job)
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            gemini_analyzer=FakeAnalyzer(success=False),
+        )
+
+        # Attempt 1 -> WAITING_RETRY (retry_count=1)
+        summary1 = pipeline.run_batch()
+        self.assertEqual(1, summary1.failed)
+        j1 = self.storage.get_job("item-retry-test")
+        self.assertEqual(JobStatus.WAITING_RETRY, j1.status)
+        self.assertEqual(1, j1.retry_count)
+
+        # Attempt 2 -> FAILED (retry_count=2 reached max_retries=2)
+        summary2 = pipeline.run_batch()
+        self.assertEqual(1, summary2.failed)
+        j2 = self.storage.get_job("item-retry-test")
+        self.assertEqual(JobStatus.FAILED, j2.status)
+        self.assertEqual(2, j2.retry_count)
+
+
+if __name__ == "__main__":
+    unittest.main()

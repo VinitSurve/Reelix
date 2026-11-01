@@ -22,10 +22,13 @@ data class AppSettings(
     val downloadThumbnails: Boolean = true,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val analysis: AnalysisProviderSettings = AnalysisProviderSettings(),
+    val cloudProcessingEnabled: Boolean = false,
+    val cloudDriveFolderId: String = "",
+    val cloudDriveToken: String = "",
     val lastRunAt: Long? = null,
     val lastRunSummary: String? = null,
 ) {
-    val processingNeedsNetwork: Boolean get() = fetchLinkPreviews || analysis.isComplete
+    val processingNeedsNetwork: Boolean get() = fetchLinkPreviews || analysis.isComplete || cloudProcessingEnabled
     val maxMediaImportSizeBytes: Long get() = maxMediaImportSizeMb.toLong() * 1024 * 1024
 
     companion object {

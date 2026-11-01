@@ -54,6 +54,8 @@ interface AppContainer {
     val pipeline: ProcessingPipeline
     val processingScheduler: ProcessingScheduler
     val shareIntakeUseCase: ShareIntakeUseCase
+    val cloudSyncClient: app.reelix.cloud.CloudSyncClient
+    val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository
 }
 
 class DefaultAppContainer(
@@ -178,6 +180,25 @@ class DefaultAppContainer(
             mediaStorage = mediaStorage,
             contentResolver = appContext.contentResolver,
             settingsRepository = settingsRepository,
+        )
+    }
+
+    override val cloudSyncClient: app.reelix.cloud.CloudSyncClient by lazy {
+        app.reelix.cloud.GoogleDriveCloudClient(
+            client = httpClient,
+            folderIdProvider = { kotlinx.coroutines.runBlocking { settingsRepository.current().cloudDriveFolderId } },
+            tokenProvider = { kotlinx.coroutines.runBlocking { settingsRepository.current().cloudDriveToken } },
+        )
+    }
+
+    override val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository by lazy {
+        app.reelix.cloud.CloudSyncRepository(
+            db = database,
+            savedItemRepository = savedItemRepository,
+            cloudClient = cloudSyncClient,
+            settingsRepository = settingsRepository,
+            indexer = searchIndexer,
+            clock = clock,
         )
     }
 }
