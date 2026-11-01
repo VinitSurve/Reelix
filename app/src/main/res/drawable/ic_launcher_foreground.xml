@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Bookmark vault outline -->
+    <path
+        android:fillColor="#E9B872"
+        android:pathData="M37,28C37,24.69 39.69,22 43,22H65C68.31,22 71,24.69 71,28V82L54,71L37,82V28Z" />
+    <!-- Play / reel triangle cutout -->
+    <path
+        android:fillColor="#162126"
+        android:pathData="M49,39L63,48L49,57V39Z" />
+</vector>
+
