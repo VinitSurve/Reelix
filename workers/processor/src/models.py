@@ -12,6 +12,7 @@ class JobStatus(str, Enum):
     QUEUED = "QUEUED"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
+    PARTIAL = "PARTIAL"
     FAILED = "FAILED"
     WAITING_RETRY = "WAITING_RETRY"
 
@@ -84,7 +85,7 @@ class GeminiAnalysisResult:
             key_takeaways=data.get("key_takeaways", []),
             important_concepts=data.get("important_concepts", []),
             actionable_steps=data.get("actionable_steps", []),
-            model_name=data.get("model_name", "gemini-2.5-flash"),
+            model_name=data.get("model_name", "gemini-3.8-flash"),
             generated_at=data.get("generated_at", 0),
         )
 

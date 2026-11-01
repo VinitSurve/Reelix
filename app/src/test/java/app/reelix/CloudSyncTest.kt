@@ -91,7 +91,7 @@ class CloudSyncTest {
                     keyTakeaways = listOf("Use Dispatchers.IO for disk operations", "Always respect cancellation"),
                     importantConcepts = listOf("Structured Concurrency", "CoroutineScope"),
                     actionableSteps = listOf("Wrap calls in viewModelScope.launch", "Avoid GlobalScope"),
-                    modelName = "gemini-2.5-flash",
+                    modelName = "gemini-3.8-flash",
                     generatedAt = 1730000500000L,
                 ),
             ),
@@ -128,7 +128,7 @@ class CloudSyncTest {
         assertEquals("Kotlin Coroutines", parsed.results.analysis!!.mainTopic)
         assertEquals(listOf("android", "kotlin", "concurrency"), parsed.results.analysis!!.tags)
         assertEquals(listOf("Structured Concurrency", "CoroutineScope"), parsed.results.analysis!!.importantConcepts)
-        assertEquals("gemini-2.5-flash", parsed.results.analysis!!.modelName)
+        assertEquals("gemini-3.8-flash", parsed.results.analysis!!.modelName)
     }
 
     @Test
@@ -230,7 +230,7 @@ class CloudSyncTest {
                     keyTakeaways = listOf("Use FTS4 for fast local search", "Index transcripts and summaries"),
                     importantConcepts = listOf("Virtual Table", "Match Query"),
                     actionableSteps = listOf("Create entity extending Fts4", "Call reindex after inserts"),
-                    modelName = "gemini-2.5-flash",
+                    modelName = "gemini-3.8-flash",
                     generatedAt = container.clock.now(),
                 ),
             ),
@@ -287,5 +287,122 @@ class CloudSyncTest {
 
         val synced = container.cloudSyncRepository.syncCompletedJobs()
         assertEquals("Sync should return 0 when client is disabled", 0, synced)
+    }
+
+    @Test
+    fun resumableUploadRecoverySavesSessionAndResumesAfterInterruption() = runTest {
+        val testFile = File(testMediaDir, "resumable_test.mp4").apply {
+            writeBytes(ByteArray(2048) { (it % 256).toByte() })
+        }
+        val client = container.fakeCloudClient
+        client.simulateInterruptionOnce = true
+
+        // First attempt: interrupted
+        val firstResult = client.uploadMedia(testFile, "video/mp4", testFile.name)
+        assertTrue("First attempt should fail with simulated network failure", firstResult is app.reelix.cloud.CloudUploadResult.Failure)
+
+        val uploadKey = "${testFile.name}_${testFile.length()}"
+        val savedSession = client.resumableStore.getSessionUri(uploadKey)
+        assertNotNull("Resumable session URI should be preserved after interruption", savedSession)
+
+        // Second attempt: resumes from preserved session URI
+        val secondResult = client.uploadMedia(testFile, "video/mp4", testFile.name)
+        assertTrue("Second attempt should succeed by recovering session", secondResult is app.reelix.cloud.CloudUploadResult.Success)
+        assertEquals("Should have resumed from byte offset", testFile.length() / 2, client.lastUploadedOffset)
+        assertEquals("Session URI should be cleaned up on completion", null, client.resumableStore.getSessionUri(uploadKey))
+    }
+
+    @Test
+    fun partialProcessingPreservesTranscriptAndIndexesInFts4() = runTest {
+        val testFile = File(testMediaDir, "partial_video.mp4").apply { writeBytes("video bytes".toByteArray()) }
+        val outcome = container.savedItemRepository.saveMediaItem(
+            media = ImportedMedia(testFile, "video/mp4", testFile.length(), 10000L, testFile.name),
+            associatedUrl = "https://www.instagram.com/p/partial_test/",
+            source = SaveSource.MEDIA_SHARE,
+        )
+        val itemId = (outcome as MediaSaveOutcome.Saved).itemId
+
+        // Cloud worker produced transcript, but Gemini failed after retries -> manifest is PARTIAL
+        val partialManifest = CloudJobManifest(
+            itemId = itemId,
+            source = "MEDIA_SHARE",
+            status = "PARTIAL",
+            errorMessage = "Gemini enrichment failed: Rate limit exceeded",
+            createdAt = container.clock.now() - 50_000L,
+            updatedAt = container.clock.now(),
+            stages = CloudStageStates(
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "FAILED",
+            ),
+            results = CloudJobResults(
+                transcript = "This offline transcript discusses algorithmic complexity and big-O notation.",
+                transcriptModel = "base",
+                analysis = null,
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = partialManifest
+
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+
+        val item = container.savedItemRepository.getItem(itemId)
+        assertNotNull(item)
+        // Honest state: not falsely marked COMPLETED
+        assertEquals(ProcessingStatus.NEEDS_ATTENTION, item!!.processingStatus)
+        assertEquals(StageStatus.SUCCEEDED, item.transcriptionStatus)
+        assertEquals(StageStatus.FAILED, item.analysisStatus)
+        assertTrue(item.lastError!!.contains("Rate limit"))
+
+        // Transcript is preserved in Room
+        val results = container.savedItemRepository.latestResults(itemId)
+        val transcriptRes = results.firstOrNull { it.stage == ProcessingStage.TRANSCRIPTION }
+        assertNotNull(transcriptRes)
+        assertTrue(transcriptRes!!.transcript!!.contains("algorithmic complexity"))
+
+        // Partial transcript is indexed and searchable offline in FTS4!
+        val search = container.savedItemRepository.search("complexity", ItemQuery()).first()
+        assertEquals(1, search.size)
+        assertEquals(itemId, search.first().id)
+    }
+
+    @Test
+    fun cloudSyncRejectsEmptyAnalysisAsIncomplete() = runTest {
+        val testFile = File(testMediaDir, "incomplete_video.mp4").apply { writeBytes("video bytes".toByteArray()) }
+        val outcome = container.savedItemRepository.saveMediaItem(
+            media = ImportedMedia(testFile, "video/mp4", testFile.length(), 10000L, testFile.name),
+            associatedUrl = "https://www.instagram.com/p/incomplete_test/",
+            source = SaveSource.MEDIA_SHARE,
+        )
+        val itemId = (outcome as MediaSaveOutcome.Saved).itemId
+
+        // Cloud manifest marked COMPLETED but analysis is missing/empty
+        val emptyAnalysisManifest = CloudJobManifest(
+            itemId = itemId,
+            source = "MEDIA_SHARE",
+            status = "COMPLETED",
+            createdAt = container.clock.now() - 50_000L,
+            updatedAt = container.clock.now(),
+            stages = CloudStageStates(
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "SUCCEEDED",
+            ),
+            results = CloudJobResults(
+                transcript = "Some audio text",
+                transcriptModel = "base",
+                analysis = null, // Missing analysis!
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = emptyAnalysisManifest
+
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+
+        val item = container.savedItemRepository.getItem(itemId)
+        assertNotNull(item)
+        // Must NOT be marked COMPLETED when analysis is missing
+        assertEquals(ProcessingStatus.NEEDS_ATTENTION, item!!.processingStatus)
+        assertTrue(item.lastError!!.contains("Missing or empty analysis"))
     }
 }

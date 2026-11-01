@@ -78,14 +78,13 @@ class CloudProcessingPipeline:
         logger.info("========================================")
 
         now_ms = int(time.time() * 1000)
-        prev_etag = job.etag
         job.status = JobStatus.PROCESSING
         job.claimed_by = self.config.runner_id
         job.claimed_at = now_ms
         job.updated_at = now_ms
         job.lease_timeout_ms = self.config.lease_timeout_ms
 
-        if not self.storage.claim_job(job, expected_etag=prev_etag):
+        if not self.storage.claim_job(job, runner_id=self.config.runner_id):
             logger.warning(
                 "Could not claim job %s (concurrent worker claimed it or lease still active); skipping",
                 job.item_id,
@@ -171,13 +170,37 @@ class CloudProcessingPipeline:
                 job.updated_at = int(time.time() * 1000)
                 self.storage.update_job(job)
 
-            # Mark completed!
-            job.status = JobStatus.COMPLETED
-            job.error_message = None
-            job.updated_at = int(time.time() * 1000)
-            self.storage.update_job(job)
-            logger.info("Successfully completed all processing stages for job %s", job.item_id)
-            return True
+            # Verify honest completion criteria
+            has_valid_analysis = (
+                job.stages.gemini_analysis == StageStatus.SUCCEEDED
+                and job.results.analysis is not None
+                and bool(job.results.analysis.summary or job.results.analysis.key_takeaways)
+            )
+            has_transcription_or_skipped = (
+                job.stages.transcription in (StageStatus.SUCCEEDED, StageStatus.SKIPPED)
+            )
+
+            if has_valid_analysis and has_transcription_or_skipped:
+                job.status = JobStatus.COMPLETED
+                job.error_message = None
+                job.updated_at = int(time.time() * 1000)
+                self.storage.update_job(job)
+                logger.info("Successfully completed all processing stages for job %s", job.item_id)
+                return True
+            elif job.results.transcript or has_valid_analysis:
+                job.status = JobStatus.PARTIAL
+                job.error_message = "Partial processing: one or more stages were incomplete or skipped"
+                job.updated_at = int(time.time() * 1000)
+                self.storage.update_job(job)
+                logger.warning("Job %s marked PARTIAL (some stages succeeded, others incomplete)", job.item_id)
+                return True
+            else:
+                job.status = JobStatus.FAILED
+                job.error_message = "No stage results produced"
+                job.updated_at = int(time.time() * 1000)
+                self.storage.update_job(job)
+                logger.error("Job %s marked FAILED (no valid stage results)", job.item_id)
+                return False
 
         except Exception as e:
             logger.error("Unhandled exception during job %s processing: %s", job.item_id, e, exc_info=True)
@@ -196,8 +219,16 @@ class CloudProcessingPipeline:
         job.updated_at = now_ms
 
         if job.retry_count >= job.max_retries:
-            job.status = JobStatus.FAILED
-            logger.error("Job %s exceeded maximum retries (%d); marked FAILED", job.item_id, job.max_retries)
+            # Honest partial vs failed classification
+            if job.results.transcript or job.stages.transcription == StageStatus.SUCCEEDED:
+                job.status = JobStatus.PARTIAL
+                logger.warning(
+                    "Job %s exceeded retries but preserved partial transcript results; marked PARTIAL",
+                    job.item_id
+                )
+            else:
+                job.status = JobStatus.FAILED
+                logger.error("Job %s exceeded maximum retries (%d); marked FAILED", job.item_id, job.max_retries)
         else:
             job.status = JobStatus.WAITING_RETRY
             logger.info("Job %s scheduled for retry (attempt %d/%d)", job.item_id, job.retry_count, job.max_retries)

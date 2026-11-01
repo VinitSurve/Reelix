@@ -15,9 +15,9 @@ on:
         required: false
         default: "base"
       gemini_model:
-        description: "Gemini model version"
+        description: "Gemini model version (Strictly permitted: gemini-3.8-flash, gemini-3.6-flash)"
         required: false
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
 
 concurrency:
   group: reelix-processing
@@ -62,7 +62,7 @@ jobs:
       - name: Execute Cloud Processing Pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3.8-flash' }}
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}

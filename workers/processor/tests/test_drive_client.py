@@ -45,7 +45,7 @@ class TestDriveClient(unittest.TestCase):
 
         mock_files = mock_service.files()
         mock_files.list().execute.return_value = {
-            "files": [{"id": "file-1", "name": "job1.json", "etag": "etag-123"}]
+            "files": [{"id": "file-1", "name": "job1.json", "version": 2, "modifiedTime": "2026-11-01T12:00:00Z"}]
         }
 
         sample_manifest = JobManifest(
@@ -61,7 +61,6 @@ class TestDriveClient(unittest.TestCase):
             self.assertEqual(1, len(jobs))
             self.assertEqual("item-drive-1", jobs[0].item_id)
             self.assertEqual(JobStatus.QUEUED, jobs[0].status)
-            self.assertEqual("etag-123", jobs[0].etag)
 
     @patch("google.oauth2.credentials.Credentials")
     @patch("googleapiclient.discovery.build")
@@ -89,27 +88,178 @@ class TestDriveClient(unittest.TestCase):
         self.assertIn("GDRIVE_CLIENT_ID", str(ctx.exception))
         self.assertIn("GDRIVE_REFRESH_TOKEN", str(ctx.exception))
 
-    def test_claim_job_etag_mismatch_returns_false(self):
+    def test_claim_job_active_lease_rejected(self):
+        import time
         mock_service = MagicMock()
         self.client._service = mock_service
         self.client._subfolders["jobs"] = "jobs-folder-id"
 
         mock_files = mock_service.files()
         mock_files.list().execute.return_value = {
-            "files": [{"id": "file-1", "name": "item-etag.json", "etag": "etag-NEW"}]
+            "files": [{"id": "file-1", "name": "item-active.json"}]
         }
 
-        job = JobManifest(
-            item_id="item-etag",
+        # Remote file is currently being processed by worker-alpha with an active lease (5 min ago)
+        active_manifest = JobManifest(
+            item_id="item-active",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-alpha",
+            claimed_at=int(time.time() * 1000) - 300_000,  # 5 minutes ago (< 15m)
+            lease_timeout_ms=900_000,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=active_manifest.to_json().encode("utf-8")):
+            candidate = JobManifest(item_id="item-active", source="URL", created_at=1000, updated_at=1000)
+            claimed = self.client.claim_job(candidate, runner_id="worker-beta")
+            self.assertFalse(claimed, "Active lease must not be claimed by another worker")
+
+    def test_claim_job_stale_lease_recovered(self):
+        import time
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "file-1", "name": "item-stale.json"}]
+        }
+
+        # Remote file was claimed 25 minutes ago (> 15m lease expired)
+        stale_manifest = JobManifest(
+            item_id="item-stale",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-crashed",
+            claimed_at=int(time.time() * 1000) - 1_500_000,  # 25 minutes ago
+            lease_timeout_ms=900_000,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        # First download returns stale manifest; second download (verification) returns candidate claimed by worker-beta
+        verified_manifest = JobManifest(
+            item_id="item-stale",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-beta",
+            claimed_at=int(time.time() * 1000),
+            lease_timeout_ms=900_000,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(
+            self.client,
+            "_download_bytes",
+            side_effect=[
+                stale_manifest.to_json().encode("utf-8"),
+                verified_manifest.to_json().encode("utf-8"),
+            ],
+        ):
+            candidate = JobManifest(item_id="item-stale", source="URL", created_at=1000, updated_at=1000)
+            claimed = self.client.claim_job(candidate, runner_id="worker-beta")
+            self.assertTrue(claimed, "Stale lease must be reclaimed after timeout")
+
+    def test_claim_job_read_after_write_collision_aborted(self):
+        import time
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "file-1", "name": "item-collision.json"}]
+        }
+
+        queued_manifest = JobManifest(
+            item_id="item-collision",
             source="URL",
             status=JobStatus.QUEUED,
             created_at=1000,
             updated_at=1000,
         )
 
-        # Calling claim_job with an expected older ETag "etag-OLD" should be rejected
-        claimed = self.client.claim_job(job, expected_etag="etag-OLD")
-        self.assertFalse(claimed)
+        # Remote file on verification was overwritten by competing worker-gamma
+        collision_manifest = JobManifest(
+            item_id="item-collision",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-gamma",
+            claimed_at=int(time.time() * 1000),
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(
+            self.client,
+            "_download_bytes",
+            side_effect=[
+                queued_manifest.to_json().encode("utf-8"),
+                collision_manifest.to_json().encode("utf-8"),
+            ],
+        ):
+            candidate = JobManifest(item_id="item-collision", source="URL", created_at=1000, updated_at=1000)
+            claimed = self.client.claim_job(candidate, runner_id="worker-beta")
+            self.assertFalse(claimed, "Worker must abort when post-write verification detects another runner won")
+
+    def test_update_job_fails_if_lease_stolen(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "file-1", "name": "item-stolen.json"}]
+        }
+
+        # Remote file is now claimed by worker-gamma
+        remote_manifest = JobManifest(
+            item_id="item-stolen",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-gamma",
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            # worker-beta attempts update
+            my_job = JobManifest(
+                item_id="item-stolen",
+                source="URL",
+                status=JobStatus.PROCESSING,
+                claimed_by="worker-beta",
+                created_at=1000,
+                updated_at=1000,
+            )
+            updated = self.client.update_job(my_job)
+            self.assertFalse(updated, "Update must fail if remote lease was reclaimed by another worker")
+
+    def test_root_vault_auto_discovery_and_creation(self):
+        empty_config = WorkerConfig(
+            gdrive_service_account_json='{"type": "service_account"}',
+            gdrive_folder_id=None,
+        )
+        client = GoogleDriveStorageClient(empty_config)
+        mock_service = MagicMock()
+        client._service = mock_service
+
+        # Discovery case: folder found
+        mock_service.files().list().execute.return_value = {
+            "files": [{"id": "found-vault-id", "name": "Reelix_Vault"}]
+        }
+        vault_id = client._ensure_root_folder()
+        self.assertEqual("found-vault-id", vault_id)
+
+        # Creation case: folder missing
+        client.folder_id = None
+        mock_service.files().list().execute.return_value = {"files": []}
+        mock_service.files().create().execute.return_value = {"id": "created-vault-id"}
+        vault_id_created = client._ensure_root_folder()
+        self.assertEqual("created-vault-id", vault_id_created)
 
 
 if __name__ == "__main__":

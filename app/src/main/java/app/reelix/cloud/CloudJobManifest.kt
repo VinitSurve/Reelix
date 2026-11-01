@@ -123,7 +123,7 @@ data class CloudJobManifest(
                     keyTakeaways = it.optJSONArray("key_takeaways")?.toStringList() ?: emptyList(),
                     importantConcepts = it.optJSONArray("important_concepts")?.toStringList() ?: emptyList(),
                     actionableSteps = it.optJSONArray("actionable_steps")?.toStringList() ?: emptyList(),
-                    modelName = it.optString("model_name", "gemini-2.5-flash"),
+                    modelName = it.optString("model_name", "gemini-3.8-flash"),
                     generatedAt = it.optLong("generated_at", 0L),
                 )
             }

@@ -133,6 +133,12 @@ class CloudSyncRepository(
 
             if (manifest.stages.audioExtraction == "SUCCEEDED") {
                 itemDao.setAudioExtractionStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
+            } else if (manifest.stages.audioExtraction == "FAILED") {
+                itemDao.setAudioExtractionStatus(manifest.itemId, StageStatus.FAILED, now)
+            }
+
+            if (manifest.stages.transcription == "FAILED") {
+                itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.FAILED, now)
             }
 
             // 2. Gemini Analysis
@@ -163,21 +169,92 @@ class CloudSyncRepository(
                 if (aiTags.isNotEmpty()) {
                     savedItemRepository.replaceTagsLocked(manifest.itemId, aiTags, TagSource.AI, now)
                 }
+            } else if (manifest.stages.geminiAnalysis == "FAILED") {
+                itemDao.setAnalysisStatus(manifest.itemId, StageStatus.FAILED, now)
             }
 
-            // 3. Mark completed and reindex
-            itemDao.markCompleted(manifest.itemId, now)
-            indexer.reindex(manifest.itemId)
+            // 3. Honest state determination based on cloud outcome
+            when (manifest.status) {
+                "COMPLETED" -> {
+                    val hasAnalysis = analysis != null && (analysis.summary.isNotBlank() || analysis.keyTakeaways.isNotEmpty())
+                    val expectedAudio = manifest.media != null && manifest.stages.audioExtraction != "SKIPPED"
+                    val hasTranscript = manifest.results.transcript?.isNotBlank() == true
 
-            processingDao.insertEvent(
-                ProcessingEventEntity(
-                    savedItemId = manifest.itemId,
-                    stage = ProcessingStage.COMPLETION,
-                    status = "CLOUD_SYNCED",
-                    message = "Synchronized transcripts & Gemini analysis from GitHub Actions cloud worker",
-                    createdAt = now,
-                ),
-            )
+                    if (hasAnalysis && (!expectedAudio || hasTranscript)) {
+                        // Truly completed
+                        itemDao.markCompleted(manifest.itemId, now)
+                        indexer.reindex(manifest.itemId)
+                        processingDao.insertEvent(
+                            ProcessingEventEntity(
+                                savedItemId = manifest.itemId,
+                                stage = ProcessingStage.COMPLETION,
+                                status = "CLOUD_SYNCED",
+                                message = "Synchronized complete transcripts & Gemini analysis from GitHub Actions cloud worker",
+                                createdAt = now,
+                            ),
+                        )
+                    } else {
+                        // Incomplete or empty results
+                        val reason = if (!hasAnalysis) "Missing or empty analysis from cloud worker" else "Missing transcript from cloud worker"
+                        itemDao.updateProcessingStatus(
+                            id = manifest.itemId,
+                            status = ProcessingStatus.NEEDS_ATTENTION,
+                            nextAttemptAt = null,
+                            lastError = reason,
+                            now = now,
+                        )
+                        indexer.reindex(manifest.itemId)
+                        processingDao.insertEvent(
+                            ProcessingEventEntity(
+                                savedItemId = manifest.itemId,
+                                stage = ProcessingStage.COMPLETION,
+                                status = "CLOUD_INCOMPLETE",
+                                message = "Cloud processing incomplete ($reason); attention required",
+                                createdAt = now,
+                            ),
+                        )
+                    }
+                }
+                "PARTIAL" -> {
+                    val errorMsg = manifest.errorMessage ?: "Partial cloud processing; some stages incomplete"
+                    itemDao.updateProcessingStatus(
+                        id = manifest.itemId,
+                        status = ProcessingStatus.NEEDS_ATTENTION,
+                        nextAttemptAt = null,
+                        lastError = errorMsg,
+                        now = now,
+                    )
+                    indexer.reindex(manifest.itemId)
+                    processingDao.insertEvent(
+                        ProcessingEventEntity(
+                            savedItemId = manifest.itemId,
+                            stage = ProcessingStage.COMPLETION,
+                            status = "CLOUD_PARTIAL",
+                            message = "Synchronized partial cloud results: $errorMsg",
+                            createdAt = now,
+                        ),
+                    )
+                }
+                "FAILED" -> {
+                    val errorMsg = manifest.errorMessage ?: "Cloud processing failed"
+                    itemDao.updateProcessingStatus(
+                        id = manifest.itemId,
+                        status = ProcessingStatus.NEEDS_ATTENTION,
+                        nextAttemptAt = null,
+                        lastError = errorMsg,
+                        now = now,
+                    )
+                    processingDao.insertEvent(
+                        ProcessingEventEntity(
+                            savedItemId = manifest.itemId,
+                            stage = ProcessingStage.COMPLETION,
+                            status = "CLOUD_FAILED",
+                            message = "Cloud processing failed: $errorMsg",
+                            createdAt = now,
+                        ),
+                    )
+                }
+            }
             syncedCount++
         }
 

@@ -10,7 +10,19 @@ from workers.processor.src.stages.gemini_analyzer import GeminiAnalyzer
 class TestGeminiAnalyzer(unittest.TestCase):
 
     def setUp(self):
-        self.analyzer = GeminiAnalyzer(api_key="test-api-key", model="gemini-2.5-flash")
+        self.analyzer = GeminiAnalyzer(api_key="test-api-key", model="gemini-3.8-flash")
+
+    def test_model_allowlist_validation(self):
+        # Permitted models
+        a1 = GeminiAnalyzer(api_key="key", model="gemini-3.8-flash")
+        self.assertEqual("gemini-3.8-flash", a1.model)
+        a2 = GeminiAnalyzer(api_key="key", model="gemini-3.6-flash")
+        self.assertEqual("gemini-3.6-flash", a2.model)
+
+        # Disallowed models must raise ValueError
+        for disallowed in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gpt-4"]:
+            with self.assertRaises(ValueError):
+                GeminiAnalyzer(api_key="key", model=disallowed)
 
     def test_missing_api_key_returns_error(self):
         no_key = GeminiAnalyzer(api_key=None)
@@ -81,7 +93,45 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertEqual(2, len(res.result.key_takeaways))
         self.assertEqual(2, len(res.result.important_concepts))
         self.assertEqual(3, len(res.result.actionable_steps))
-        self.assertEqual("gemini-2.5-flash", res.result.model_name)
+        self.assertEqual("gemini-3.8-flash", res.result.model_name)
+
+    @patch("urllib.request.urlopen")
+    def test_empty_gemini_response_rejected(self, mock_urlopen):
+        # Empty candidate content should fail and not be treated as successful
+        gemini_api_payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": json.dumps({"summary": "", "key_takeaways": []})}
+                        ]
+                    }
+                }
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(gemini_api_payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.analyzer.analyze(title="Test", transcript="Sample text")
+        self.assertFalse(res.success)
+        self.assertIn("Failed to parse", res.error)
+
+    @patch("urllib.request.urlopen")
+    def test_quota_exceeded_handled_explicitly(self, mock_urlopen):
+        import urllib.error
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://generativelanguage.googleapis.com",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={},
+            fp=MagicMock(read=lambda: b"Resource has been exhausted (e.g. check quota).")
+        )
+        res = self.analyzer.analyze(title="Test", transcript="Sample text")
+        self.assertFalse(res.success)
+        self.assertIn("429", res.error)
+        self.assertIn("quota", res.error.lower())
 
 
 if __name__ == "__main__":

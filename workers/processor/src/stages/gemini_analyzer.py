@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import urllib.request
 import urllib.error
 
+from ..config import ALLOWED_GEMINI_MODELS, DEFAULT_GEMINI_MODEL
 from ..models import GeminiAnalysisResult
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,12 @@ class GeminiAnalysisOutcome:
 class GeminiAnalyzer:
     """Interacts with Google Gemini free-tier API to extract structured knowledge."""
 
-    def __init__(self, api_key: Optional[str], model: str = "gemini-1.5-flash"):
+    def __init__(self, api_key: Optional[str], model: str = DEFAULT_GEMINI_MODEL):
+        if model not in ALLOWED_GEMINI_MODELS:
+            raise ValueError(
+                f"Disallowed Gemini model '{model}'. Reelix is strictly restricted to "
+                f"the following Google AI Studio free-tier models: {ALLOWED_GEMINI_MODELS}"
+            )
         self.api_key = api_key
         self.model = model
 
@@ -143,6 +149,12 @@ class GeminiAnalyzer:
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
             logger.error("Gemini API HTTP %d error: %s", e.code, err_body)
+            if e.code == 429:
+                return GeminiAnalysisOutcome(success=False, error=f"Gemini API quota/rate limit exceeded (HTTP 429): {err_body}")
+            elif e.code == 401:
+                return GeminiAnalysisOutcome(success=False, error=f"Gemini API authentication failed (HTTP 401): {err_body}")
+            elif e.code in (403, 404):
+                return GeminiAnalysisOutcome(success=False, error=f"Gemini API model access error (HTTP {e.code}): model '{self.model}' unavailable or access denied: {err_body}")
             return GeminiAnalysisOutcome(success=False, error=f"Gemini HTTP {e.code}: {err_body}")
         except Exception as e:
             logger.error("Unexpected error calling Gemini API: %s", e)
@@ -157,21 +169,34 @@ class GeminiAnalyzer:
             if not parts:
                 return None
             raw_text = parts[0].get("text", "").strip()
+            if not raw_text:
+                return None
 
             # Clean markdown code blocks if present
             cleaned_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
             cleaned_text = re.sub(r"\s*```$", "", cleaned_text).strip()
 
             data = json.loads(cleaned_text)
+            if not isinstance(data, dict):
+                return None
+
+            summary = str(data.get("summary", "")).strip()
+            detailed_summary = str(data.get("detailed_summary", "")).strip()
+            key_takeaways = self._clean_list(data.get("key_takeaways"))
+
+            # Honest completeness check: reject empty analysis
+            if not summary and not detailed_summary and not key_takeaways:
+                logger.warning("Gemini returned empty or blank analysis fields")
+                return None
 
             return GeminiAnalysisResult(
-                summary=data.get("summary", ""),
-                detailed_summary=data.get("detailed_summary", ""),
-                main_topic=data.get("main_topic", ""),
-                category=data.get("category", "General"),
+                summary=summary,
+                detailed_summary=detailed_summary,
+                main_topic=str(data.get("main_topic", "")).strip(),
+                category=str(data.get("category", "General")).strip(),
                 keywords=self._clean_list(data.get("keywords")),
                 tags=self._clean_list(data.get("tags")),
-                key_takeaways=self._clean_list(data.get("key_takeaways")),
+                key_takeaways=key_takeaways,
                 important_concepts=self._clean_list(data.get("important_concepts")),
                 actionable_steps=self._clean_list(data.get("actionable_steps")),
                 model_name=self.model,

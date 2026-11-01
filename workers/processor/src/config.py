@@ -8,11 +8,15 @@ from pathlib import Path
 from typing import Optional
 
 
+ALLOWED_GEMINI_MODELS = ("gemini-3.8-flash", "gemini-3.6-flash")
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+
+
 @dataclass
 class WorkerConfig:
-    # Google Gemini AI settings
+    # Google Gemini AI settings (Strictly restricted to gemini-3.8-flash and gemini-3.6-flash on Free Tier)
     gemini_api_key: Optional[str] = None
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = DEFAULT_GEMINI_MODEL
 
     # Google Drive persistent storage settings (OAuth 2.0 on behalf of personal Google account)
     gdrive_client_id: Optional[str] = None
@@ -35,6 +39,13 @@ class WorkerConfig:
     # Testing / Dry-run mode
     mock_mode: bool = False
 
+    def __post_init__(self):
+        if self.gemini_model not in ALLOWED_GEMINI_MODELS:
+            raise ValueError(
+                f"Disallowed Gemini model '{self.gemini_model}'. Reelix is strictly restricted to "
+                f"the following Google AI Studio free-tier models: {ALLOWED_GEMINI_MODELS}"
+            )
+
     @classmethod
     def from_env(cls) -> WorkerConfig:
         run_id = os.getenv("GITHUB_RUN_ID", "local")
@@ -47,7 +58,7 @@ class WorkerConfig:
 
         return cls(
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             gdrive_client_id=os.getenv("GDRIVE_CLIENT_ID"),
             gdrive_client_secret=os.getenv("GDRIVE_CLIENT_SECRET"),
             gdrive_refresh_token=os.getenv("GDRIVE_REFRESH_TOKEN"),

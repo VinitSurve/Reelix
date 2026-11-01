@@ -61,9 +61,42 @@ def main():
     print(f"GDRIVE_CLIENT_ID:      {client_id}")
     print(f"GDRIVE_CLIENT_SECRET:  {client_secret}")
     print(f"GDRIVE_REFRESH_TOKEN:  {creds.refresh_token}")
+
+    # Discover or create authorized root Reelix_Vault folder under drive.file scope
+    vault_id = None
+    try:
+        from googleapiclient.discovery import build
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        q = "name = 'Reelix_Vault' and mimeType = 'application/vnd.google-apps.folder' and 'root' in parents and trashed = false"
+        res = service.files().list(q=q, fields="files(id, name)").execute()
+        files = res.get("files", [])
+        if files:
+            vault_id = files[0]["id"]
+            print(f"GDRIVE_FOLDER_ID:      {vault_id} (found existing Reelix_Vault)")
+        else:
+            meta = {
+                "name": "Reelix_Vault",
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": ["root"],
+            }
+            folder = service.files().create(body=meta, fields="id").execute()
+            vault_id = folder["id"]
+            print(f"GDRIVE_FOLDER_ID:      {vault_id} (created new Reelix_Vault under 'root')")
+    except Exception as e:
+        print(f"Note: Could not automatically create Reelix_Vault folder ({e}).")
+        print("Reelix will automatically create it upon first worker run.")
+
     print("=================================================================")
-    print("Add these 3 values (and GDRIVE_FOLDER_ID) to your GitHub Repository Secrets.")
+    print("Add these 4 values to your GitHub Repository Secrets:")
+    print(" - GDRIVE_CLIENT_ID")
+    print(" - GDRIVE_CLIENT_SECRET")
+    print(" - GDRIVE_REFRESH_TOKEN")
+    if vault_id:
+        print(f" - GDRIVE_FOLDER_ID (value: {vault_id})")
+    else:
+        print(" - GDRIVE_FOLDER_ID")
 
 
 if __name__ == "__main__":
     main()
+

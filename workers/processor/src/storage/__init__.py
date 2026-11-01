@@ -23,8 +23,8 @@ class StorageClient(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def claim_job(self, job: JobManifest, expected_etag: Optional[str] = None) -> bool:
-        """Attempts to claim a job with lease checking and ETag precondition."""
+    def claim_job(self, job: JobManifest, runner_id: Optional[str] = None) -> bool:
+        """Attempts to claim a job safely with lease validation and read-after-write verification."""
         pass
 
     @abc.abstractmethod

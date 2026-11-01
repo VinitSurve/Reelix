@@ -69,7 +69,7 @@ class FakeAnalyzer:
                 key_takeaways=["takeaway1"],
                 important_concepts=["concept1"],
                 actionable_steps=["step1"],
-                model_name="gemini-2.5-flash",
+                model_name="gemini-3.8-flash",
                 generated_at=1000,
             ),
         )
@@ -156,8 +156,8 @@ class TestPipeline(unittest.TestCase):
             retry_count=0,
             max_retries=2,
             stages=StageStates(
-                audio_extraction=StageStatus.SUCCEEDED,
-                transcription=StageStatus.SUCCEEDED,
+                audio_extraction=StageStatus.PENDING,
+                transcription=StageStatus.PENDING,
                 gemini_analysis=StageStatus.PENDING,
             ),
         )
@@ -176,12 +176,43 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(JobStatus.WAITING_RETRY, j1.status)
         self.assertEqual(1, j1.retry_count)
 
-        # Attempt 2 -> FAILED (retry_count=2 reached max_retries=2)
+        # Attempt 2 -> FAILED (retry_count=2 reached max_retries=2 with zero results)
         summary2 = pipeline.run_batch()
         self.assertEqual(1, summary2.failed)
         j2 = self.storage.get_job("item-retry-test")
         self.assertEqual(JobStatus.FAILED, j2.status)
         self.assertEqual(2, j2.retry_count)
+
+    def test_job_failure_with_partial_results_marked_partial(self):
+        # When transcription succeeded but Gemini failed after exhausting retries
+        job = JobManifest(
+            item_id="item-partial-test",
+            source="URL",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            retry_count=1,
+            max_retries=2,
+            stages=StageStates(
+                audio_extraction=StageStatus.SUCCEEDED,
+                transcription=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.PENDING,
+            ),
+        )
+        job.results.transcript = "Saved transcript content"
+        self.storage.update_job(job)
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            gemini_analyzer=FakeAnalyzer(success=False),
+        )
+
+        summary = pipeline.run_batch()
+        self.assertEqual(1, summary.failed)
+        j = self.storage.get_job("item-partial-test")
+        self.assertEqual(JobStatus.PARTIAL, j.status)
+        self.assertEqual("Saved transcript content", j.results.transcript)
 
     def test_concurrent_worker_claim_collision_rejected(self):
         job = JobManifest(
@@ -193,7 +224,7 @@ class TestPipeline(unittest.TestCase):
             stages=StageStates(
                 audio_extraction=StageStatus.SUCCEEDED,
                 transcription=StageStatus.SUCCEEDED,
-                gemini_analysis=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.PENDING,
             ),
         )
         self.storage.update_job(job)
@@ -237,7 +268,7 @@ class TestPipeline(unittest.TestCase):
             stages=StageStates(
                 audio_extraction=StageStatus.SUCCEEDED,
                 transcription=StageStatus.SUCCEEDED,
-                gemini_analysis=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.PENDING,
             ),
         )
         self.storage.update_job(stale_job)
@@ -277,7 +308,7 @@ class TestPipeline(unittest.TestCase):
             stages=StageStates(
                 audio_extraction=StageStatus.SUCCEEDED,
                 transcription=StageStatus.SUCCEEDED,
-                gemini_analysis=StageStatus.SUCCEEDED,
+                gemini_analysis=StageStatus.PENDING,
             ),
         )
         self.storage.update_job(active_job)

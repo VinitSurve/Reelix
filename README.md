@@ -6,20 +6,39 @@ Reelix is a single-user, local-first Android knowledge vault for capturing, orga
 
 ---
 
-## What's New in Phase 3 & 3.1: Cloud Processing Migration & Verified OAuth Integration
+## What's New in Phase 3.2: Drive API Correctness, Concurrency & Live Integration Readiness
 
-Phase 3 introduces an asynchronous, battery-saving cloud processing architecture that offloads heavy compute (FFmpeg audio extraction, Whisper speech-to-text, and Gemini AI analysis) to free GitHub Actions runners, using persistent Google Drive storage for durable queueing.
+Phase 3.2 solidifies cloud processing reliability, API correctness, and concurrency guarantees:
 
-Phase 3.1 addresses critical integration requirements:
-- **Upgraded Gemini Model:** Upgraded to supported `gemini-2.5-flash` with zero billing requirements and permanent free-tier quotas (configurable via `GEMINI_MODEL`).
-- **Google OAuth 2.0 on Personal My Drive:** Standalone service accounts cannot own files in personal Gmail My Drive and have zero storage quota. Reelix now uses Google OAuth 2.0 with the least-privilege `drive.file` scope and automatic token refresh.
-- **Streaming Resumable Android Uploads:** Uses Google Drive's Resumable Upload protocol with OkHttp streaming (`file.asRequestBody()`), preventing `OutOfMemoryError` on large video files. Includes duplicate detection to prevent redundant uploads and automatic token refresh on HTTP 401.
-- **Keystore Security:** OAuth access and refresh tokens are encrypted using AES-256-GCM in the Android Keystore (`SecretStore`) and are never written to plain DataStore preferences or system logs.
-- **Concurrency & Lease-Claiming Strategy:** Uses Google Drive ETags (`If-Match`) and a 15-minute lease timeout to handle competing runners safely and reclaim stale/abandoned processing jobs.
+- **Strict Gemini Model Restriction:** Reelix strictly allows **only two Google AI Studio models**:
+  - `gemini-3.8-flash` (Default)
+  - `gemini-3.6-flash` (Allowed Alternative)
+  Both models are available on Google AI Studio's **Free Tier** ($0 cost, no Google Cloud billing account, no credit card required). An allowlist enforces valid models across Python config, workflow inputs, and Android manifests; any invalid model fails fast before making an API call.
+- **Google Drive API Concurrency Architecture:** Google Drive API v3 does not enforce HTTP `If-Match` or atomic Compare-And-Swap (CAS) on File resource updates. Reelix solves concurrency with a robust multi-layer design:
+  1. *Workflow Serialization:* GitHub Actions enforces `concurrency: group: reelix-processing, cancel-in-progress: false`, ensuring only one runner executes at a time.
+  2. *Active Lease Protection:* Any job in `PROCESSING` with a lease under 15 minutes is strictly protected from being claimed or overwritten by another worker.
+  3. *Stale Lease Recovery:* Abandoned or stalled jobs (> 15 minutes) are safely reclaimed and retried.
+  4. *Read-After-Write Verification:* Workers write their unique `runner_id` and lease timestamp, then immediately re-read the remote manifest. If a race collision occurs and another worker won the write, the losing worker detects the mismatch and immediately aborts without processing or corrupting data.
+  5. *Lease Ownership Check on Updates:* Workers verify remote lease ownership before committing stage updates.
+- **Root Vault Authorization under `drive.file` Scope:**
+  The `drive.file` OAuth scope only grants access to files and folders created or opened by the app. A folder manually created by the user in the Google Drive web UI is inaccessible under `drive.file`. Reelix automatically searches for or creates its own `Reelix_Vault` folder under `'root'` (`parents: ['root']`) using the authorized API. Both the Android app and GitHub Actions share this authorized root folder.
+- **Android Resumable Upload Recovery:**
+  Implements the full Google Drive Resumable Upload recovery protocol:
+  1. Persists upload session URIs across network interruptions and app restarts.
+  2. Queries the server for uploaded byte range (`PUT` with `Content-Range: bytes */<length>`).
+  3. Parses `308 Resume Incomplete` (`Range: bytes=0-<lastByte>`) and resumes streaming from `lastByte + 1`.
+  4. Detects already-completed uploads (`200/201`), avoiding duplicate file creation.
+  5. Handles expired sessions (`404/410`) by seamlessly restarting fresh sessions.
+  6. Refreshes OAuth tokens on HTTP 401 without destroying in-progress upload sessions.
+- **Honest Completion States:**
+  - `COMPLETED`: Marked only when all required stages succeeded and produced non-empty results (non-empty summary, takeaways, and transcript). Empty Gemini responses or missing transcripts are never treated as successful.
+  - `PARTIAL`: Preserves successful stage results (e.g. transcript) in SQLite, marks `NEEDS_ATTENTION`, and indexes partial results in Room FTS4 for offline searchability.
+  - `FAILED`: Marked when all stages fail or retries are exhausted.
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                            REELIX CLOUD ARCHITECTURE                         │
+│                           Phase 3.2 Verified Pipeline                        │
 └──────────────────────────────────────────────────────────────────────────────┘
    [ Instagram / Share Sheet ]
                 │
@@ -27,71 +46,57 @@ Phase 3.1 addresses critical integration requirements:
    [ Android Reelix App ]
     - Receives URLs & Shared Media (video/audio)
     - Saves locally to Room SQLite + App-Private Storage
-    - Resumable streaming upload to Google Drive queue (no heap buffering)
+    - Resumable streaming upload to Google Drive queue (session recovery, 0 heap buffering)
                 │
                 ▼
-   [ Persistent Cloud Storage: Google Drive (Personal My Drive) ]
-    ├── jobs/<item_id>.json   (Lease-tracked manifests with ETag concurrency)
-    ├── media/<item_id>_*     (Raw shared media files)
-    └── audio/<item_id>.wav   (Extracted 16kHz mono WAV files)
+   [ Persistent Cloud Storage: Google Drive (Personal My Drive under drive.file) ]
+    ├── Reelix_Vault/ (Auto-created in 'root' via API)
+    │   ├── jobs/<item_id>.json   (Leased manifests with Read-After-Write verification)
+    │   ├── media/<item_id>_*     (Raw shared media files)
+    │   └── audio/<item_id>.wav   (Extracted 16kHz mono WAV files)
                 │
                 ▼
    [ GitHub Actions Runner (Scheduled Cron / Manual Dispatch) ]
-    - Concurrency protected (no race conditions)
-    - Optimistic lease claim with ETag pre-condition checks
+    - Serialized concurrency (cancel-in-progress: false)
+    - Application lease claim + Read-After-Write verification
     - FFmpeg: Extracts 16kHz 16-bit mono WAV audio
     - Whisper: CPU speech transcription (OpenAI Whisper base model with weight caching)
-    - Google AI Studio Gemini API: Generates 9-field structured content intelligence
-    - Writes results back to jobs/<item_id>.json in Google Drive
+    - Google AI Studio Gemini API: Structured knowledge extraction (gemini-3.8-flash)
+    - Writes verified results back to jobs/<item_id>.json in Google Drive
                 │
                 ▼
    [ Android Reelix Sync ]
     - WorkManager CloudSyncWorker / Settings "Sync results now"
     - Downloads transcripts & structured Gemini intelligence
-    - Stores into Room database & populates tags
-    - Re-indexes SQLite FTS4 for instant offline search
+    - Honest state transition: COMPLETED vs PARTIAL vs FAILED
+    - Stores into Room database & populates normalized AI tags
+    - Re-indexes SQLite FTS4 for instant offline search (even for partial transcripts)
 ```
-
-### Key Highlights
-- **Zero Heavy Processing on Android Phones:** No CPU-heavy Whisper decoding or battery-draining audio encoding on your device.
-- **Durable Storage & Atomic Job Claiming:** Google Drive serves as a resilient queue. The GitHub Actions worker claims jobs using a runner ID, timestamps, and ETags, with automatic retries up to 3 attempts.
-- **Git Repository Cleanliness:** No media files, model binaries, or database records are committed to Git.
-- **9 Structured Content Intelligence Fields:**
-  1. `summary`
-  2. `detailed_summary`
-  3. `main_topic`
-  4. `category`
-  5. `keywords`
-  6. `tags`
-  7. `key_takeaways`
-  8. `important_concepts`
-  9. `actionable_steps`
-- **Dual Mode Flexibility:** Keep local processing (native MediaCodec + local Whisper + local Ollama) or enable Cloud Offloading in Settings with a single switch.
 
 ---
 
 ## 100% Free-Tier Architecture Verification
 
 Reelix strictly adheres to the zero-cost principle:
-1. **Google Drive API (v3):** Standard GCP projects can enable Google Drive API with **no payment card and no billing account**. Google accounts provide 15GB of free persistent storage and generous Drive API quotas (20,000 queries / 100 seconds).
-2. **Google AI Studio (Gemini 2.5 Flash):** Google AI Studio provides a **permanent free-tier API** without requiring a credit card or billing account.
-3. **GitHub Actions:** GitHub accounts receive free runner minutes each month for public and private repositories.
-4. **Whisper:** Uses the open-source OpenAI Whisper model running on GitHub Actions CPU runners with runner caching (`actions/cache@v4`).
+1. **Google Drive API (v3):** Standard Google accounts provide 15GB of persistent storage. Enabling Google Drive API in a personal GCP project requires **no billing account and no payment card**.
+2. **Google AI Studio (Gemini 3.8 Flash & Gemini 3.6 Flash):** Available on Google AI Studio's **Free Tier** with 1M token context windows, rate limits sufficient for personal usage, and **$0 cost** with no billing account required.
+3. **GitHub Actions:** GitHub provides free runner minutes monthly for workflows.
+4. **Whisper:** Open-source OpenAI Whisper runs on GitHub Actions CPU runners with weight caching (`actions/cache@v4`).
 
 **Total Operating Cost: $0.00 / month forever.**
 
 ---
 
-## Cloud Worker Setup (GitHub Actions & Google Drive)
+## First-Time Setup Instructions
 
 ### 1. Set Up Google Cloud Project & OAuth 2.0
-> **Why OAuth 2.0?** Standalone Service Accounts have 0 bytes of storage quota and cannot own files in personal Google Drive accounts (@gmail.com). Using Google OAuth 2.0 with the least-privilege `drive.file` scope allows the worker to access only the files/folders created by Reelix in your personal Drive.
+> **Why OAuth 2.0?** Service Accounts have 0 bytes of storage quota and cannot own files in personal Google Drive accounts (@gmail.com). OAuth 2.0 with the least-privilege `drive.file` scope allows Reelix to manage only its own vault files in your personal Drive.
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project (no billing account needed).
 2. Go to **APIs & Services → Library** and enable **Google Drive API**.
 3. Go to **APIs & Services → OAuth consent screen**:
    - Choose **External** user type.
-   - Fill in app name (e.g. `Reelix`) and your email.
+   - Enter App name (`Reelix`) and your email.
    - Under **Scopes**, add `https://www.googleapis.com/auth/drive.file`.
    - Under **Test users**, add your own Gmail address.
 4. Go to **APIs & Services → Credentials**:
@@ -99,81 +104,42 @@ Reelix strictly adheres to the zero-cost principle:
    - Application type: **Desktop app**.
    - Copy the **Client ID** and **Client Secret**.
 
-### 2. Generate Refresh Token
-Run the included helper script:
+### 2. Generate Refresh Token & Auto-Create Root Vault
+Run the interactive setup helper:
 ```bash
 python workers/processor/scripts/get_oauth_token.py
 ```
-Enter your Client ID and Client Secret, authorize in your browser, and copy the printed `GDRIVE_REFRESH_TOKEN`.
+1. Enter your Client ID and Client Secret.
+2. Authorize in the browser window with your personal Google account.
+3. The script automatically obtains your refresh token and creates or discovers the authorized `Reelix_Vault` folder under `'root'`.
+4. Copy the printed output:
+   - `GDRIVE_CLIENT_ID`
+   - `GDRIVE_CLIENT_SECRET`
+   - `GDRIVE_REFRESH_TOKEN`
+   - `GDRIVE_FOLDER_ID`
 
-### 3. Create Google Drive Target Folder
-1. Open [Google Drive](https://drive.google.com/).
-2. Create a folder named `Reelix_Vault`.
-3. Copy the Folder ID from the URL: `https://drive.google.com/drive/folders/<FOLDER_ID>`.
-
-### 4. Get a Free Gemini API Key
+### 3. Get a Free Gemini API Key
 1. Go to [Google AI Studio](https://aistudio.google.com/).
-2. Click **Get API key** and generate a free API key (zero payment required).
+2. Click **Get API key** and create an API key (no credit card or billing account needed).
+3. Permitted models are `gemini-3.8-flash` (default) and `gemini-3.6-flash`.
 
-### 5. Add GitHub Repository Secrets
+### 4. Add GitHub Repository Secrets
 In your GitHub repository (`https://github.com/VinitSurve/Reelix`), navigate to **Settings → Secrets and variables → Actions** and add:
 - `GDRIVE_CLIENT_ID`: Your OAuth Client ID.
 - `GDRIVE_CLIENT_SECRET`: Your OAuth Client Secret.
 - `GDRIVE_REFRESH_TOKEN`: The generated refresh token.
-- `GDRIVE_FOLDER_ID`: The `Reelix_Vault` folder ID.
+- `GDRIVE_FOLDER_ID`: The authorized `Reelix_Vault` folder ID.
 - `GEMINI_API_KEY`: Your free Gemini API key.
-- `GEMINI_MODEL`: (Optional, defaults to `gemini-2.5-flash`).
+- `GEMINI_MODEL`: (Optional, defaults to `gemini-3.8-flash`; allowed alternative: `gemini-3.6-flash`).
 
-### 6. Enable Cloud Offloading in Reelix Android App
-1. Open Reelix on your device or emulator.
+### 5. Configure Reelix Android App
+1. Open Reelix on your device.
 2. Go to **Settings → Cloud processing (GitHub Actions & Google Drive)**.
 3. Toggle **Enable cloud offloading**.
-4. Enter your **Google Drive Folder ID** and OAuth Refresh Token (or access token).
-5. Tap **Save cloud config** (tokens are encrypted in Android Keystore).
-6. When media items are shared to Reelix, they will be streamed to Drive and processed automatically by GitHub Actions!
-7. Tap **Sync results now** anytime to integrate completed transcripts and Gemini intelligence immediately.
-
----
-
-## Repository Structure
-
-```text
-.
-├── .github/
-│   └── workflows/
-│       ├── process-queue.yml  # Scheduled (every 30m) & dispatch processor on GitHub Actions
-│       └── ci.yml             # Continuous integration (Android testDebugUnitTest + Python unit tests)
-├── workers/
-│   └── processor/             # Cloud Python worker executed in GitHub Actions
-│       ├── scripts/
-│       │   └── get_oauth_token.py # Interactive OAuth 2.0 token generator
-│       ├── src/
-│       │   ├── config.py      # Environment configuration (secrets & folders)
-│       │   ├── models.py      # JobManifest, MediaInfo, StageStates, GeminiAnalysisResult
-│       │   ├── pipeline.py    # Atomic job claiming, stage execution, retries, disk cleanup
-│       │   ├── main.py        # CLI entrypoint for GitHub Actions runner
-│       │   ├── stages/        # audio_extractor (FFmpeg), transcriber (Whisper), gemini_analyzer (Gemini 2.5 Flash)
-│       │   └── storage/       # DriveClient (OAuth 2.0 & ETags) & MockStorageClient
-│       ├── tests/             # 24 unit and live-integration tests for cloud pipeline
-│       └── requirements.txt   # Worker dependencies
-├── app/src/main/java/app/reelix/
-│   ├── cloud/                 # Android CloudSyncClient (resumable streaming), CloudSyncRepository, CloudSyncWorker
-│   ├── core/                  # Clock, privacy-safe logging, InstagramUrlParser, ShareIntentReader
-│   ├── data/
-│   │   ├── db/                # ReelixDatabase (Room v2 + FTS4 full-text search)
-│   │   ├── files/             # MediaStorage (AppPrivateMediaStorage), StorageInspector
-│   │   ├── media/             # Local AndroidMediaCodecAudioExtractor
-│   │   ├── repository/        # SavedItemRepository, SearchIndexer, TagNormalizer
-│   │   └── settings/          # DataStoreSettingsRepository, KeystoreSecretStore (AES-256-GCM)
-│   ├── integrations/          # Local Whisper model manager & Ollama integration
-│   ├── processing/            # ProcessingPipeline, StageHandlers, ProcessingWorker, Scheduler
-│   └── ui/                    # Jetpack Compose UI (Material 3), Navigation, Screens, Settings
-└── app/src/test/java/app/reelix/
-    ├── CloudSyncTest.kt       # Manifest round-trip, cloud upload, completed job sync & FTS4 indexing
-    ├── AudioExtractionAndTranscriptionTest.kt
-    ├── AiEnrichmentAndConnectionTest.kt
-    └── ... (43 passing unit tests)
-```
+4. Enter your **Google Drive Folder ID** and OAuth Refresh Token.
+5. Tap **Save cloud config** (tokens are encrypted with AES-256-GCM in Android Keystore).
+6. When media items are shared to Reelix, they will be uploaded with resumable session recovery and processed automatically by GitHub Actions!
+7. Tap **Sync results now** anytime to retrieve transcripts and Gemini content intelligence.
 
 ---
 
@@ -185,9 +151,10 @@ python3 -m unittest discover -s workers/processor/tests -v
 ```
 Output:
 ```text
-Ran 24 tests in 0.455s
-OK (skipped=2)
+Ran 36 tests in 0.362s
+OK (skipped=5)
 ```
+*(31 unit & mock integration tests passed; 5 live external tests explicitly skipped when live credentials are not set)*
 
 ### 2. Run Android Unit Tests
 ```bash
@@ -195,8 +162,8 @@ OK (skipped=2)
 ```
 Output:
 ```text
-BUILD SUCCESSFUL in 8s
-30 actionable tasks: 7 executed, 23 up-to-date
+BUILD SUCCESSFUL
+46 tests completed, 0 failed, 0 skipped
 ```
 
 ### 3. Build Android Debug APK

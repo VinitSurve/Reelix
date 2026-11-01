@@ -66,30 +66,43 @@ class MockStorageClient(StorageClient):
         manifest.etag = self.etags.get(item_id, "mock_etag_init")
         return manifest
 
-    def claim_job(self, job: JobManifest, expected_etag: Optional[str] = None) -> bool:
-        current_etag = self.etags.get(job.item_id)
-        if expected_etag is not None and current_etag is not None and current_etag != expected_etag:
-            return False
-
+    def claim_job(self, job: JobManifest, runner_id: Optional[str] = None) -> bool:
+        actual_runner = runner_id or job.claimed_by or "mock-runner"
         existing = self.get_job(job.item_id)
-        if existing and existing.status == JobStatus.PROCESSING:
-            now_ms = int(time.time() * 1000)
-            lease = existing.lease_timeout_ms or self.default_lease_ms
-            if existing.claimed_at and (now_ms - existing.claimed_at) < lease:
+        if existing:
+            if existing.status == JobStatus.PROCESSING:
+                now_ms = int(time.time() * 1000)
+                lease = existing.lease_timeout_ms or self.default_lease_ms
+                if existing.claimed_at and (now_ms - existing.claimed_at) < lease:
+                    return False
+            elif existing.status in (JobStatus.COMPLETED, JobStatus.FAILED):
                 return False
 
-        new_etag = self._next_etag(job.item_id)
-        job.etag = new_etag
-        self.etags[job.item_id] = new_etag
+        now_ms = int(time.time() * 1000)
+        job.status = JobStatus.PROCESSING
+        job.claimed_by = actual_runner
+        job.claimed_at = now_ms
+        job.updated_at = now_ms
 
         job_file = self.jobs_dir / f"{job.item_id}.json"
         job_file.write_text(job.to_json(), encoding="utf-8")
+
+        # Read-after-write verification
+        verified = JobManifest.from_json(job_file.read_text(encoding="utf-8"))
+        if verified.claimed_by != actual_runner:
+            return False
+
         return True
 
     def update_job(self, job: JobManifest) -> bool:
-        new_etag = self._next_etag(job.item_id)
-        job.etag = new_etag
-        self.etags[job.item_id] = new_etag
+        existing = self.get_job(job.item_id)
+        if (
+            existing
+            and existing.claimed_by
+            and job.claimed_by
+            and existing.claimed_by != job.claimed_by
+        ):
+            return False
 
         job_file = self.jobs_dir / f"{job.item_id}.json"
         job_file.write_text(job.to_json(), encoding="utf-8")
