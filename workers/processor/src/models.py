@@ -46,6 +46,7 @@ class MediaInfo:
 
 @dataclass
 class StageStates:
+    acquisition: StageStatus = StageStatus.PENDING
     audio_extraction: StageStatus = StageStatus.PENDING
     transcription: StageStatus = StageStatus.PENDING
     gemini_analysis: StageStatus = StageStatus.PENDING
@@ -53,6 +54,7 @@ class StageStates:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> StageStates:
         return cls(
+            acquisition=StageStatus(data.get("acquisition", StageStatus.PENDING.value)),
             audio_extraction=StageStatus(data.get("audio_extraction", StageStatus.PENDING.value)),
             transcription=StageStatus(data.get("transcription", StageStatus.PENDING.value)),
             gemini_analysis=StageStatus(data.get("gemini_analysis", StageStatus.PENDING.value)),
@@ -137,6 +139,7 @@ class JobManifest:
         d = asdict(self)
         d["status"] = self.status.value
         d["stages"] = {
+            "acquisition": self.stages.acquisition.value,
             "audio_extraction": self.stages.audio_extraction.value,
             "transcription": self.stages.transcription.value,
             "gemini_analysis": self.stages.gemini_analysis.value,
@@ -153,6 +156,10 @@ class JobManifest:
 
         stages_data = data.get("stages", {})
         stages = StageStates.from_dict(stages_data)
+        # Backward compatibility: if older manifest already had uploaded media and no acquisition stage recorded,
+        # acquisition was already handled / not required.
+        if media is not None and "acquisition" not in stages_data:
+            stages.acquisition = StageStatus.SKIPPED
 
         results_data = data.get("results", {})
         results = JobResults.from_dict(results_data)

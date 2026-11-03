@@ -3,6 +3,7 @@
 import shutil
 import unittest
 from pathlib import Path
+from typing import Optional
 
 from workers.processor.src.config import WorkerConfig
 from workers.processor.src.models import (
@@ -15,6 +16,11 @@ from workers.processor.src.models import (
 )
 from workers.processor.src.pipeline import CloudProcessingPipeline
 from workers.processor.src.stages.audio_extractor import AudioExtractionOutcome
+from workers.processor.src.stages.downloader import (
+    DownloadResult,
+    DownloadStatus,
+    MediaDownloader,
+)
 from workers.processor.src.stages.gemini_analyzer import GeminiAnalysisOutcome
 from workers.processor.src.stages.transcriber import TranscriptionOutcome
 from workers.processor.src.storage.mock_storage import MockStorageClient
@@ -72,6 +78,35 @@ class FakeAnalyzer:
                 model_name="gemini-3.6-flash",
                 generated_at=1000,
             ),
+        )
+
+
+class FakeDownloader(MediaDownloader):
+    def __init__(self, outcome: Optional[DownloadResult] = None):
+        self.outcome = outcome
+        self.called = 0
+        self.last_url = None
+
+    def download(self, url: str, output_dir: Path, item_id: str) -> DownloadResult:
+        self.called += 1
+        self.last_url = url
+        if self.outcome is not None:
+            return self.outcome
+
+        # Default success: create dummy file on disk
+        output_dir.mkdir(parents=True, exist_ok=True)
+        media_path = output_dir / f"{item_id}_dummy.mp4"
+        media_path.write_bytes(b"dummy downloaded video bytes")
+        return DownloadResult(
+            status=DownloadStatus.SUCCESS,
+            media_path=media_path,
+            mime_type="video/mp4",
+            file_name=media_path.name,
+            size_bytes=len(b"dummy downloaded video bytes"),
+            duration_ms=10000,
+            title="Downloaded Title",
+            caption="Downloaded Caption",
+            provider="fake-downloader",
         )
 
 
@@ -345,10 +380,12 @@ class TestPipeline(unittest.TestCase):
         self.storage.update_job(job)
 
         fake_analyzer = FakeAnalyzer(success=True)
+        fake_dl = FakeDownloader(DownloadResult(status=DownloadStatus.UNAVAILABLE, error_message="Not found"))
         pipeline = CloudProcessingPipeline(
             config=self.config,
             storage=self.storage,
             gemini_analyzer=fake_analyzer,
+            downloader=fake_dl,
         )
 
         success = pipeline.process_job(job)
@@ -361,6 +398,7 @@ class TestPipeline(unittest.TestCase):
             "URL-only item without media or metadata; share reel video or provide notes",
             updated.error_message,
         )
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.acquisition)
         self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
         self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
         self.assertEqual(StageStatus.SKIPPED, updated.stages.gemini_analysis)
@@ -381,10 +419,12 @@ class TestPipeline(unittest.TestCase):
         self.storage.update_job(job)
 
         fake_analyzer = FakeAnalyzer(success=True)
+        fake_dl = FakeDownloader(DownloadResult(status=DownloadStatus.UNAVAILABLE, error_message="Private post"))
         pipeline = CloudProcessingPipeline(
             config=self.config,
             storage=self.storage,
             gemini_analyzer=fake_analyzer,
+            downloader=fake_dl,
         )
 
         success = pipeline.process_job(job)
@@ -392,6 +432,7 @@ class TestPipeline(unittest.TestCase):
 
         updated = self.storage.get_job("item-url-with-caption")
         self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.acquisition)
         self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
         self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
         self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
@@ -414,10 +455,12 @@ class TestPipeline(unittest.TestCase):
         self.storage.update_job(job)
 
         fake_analyzer = FakeAnalyzer(success=True)
+        fake_dl = FakeDownloader(DownloadResult(status=DownloadStatus.UNAVAILABLE, error_message="Private post"))
         pipeline = CloudProcessingPipeline(
             config=self.config,
             storage=self.storage,
             gemini_analyzer=fake_analyzer,
+            downloader=fake_dl,
         )
 
         success = pipeline.process_job(job)
@@ -425,11 +468,235 @@ class TestPipeline(unittest.TestCase):
 
         updated = self.storage.get_job("item-url-with-notes")
         self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.acquisition)
         self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
         self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
         self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
         self.assertEqual(1, fake_analyzer.called)
         self.assertIsNotNone(updated.results.analysis)
+
+    def test_uploaded_media_preserves_existing_behavior(self):
+        media_file = self.test_dir / "uploaded.mp4"
+        media_file.write_bytes(b"uploaded video bytes")
+        self.storage.register_media("uploaded-drive-id-1", media_file)
+
+        job = JobManifest(
+            item_id="item-uploaded-pre-existing",
+            source="MEDIA_SHARE",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            media=MediaInfo(
+                file_name="uploaded.mp4",
+                mime_type="video/mp4",
+                drive_file_id="uploaded-drive-id-1",
+                size_bytes=20,
+            ),
+        )
+        self.storage.update_job(job)
+
+        fake_dl = FakeDownloader()
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            audio_extractor=FakeExtractor(),
+            transcriber=FakeTranscriber(),
+            gemini_analyzer=FakeAnalyzer(),
+            downloader=fake_dl,
+        )
+
+        success = pipeline.process_job(job)
+        self.assertTrue(success)
+        self.assertEqual(0, fake_dl.called, "Downloader must not be called when media is pre-existing")
+
+        updated = self.storage.get_job("item-uploaded-pre-existing")
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.acquisition)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
+
+    def test_url_job_successful_acquisition_and_full_pipeline(self):
+        job = JobManifest(
+            item_id="item-acquire-success",
+            source="SHARE",
+            original_url="https://www.instagram.com/reel/SuccessfulAcquire/",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            media=None,
+        )
+        self.storage.update_job(job)
+
+        fake_dl = FakeDownloader()  # Returns SUCCESS with dummy file
+        fake_extractor = FakeExtractor()
+        fake_transcriber = FakeTranscriber()
+        fake_analyzer = FakeAnalyzer()
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            audio_extractor=fake_extractor,
+            transcriber=fake_transcriber,
+            gemini_analyzer=fake_analyzer,
+            downloader=fake_dl,
+        )
+
+        success = pipeline.process_job(job)
+        self.assertTrue(success)
+        self.assertEqual(1, fake_dl.called)
+        self.assertEqual(1, fake_extractor.called)
+        self.assertEqual(1, fake_transcriber.called)
+        self.assertEqual(1, fake_analyzer.called)
+
+        updated = self.storage.get_job("item-acquire-success")
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.acquisition)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
+        self.assertIsNotNone(updated.media)
+        self.assertTrue(updated.media.drive_file_id.startswith("media_item-acquire-success"))
+        self.assertEqual("Transcribed speech content", updated.results.transcript)
+        self.assertIsNotNone(updated.results.analysis)
+
+    def test_url_job_media_unavailable_falls_back_to_caption_gemini(self):
+        job = JobManifest(
+            item_id="item-unavail-with-caption",
+            source="SHARE",
+            original_url="https://www.instagram.com/reel/PrivateReel/",
+            caption="Valuable caption text discussing Kotlin Coroutines",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            media=None,
+        )
+        self.storage.update_job(job)
+
+        fake_dl = FakeDownloader(
+            DownloadResult(
+                status=DownloadStatus.UNAVAILABLE,
+                error_message="Instagram: User account is private",
+                is_retryable=False,
+            )
+        )
+        fake_extractor = FakeExtractor()
+        fake_transcriber = FakeTranscriber()
+        fake_analyzer = FakeAnalyzer()
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            audio_extractor=fake_extractor,
+            transcriber=fake_transcriber,
+            gemini_analyzer=fake_analyzer,
+            downloader=fake_dl,
+        )
+
+        success = pipeline.process_job(job)
+        self.assertTrue(success)
+        self.assertEqual(1, fake_dl.called)
+        self.assertEqual(0, fake_extractor.called, "Audio extraction must be skipped when media unavailable")
+        self.assertEqual(0, fake_transcriber.called, "Transcription must be skipped when media unavailable")
+        self.assertEqual(1, fake_analyzer.called, "Gemini should analyze available caption")
+
+        updated = self.storage.get_job("item-unavail-with-caption")
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.acquisition)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
+        self.assertEqual("https://www.instagram.com/reel/PrivateReel/", updated.original_url)
+        self.assertEqual("Valuable caption text discussing Kotlin Coroutines", updated.caption)
+
+    def test_url_job_transient_failure_retries_with_backoff(self):
+        job = JobManifest(
+            item_id="item-transient-rate-limit",
+            source="SHARE",
+            original_url="https://www.instagram.com/reel/RateLimitedReel/",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            retry_count=0,
+            max_retries=2,
+            media=None,
+        )
+        self.storage.update_job(job)
+
+        fake_dl = FakeDownloader(
+            DownloadResult(
+                status=DownloadStatus.TRANSIENT_FAILURE,
+                error_message="HTTP Error 429: Too Many Requests",
+                is_retryable=True,
+            )
+        )
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            downloader=fake_dl,
+        )
+
+        success = pipeline.process_job(job)
+        self.assertFalse(success, "Transient failure returns False to trigger retry handling")
+
+        updated = self.storage.get_job("item-transient-rate-limit")
+        self.assertEqual(JobStatus.WAITING_RETRY, updated.status)
+        self.assertEqual(1, updated.retry_count)
+        self.assertIn("Temporary media acquisition restriction", updated.error_message)
+
+    def test_old_manifest_compatibility_in_pipeline(self):
+        # Register media file
+        legacy_media = self.test_dir / "legacy.mp4"
+        legacy_media.write_bytes(b"legacy media content")
+        self.storage.register_media("legacy-drive-id", legacy_media)
+
+        # Legacy manifest JSON string without "acquisition" key in stages
+        old_json = """
+        {
+          "version": 1,
+          "item_id": "item-legacy-pipeline",
+          "source": "MEDIA_SHARE",
+          "status": "QUEUED",
+          "created_at": 1000,
+          "updated_at": 1000,
+          "media": {
+            "file_name": "legacy.mp4",
+            "mime_type": "video/mp4",
+            "drive_file_id": "legacy-drive-id",
+            "size_bytes": 20
+          },
+          "stages": {
+            "audio_extraction": "PENDING",
+            "transcription": "PENDING",
+            "gemini_analysis": "PENDING"
+          },
+          "results": {}
+        }
+        """
+        legacy_job = JobManifest.from_json(old_json)
+        self.storage.update_job(legacy_job)
+
+        fake_dl = FakeDownloader()
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            audio_extractor=FakeExtractor(),
+            transcriber=FakeTranscriber(),
+            gemini_analyzer=FakeAnalyzer(),
+            downloader=fake_dl,
+        )
+
+        success = pipeline.process_job(legacy_job)
+        self.assertTrue(success)
+        self.assertEqual(0, fake_dl.called)
+
+        updated = self.storage.get_job("item-legacy-pipeline")
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.acquisition)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
 
 
 if __name__ == "__main__":

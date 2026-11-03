@@ -41,3 +41,14 @@ class StorageClient(abc.ABC):
     def upload_audio(self, local_wav_path: Path, item_id: str) -> Optional[str]:
         """Uploads an extracted audio WAV file and returns its cloud file ID."""
         pass
+
+    @abc.abstractmethod
+    def upload_media(
+        self,
+        local_media_path: Path,
+        item_id: str,
+        mime_type: str = "video/mp4",
+        original_file_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """Uploads acquired media file to cloud storage and returns its cloud file ID."""
+        pass

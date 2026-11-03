@@ -131,3 +131,18 @@ class MockStorageClient(StorageClient):
         shutil.copy2(local_wav_path, dest)
         self._files[file_id] = dest
         return file_id
+
+    def upload_media(
+        self,
+        local_media_path: Path,
+        item_id: str,
+        mime_type: str = "video/mp4",
+        original_file_name: Optional[str] = None,
+    ) -> Optional[str]:
+        if not local_media_path.exists():
+            return None
+        file_id = f"media_{item_id}.mp4"
+        dest = self.media_dir / file_id
+        shutil.copy2(local_media_path, dest)
+        self._files[file_id] = dest
+        return file_id

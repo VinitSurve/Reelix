@@ -1,0 +1,62 @@
+name: Verify Cross-Client Google Drive Access
+
+'on':
+  workflow_dispatch:
+    inputs:
+      folder_id:
+        description: "Google Drive Folder ID created by Android Client A (the folder's NAME in Drive must start with 'Reelix_CrossClient_Test_')"
+        required: true
+      file_id:
+        description: "Google Drive File ID of probe JSON created by Android Client A"
+        required: true
+      skip_cleanup:
+        description: "Set to 'true' to preserve files for manual inspection (default: false cleans up automatically)"
+        required: false
+        default: "false"
+
+# Concurrency group matches the production processing queue to serialize execution within GitHub Actions.
+# Note: This prevents overlapping GitHub Actions workflow runs, but does not prevent uncoordinated local or external Drive operations.
+concurrency:
+  group: reelix-processing
+  cancel-in-progress: false
+
+jobs:
+  verify-cross-client:
+    name: Verify Cross-Client Drive Access
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "workers/processor/requirements.txt"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r workers/processor/requirements.txt
+
+      - name: Execute Controlled Cross-Client Drive Verification
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
+          INPUT_FOLDER_ID: ${{ github.event.inputs.folder_id }}
+          INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
+          INPUT_SKIP_CLEANUP: ${{ github.event.inputs.skip_cleanup }}
+        run: |
+          EXTRA_ARGS=()
+          if [ "$INPUT_SKIP_CLEANUP" = "true" ]; then
+            EXTRA_ARGS+=(--skip-cleanup)
+          fi
+          python workers/processor/scripts/verify_cross_client.py \
+            --folder-id "$INPUT_FOLDER_ID" \
+            --file-id "$INPUT_FILE_ID" \
+            "${EXTRA_ARGS[@]}"

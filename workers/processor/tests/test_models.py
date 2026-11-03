@@ -69,6 +69,7 @@ class TestModels(unittest.TestCase):
         self.assertEqual(manifest.item_id, restored.item_id)
         self.assertEqual(manifest.status, restored.status)
         self.assertEqual(JobStatus.COMPLETED, restored.status)
+        self.assertEqual(StageStatus.PENDING, restored.stages.acquisition)
         self.assertEqual(StageStatus.SUCCEEDED, restored.stages.audio_extraction)
         self.assertEqual(StageStatus.SUCCEEDED, restored.stages.transcription)
         self.assertEqual(StageStatus.SUCCEEDED, restored.stages.gemini_analysis)
@@ -83,6 +84,62 @@ class TestModels(unittest.TestCase):
         self.assertEqual(["Hoist state"], restored.results.analysis.key_takeaways)
         self.assertEqual(["Unidirectional data flow"], restored.results.analysis.important_concepts)
         self.assertEqual(["Pass events upwards"], restored.results.analysis.actionable_steps)
+
+    def test_backward_compatibility_old_manifest_without_acquisition_field(self):
+        # Legacy manifest JSON without "acquisition" key in stages
+        old_json = """
+        {
+          "version": 1,
+          "item_id": "legacy-item-999",
+          "source": "MEDIA_SHARE",
+          "status": "QUEUED",
+          "created_at": 1730000000000,
+          "updated_at": 1730000000000,
+          "media": {
+            "file_name": "legacy_reel.mp4",
+            "mime_type": "video/mp4",
+            "drive_file_id": "legacy_drive_file_id",
+            "size_bytes": 500000
+          },
+          "stages": {
+            "audio_extraction": "PENDING",
+            "transcription": "PENDING",
+            "gemini_analysis": "PENDING"
+          },
+          "results": {}
+        }
+        """
+        restored = JobManifest.from_json(old_json)
+        self.assertEqual(restored.item_id, "legacy-item-999")
+        # Since media was already present, acquisition defaults to SKIPPED
+        self.assertEqual(restored.stages.acquisition, StageStatus.SKIPPED)
+        self.assertEqual(restored.stages.audio_extraction, StageStatus.PENDING)
+        self.assertIsNotNone(restored.media)
+        self.assertEqual(restored.media.file_name, "legacy_reel.mp4")
+
+    def test_backward_compatibility_old_url_manifest_without_acquisition_field(self):
+        # Legacy URL-only manifest JSON without media and without acquisition stage
+        old_url_json = """
+        {
+          "version": 1,
+          "item_id": "legacy-url-888",
+          "source": "SHARE",
+          "original_url": "https://www.instagram.com/reel/LegacyUrl123/",
+          "status": "QUEUED",
+          "created_at": 1730000000000,
+          "updated_at": 1730000000000,
+          "stages": {
+            "audio_extraction": "SKIPPED",
+            "transcription": "SKIPPED",
+            "gemini_analysis": "PENDING"
+          },
+          "results": {}
+        }
+        """
+        restored = JobManifest.from_json(old_url_json)
+        self.assertEqual(restored.item_id, "legacy-url-888")
+        # Since media is None and acquisition wasn't present, acquisition defaults to PENDING
+        self.assertEqual(restored.stages.acquisition, StageStatus.PENDING)
 
 
 if __name__ == "__main__":

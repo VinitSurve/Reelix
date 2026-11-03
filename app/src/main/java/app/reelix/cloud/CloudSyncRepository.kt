@@ -74,8 +74,9 @@ class CloudSyncRepository(
             updatedAt = clock.now(),
             media = mediaInfo,
             stages = CloudStageStates(
-                audioExtraction = if (mediaInfo != null) "PENDING" else "SKIPPED",
-                transcription = if (mediaInfo != null) "PENDING" else "SKIPPED",
+                acquisition = if (mediaInfo != null) "SKIPPED" else "PENDING",
+                audioExtraction = "PENDING",
+                transcription = "PENDING",
                 geminiAnalysis = "PENDING",
             ),
         )
@@ -118,9 +119,28 @@ class CloudSyncRepository(
             }
 
             val now = clock.now()
+            val existingResults = processingDao.resultsFor(manifest.itemId)
 
-            // 1. Audio and Transcription
-            if (manifest.results.transcript != null) {
+            // 0. Cloud-acquired media synchronization (idempotent; preserves existing valid local device media)
+            val hasValidLocalMedia = item.mediaPath?.let { File(it).exists() } == true
+            if (!hasValidLocalMedia && manifest.media != null && manifest.stages.acquisition == "SUCCEEDED") {
+                if (!item.mediaAvailable || item.mediaFileName != manifest.media.fileName) {
+                    itemDao.updateMediaDetails(
+                        id = manifest.itemId,
+                        available = true,
+                        mediaPath = item.mediaPath,
+                        mediaMimeType = manifest.media.mimeType.ifBlank { item.mediaMimeType ?: "video/mp4" },
+                        mediaSizeBytes = manifest.media.sizeBytes.takeIf { it > 0 } ?: item.mediaSizeBytes,
+                        mediaDurationMs = manifest.media.durationMs ?: item.mediaDurationMs,
+                        mediaFileName = manifest.media.fileName.ifBlank { item.mediaFileName },
+                        now = now,
+                    )
+                }
+            }
+
+            // 1. Audio and Transcription (idempotent: avoid duplicate result inserts)
+            val hasExistingTranscript = existingResults.any { it.stage == ProcessingStage.TRANSCRIPTION }
+            if (!hasExistingTranscript && manifest.results.transcript != null) {
                 processingDao.insertResult(
                     ProcessingResultEntity(
                         savedItemId = manifest.itemId,
@@ -131,6 +151,8 @@ class CloudSyncRepository(
                         generatedAt = now,
                     ),
                 )
+                itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
+            } else if (manifest.results.transcript != null && item.transcriptionStatus != StageStatus.SUCCEEDED) {
                 itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
             }
 
@@ -144,9 +166,10 @@ class CloudSyncRepository(
                 itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.FAILED, now)
             }
 
-            // 2. Gemini Analysis
+            // 2. Gemini Analysis (idempotent: avoid duplicate result inserts)
             val analysis = manifest.results.analysis
-            if (analysis != null) {
+            val hasExistingAnalysis = existingResults.any { it.stage == ProcessingStage.ANALYSIS }
+            if (!hasExistingAnalysis && analysis != null) {
                 processingDao.insertResult(
                     ProcessingResultEntity(
                         savedItemId = manifest.itemId,
@@ -172,6 +195,8 @@ class CloudSyncRepository(
                 if (aiTags.isNotEmpty()) {
                     savedItemRepository.replaceTagsLocked(manifest.itemId, aiTags, TagSource.AI, now)
                 }
+            } else if (analysis != null && item.analysisStatus != StageStatus.SUCCEEDED) {
+                itemDao.setAnalysisStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
             } else if (manifest.stages.geminiAnalysis == "FAILED") {
                 itemDao.setAnalysisStatus(manifest.itemId, StageStatus.FAILED, now)
             }

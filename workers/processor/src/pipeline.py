@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Optional
 
 from .config import WorkerConfig
-from .models import JobManifest, JobStatus, StageStatus
+from .models import JobManifest, JobStatus, MediaInfo, StageStatus
 from .stages.audio_extractor import FFmpegAudioExtractor
+from .stages.downloader import DownloadStatus, MediaDownloader, YtDlpDownloader
 from .stages.gemini_analyzer import GeminiAnalyzer
 from .stages.transcriber import WhisperTranscriber
 from .storage import StorageClient
@@ -28,7 +29,7 @@ class BatchRunSummary:
 
 
 class CloudProcessingPipeline:
-    """Orchestrates job claiming, audio extraction, Whisper transcription, and Gemini analysis."""
+    """Orchestrates job claiming, media acquisition, audio extraction, Whisper transcription, and Gemini analysis."""
 
     def __init__(
         self,
@@ -37,6 +38,7 @@ class CloudProcessingPipeline:
         audio_extractor: Optional[FFmpegAudioExtractor] = None,
         transcriber: Optional[WhisperTranscriber] = None,
         gemini_analyzer: Optional[GeminiAnalyzer] = None,
+        downloader: Optional[MediaDownloader] = None,
     ):
         self.config = config
         self.storage = storage
@@ -46,6 +48,7 @@ class CloudProcessingPipeline:
             api_key=config.gemini_api_key,
             model=config.gemini_model,
         )
+        self.downloader = downloader or YtDlpDownloader()
 
     def run_batch(self) -> BatchRunSummary:
         """Finds and executes up to max_jobs_per_run pending jobs."""
@@ -98,6 +101,60 @@ class CloudProcessingPipeline:
         local_wav_path = job_dir / f"{job.item_id}_audio.wav"
 
         try:
+            # 0. Media Acquisition
+            if job.media is not None:
+                # Pre-existing media uploaded directly from Android
+                if job.stages.acquisition == StageStatus.PENDING:
+                    job.stages.acquisition = StageStatus.SKIPPED
+            elif job.stages.acquisition != StageStatus.SUCCEEDED:
+                if job.original_url:
+                    logger.info("Attempting media acquisition for job %s from %s", job.item_id, job.original_url)
+                    dl_res = self.downloader.download(job.original_url, job_dir, job.item_id)
+                    if dl_res.is_success and dl_res.media_path is not None:
+                        logger.info("Uploading acquired media to persistent storage...")
+                        drive_file_id = self.storage.upload_media(
+                            local_media_path=dl_res.media_path,
+                            item_id=job.item_id,
+                            mime_type=dl_res.mime_type,
+                            original_file_name=dl_res.file_name,
+                        )
+                        if not drive_file_id:
+                            return self._handle_job_failure(job, "Failed to upload acquired media to persistent storage")
+
+                        job.media = MediaInfo(
+                            file_name=dl_res.file_name or dl_res.media_path.name,
+                            mime_type=dl_res.mime_type,
+                            drive_file_id=drive_file_id,
+                            size_bytes=dl_res.size_bytes,
+                            duration_ms=dl_res.duration_ms,
+                        )
+                        if not job.caption and dl_res.caption:
+                            job.caption = dl_res.caption
+                        local_media_path = dl_res.media_path
+                        job.stages.acquisition = StageStatus.SUCCEEDED
+                        job.updated_at = int(time.time() * 1000)
+                        self.storage.update_job(job)
+                    elif dl_res.is_retryable and job.retry_count < job.max_retries:
+                        logger.warning(
+                            "Temporary media acquisition restriction for %s: %s; scheduling retry",
+                            job.item_id, dl_res.error_message
+                        )
+                        return self._handle_job_failure(
+                            job, f"Temporary media acquisition restriction: {dl_res.error_message}"
+                        )
+                    else:
+                        logger.warning(
+                            "Media acquisition unavailable or exhausted for %s: %s",
+                            job.item_id, dl_res.error_message
+                        )
+                        job.stages.acquisition = StageStatus.SKIPPED
+                        job.stages.audio_extraction = StageStatus.SKIPPED
+                        job.stages.transcription = StageStatus.SKIPPED
+                else:
+                    job.stages.acquisition = StageStatus.SKIPPED
+                    job.stages.audio_extraction = StageStatus.SKIPPED
+                    job.stages.transcription = StageStatus.SKIPPED
+
             # 1. Media Retrieval & Audio Extraction
             if job.media is None:
                 if job.stages.audio_extraction == StageStatus.PENDING:
@@ -108,13 +165,14 @@ class CloudProcessingPipeline:
                 job.stages.audio_extraction != StageStatus.SUCCEEDED
                 and job.stages.audio_extraction != StageStatus.SKIPPED
             ):
-                ext = Path(job.media.file_name).suffix or ".mp4"
-                local_media_path = job_dir / f"input_media{ext}"
+                if local_media_path is None or not local_media_path.exists():
+                    ext = Path(job.media.file_name).suffix or ".mp4"
+                    local_media_path = job_dir / f"input_media{ext}"
 
-                logger.info("Downloading media file %s from cloud storage...", job.media.drive_file_id)
-                download_ok = self.storage.download_media(job.media.drive_file_id, local_media_path)
-                if not download_ok:
-                    return self._handle_job_failure(job, "Failed to download media file from persistent storage")
+                    logger.info("Downloading media file %s from cloud storage...", job.media.drive_file_id)
+                    download_ok = self.storage.download_media(job.media.drive_file_id, local_media_path)
+                    if not download_ok:
+                        return self._handle_job_failure(job, "Failed to download media file from persistent storage")
 
                 # Extract audio
                 extract_res = self.audio_extractor.extract(local_media_path, local_wav_path)
@@ -163,7 +221,7 @@ class CloudProcessingPipeline:
             )
             if job.media is None and not usable_text:
                 logger.info(
-                    "Job %s is URL-only with no media, caption, or notes; manual input required",
+                    "Job %s has no media, caption, or notes; manual input required",
                     job.item_id,
                 )
                 job.stages.audio_extraction = StageStatus.SKIPPED

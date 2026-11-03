@@ -61,6 +61,7 @@ data class CloudJobManifest(
         }
 
         val st = JSONObject()
+        st.put("acquisition", stages.acquisition)
         st.put("audio_extraction", stages.audioExtraction)
         st.put("transcription", stages.transcription)
         st.put("gemini_analysis", stages.geminiAnalysis)
@@ -108,7 +109,10 @@ data class CloudJobManifest(
             }
 
             val stagesObj = root.optJSONObject("stages")
+            val defaultAcquisition = if (media != null) "SKIPPED" else "PENDING"
+            val acquisition = stagesObj?.optString("acquisition")?.takeIf { it.isNotBlank() } ?: defaultAcquisition
             val stages = CloudStageStates(
+                acquisition = acquisition,
                 audioExtraction = stagesObj?.optString("audio_extraction", "PENDING") ?: "PENDING",
                 transcription = stagesObj?.optString("transcription", "PENDING") ?: "PENDING",
                 geminiAnalysis = stagesObj?.optString("gemini_analysis", "PENDING") ?: "PENDING",
@@ -183,6 +187,7 @@ data class CloudMediaInfo(
 )
 
 data class CloudStageStates(
+    val acquisition: String = "PENDING",
     val audioExtraction: String = "PENDING",
     val transcription: String = "PENDING",
     val geminiAnalysis: String = "PENDING",

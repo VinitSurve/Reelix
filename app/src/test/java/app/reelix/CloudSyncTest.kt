@@ -8,7 +8,10 @@ import app.reelix.cloud.CloudJobResults
 import app.reelix.cloud.CloudMediaInfo
 import app.reelix.cloud.CloudStageStates
 import app.reelix.data.files.ImportedMedia
+import app.reelix.domain.model.ContentType
+import app.reelix.domain.model.InstagramLink
 import app.reelix.domain.model.ItemQuery
+import app.reelix.domain.model.LinkSaveOutcome
 import app.reelix.domain.model.MediaSaveOutcome
 import app.reelix.domain.model.ProcessingStage
 import app.reelix.domain.model.ProcessingStatus
@@ -73,6 +76,7 @@ class CloudSyncTest {
                 durationMs = 45_000L,
             ),
             stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
                 audioExtraction = "SUCCEEDED",
                 transcription = "SUCCEEDED",
                 geminiAnalysis = "SUCCEEDED",
@@ -120,6 +124,7 @@ class CloudSyncTest {
         assertEquals(original.media!!.sizeBytes, parsed.media!!.sizeBytes)
         assertEquals(original.media!!.durationMs, parsed.media!!.durationMs)
 
+        assertEquals(original.stages.acquisition, parsed.stages.acquisition)
         assertEquals("SUCCEEDED", parsed.stages.audioExtraction)
         assertEquals("SUCCEEDED", parsed.stages.transcription)
         assertEquals("SUCCEEDED", parsed.stages.geminiAnalysis)
@@ -212,6 +217,7 @@ class CloudSyncTest {
             createdAt = container.clock.now() - 100_000L,
             updatedAt = container.clock.now(),
             stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
                 audioExtraction = "SUCCEEDED",
                 transcription = "SUCCEEDED",
                 geminiAnalysis = "SUCCEEDED",
@@ -386,6 +392,7 @@ class CloudSyncTest {
             createdAt = container.clock.now() - 50_000L,
             updatedAt = container.clock.now(),
             stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
                 audioExtraction = "SUCCEEDED",
                 transcription = "SUCCEEDED",
                 geminiAnalysis = "SUCCEEDED",
@@ -736,5 +743,324 @@ class CloudSyncTest {
         val idB = (resultB as app.reelix.cloud.CloudUploadResult.Success).driveFileId
         assertFalse("Item A and Item B must have separate Drive files", idA == idB)
         assertEquals(2, client.uploadedFiles.size)
+    }
+
+    @Test
+    fun oldManifestWithoutAcquisitionStageIsParsedBackwardCompatibly() {
+        // 1. Old manifest with media present
+        val oldMediaJson = """
+            {
+              "version": 1,
+              "item_id": "legacy-item-123",
+              "source": "MEDIA_SHARE",
+              "status": "QUEUED",
+              "created_at": 1730000000000,
+              "updated_at": 1730000000000,
+              "media": {
+                "file_name": "video.mp4",
+                "mime_type": "video/mp4",
+                "drive_file_id": "drive_123",
+                "size_bytes": 100000
+              },
+              "stages": {
+                "audio_extraction": "PENDING",
+                "transcription": "PENDING",
+                "gemini_analysis": "PENDING"
+              },
+              "results": {}
+            }
+        """.trimIndent()
+        val parsedMedia = CloudJobManifest.fromJson(oldMediaJson)
+        assertEquals("SKIPPED", parsedMedia.stages.acquisition)
+        assertEquals("PENDING", parsedMedia.stages.audioExtraction)
+        assertEquals("PENDING", parsedMedia.stages.transcription)
+
+        // 2. Old manifest without media present (URL-only)
+        val oldUrlJson = """
+            {
+              "version": 1,
+              "item_id": "legacy-url-456",
+              "source": "SHARE",
+              "original_url": "https://www.instagram.com/reel/Legacy456/",
+              "status": "QUEUED",
+              "created_at": 1730000000000,
+              "updated_at": 1730000000000,
+              "stages": {
+                "audio_extraction": "SKIPPED",
+                "transcription": "SKIPPED",
+                "gemini_analysis": "PENDING"
+              },
+              "results": {}
+            }
+        """.trimIndent()
+        val parsedUrl = CloudJobManifest.fromJson(oldUrlJson)
+        assertEquals("PENDING", parsedUrl.stages.acquisition)
+        assertEquals("SKIPPED", parsedUrl.stages.audioExtraction)
+    }
+
+    @Test
+    fun syncCompletedJobsSynchronizesCloudAcquiredMedia() = runTest {
+        // 1. Create a link-only item (no local media)
+        val linkOutcome = container.savedItemRepository.saveLink(
+            InstagramLink(
+                originalUrl = "https://www.instagram.com/reel/CloudAcquired123/",
+                normalizedUrl = "https://www.instagram.com/reel/CloudAcquired123/",
+                contentType = ContentType.REEL,
+                shortcode = "CloudAcquired123",
+            ),
+            source = SaveSource.SHARE,
+        )
+        assertTrue(linkOutcome is LinkSaveOutcome.Saved)
+        val itemId = (linkOutcome as LinkSaveOutcome.Saved).itemId
+
+        // Verify initial state: no media
+        val initialItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(initialItem)
+        assertFalse("Initial link item must not have media available", initialItem!!.mediaAvailable)
+        assertNull(initialItem.mediaFileName)
+
+        // Enable cloud in settings
+        container.settingsRepository.update {
+            it.copy(
+                cloudProcessingEnabled = true,
+                cloudDriveFolderId = "folder_root_123",
+            )
+        }
+        container.settingsRepository.setCloudDriveCredentials(accessToken = "token_abc")
+
+        // 2. Manifest returned by cloud processor where media was acquired by yt-dlp
+        val completedManifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = "https://www.instagram.com/reel/CloudAcquired123/",
+            caption = "Amazing cloud acquired reel caption",
+            status = "COMPLETED",
+            createdAt = container.clock.now() - 50_000L,
+            updatedAt = container.clock.now(),
+            media = CloudMediaInfo(
+                fileName = "cloud_acquired_123.mp4",
+                mimeType = "video/mp4",
+                driveFileId = "cloud_media_drive_id_999",
+                sizeBytes = 12_345_678L,
+                durationMs = 28_000L,
+            ),
+            stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "SUCCEEDED",
+            ),
+            results = CloudJobResults(
+                audioDriveFileId = "cloud_audio_drive_id_888",
+                audioSizeBytes = 1_000_000L,
+                transcript = "This speech was extracted from the cloud acquired Instagram reel video.",
+                transcriptModel = "base",
+                analysis = CloudAnalysisResult(
+                    summary = "Cloud acquired summary",
+                    detailedSummary = "Detailed insights from acquired media",
+                    mainTopic = "Cloud Media Ingestion",
+                    category = "Technology",
+                    keywords = listOf("cloud", "yt-dlp", "media"),
+                    tags = listOf("automation", "cloud"),
+                    keyTakeaways = listOf("Acquired without local device download"),
+                    importantConcepts = listOf("Headless Acquisition"),
+                    actionableSteps = listOf("Streamline sync"),
+                    modelName = "gemini-3.6-flash",
+                    generatedAt = container.clock.now(),
+                ),
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = completedManifest
+
+        // 3. Sync completed jobs
+        val syncedCount = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, syncedCount)
+
+        // 4. Verify item now reflects cloud-acquired media
+        val updatedItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(updatedItem)
+        assertEquals(ProcessingStatus.COMPLETED, updatedItem!!.processingStatus)
+        assertTrue("mediaAvailable must be true after cloud acquisition sync", updatedItem.mediaAvailable)
+        assertEquals("cloud_acquired_123.mp4", updatedItem.mediaFileName)
+        assertEquals(12_345_678L, updatedItem.mediaSizeBytes)
+        assertEquals(28_000L, updatedItem.mediaDurationMs)
+        assertEquals("video/mp4", updatedItem.mediaMimeType)
+
+        // Verify transcript and analysis stored
+        val results = container.savedItemRepository.latestResults(itemId)
+        val transcriptRes = results.firstOrNull { it.stage == ProcessingStage.TRANSCRIPTION }
+        assertNotNull(transcriptRes)
+        assertTrue(transcriptRes!!.transcript!!.contains("cloud acquired Instagram reel"))
+    }
+
+    @Test
+    fun repeatedSyncIsIdempotentAndDoesNotDuplicateResultsOrCorruptState() = runTest {
+        val linkOutcome = container.savedItemRepository.saveLink(
+            InstagramLink(
+                originalUrl = "https://www.instagram.com/reel/IdempotentSyncTest/",
+                normalizedUrl = "https://www.instagram.com/reel/IdempotentSyncTest/",
+                contentType = ContentType.REEL,
+                shortcode = "IdempotentSyncTest",
+            ),
+            source = SaveSource.SHARE,
+        )
+        val itemId = (linkOutcome as LinkSaveOutcome.Saved).itemId
+
+        container.settingsRepository.update {
+            it.copy(
+                cloudProcessingEnabled = true,
+                cloudDriveFolderId = "folder_root_123",
+            )
+        }
+        container.settingsRepository.setCloudDriveCredentials(accessToken = "token_abc")
+
+        val completedManifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = "https://www.instagram.com/reel/IdempotentSyncTest/",
+            status = "COMPLETED",
+            createdAt = container.clock.now() - 50_000L,
+            updatedAt = container.clock.now(),
+            media = CloudMediaInfo(
+                fileName = "idempotent.mp4",
+                mimeType = "video/mp4",
+                driveFileId = "cloud_id_idempotent",
+                sizeBytes = 3_000_000L,
+                durationMs = 15_000L,
+            ),
+            stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "SUCCEEDED",
+            ),
+            results = CloudJobResults(
+                transcript = "Idempotent transcript test text.",
+                analysis = CloudAnalysisResult(
+                    summary = "Idempotent summary",
+                    detailedSummary = "Detailed idempotency validation",
+                    mainTopic = "Idempotency",
+                    category = "Testing",
+                    keywords = listOf("idempotent"),
+                    tags = listOf("testing"),
+                    keyTakeaways = listOf("Must not duplicate results"),
+                    importantConcepts = listOf("Idempotent Operations"),
+                    actionableSteps = listOf("Verify counts"),
+                    modelName = "gemini-3.6-flash",
+                    generatedAt = container.clock.now(),
+                ),
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = completedManifest
+
+        // Sync 1: Processes the completed job
+        val sync1 = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, sync1)
+
+        val resultsAfterSync1 = container.savedItemRepository.latestResults(itemId)
+        val transcriptsCount1 = resultsAfterSync1.count { it.stage == ProcessingStage.TRANSCRIPTION }
+        val analysisCount1 = resultsAfterSync1.count { it.stage == ProcessingStage.ANALYSIS }
+        assertEquals(1, transcriptsCount1)
+        assertEquals(1, analysisCount1)
+
+        // Sync 2: Immediate re-sync
+        val sync2 = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals("Subsequent sync must not re-process already completed items", 0, sync2)
+
+        val resultsAfterSync2 = container.savedItemRepository.latestResults(itemId)
+        val transcriptsCount2 = resultsAfterSync2.count { it.stage == ProcessingStage.TRANSCRIPTION }
+        val analysisCount2 = resultsAfterSync2.count { it.stage == ProcessingStage.ANALYSIS }
+        assertEquals("Transcript rows must not be duplicated", 1, transcriptsCount2)
+        assertEquals("Analysis rows must not be duplicated", 1, analysisCount2)
+
+        // Status remains COMPLETED
+        val item = container.savedItemRepository.getItem(itemId)
+        assertEquals(ProcessingStatus.COMPLETED, item!!.processingStatus)
+    }
+
+    @Test
+    fun syncPreservesExistingDeviceUploadedMediaAndNeverOverwrites() = runTest {
+        // 1. Create item with actual device-uploaded media
+        val localFile = File(testMediaDir, "device_original.mp4").apply {
+            writeBytes("device original video payload".toByteArray())
+        }
+        val media = ImportedMedia(
+            file = localFile,
+            mimeType = "video/mp4",
+            sizeBytes = localFile.length(),
+            durationMs = 12_000L,
+            originalFileName = "device_original.mp4",
+        )
+        val outcome = container.savedItemRepository.saveMediaItem(
+            media = media,
+            associatedUrl = "https://www.instagram.com/reel/DeviceOriginalReel/",
+            source = SaveSource.MEDIA_SHARE,
+        )
+        val itemId = (outcome as MediaSaveOutcome.Saved).itemId
+
+        val initialItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(initialItem)
+        assertEquals("device_original.mp4", initialItem!!.mediaFileName)
+        assertEquals(localFile.absolutePath, initialItem.mediaPath)
+
+        container.settingsRepository.update {
+            it.copy(
+                cloudProcessingEnabled = true,
+                cloudDriveFolderId = "folder_root_123",
+            )
+        }
+        container.settingsRepository.setCloudDriveCredentials(accessToken = "token_abc")
+
+        // 2. Cloud manifest reports cloud file name
+        val completedManifest = CloudJobManifest(
+            itemId = itemId,
+            source = "MEDIA_SHARE",
+            originalUrl = "https://www.instagram.com/reel/DeviceOriginalReel/",
+            status = "COMPLETED",
+            createdAt = container.clock.now() - 50_000L,
+            updatedAt = container.clock.now(),
+            media = CloudMediaInfo(
+                fileName = "cloud_renamed_or_converted.mp4",
+                mimeType = "video/mp4",
+                driveFileId = "cloud_media_id_777",
+                sizeBytes = 999_999L,
+                durationMs = 12_000L,
+            ),
+            stages = CloudStageStates(
+                acquisition = "SKIPPED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "SUCCEEDED",
+            ),
+            results = CloudJobResults(
+                transcript = "Transcribed text for device uploaded media.",
+                analysis = CloudAnalysisResult(
+                    summary = "Summary for device media",
+                    detailedSummary = "Detailed device media analysis",
+                    mainTopic = "Device Media",
+                    category = "Media",
+                    keywords = listOf("device"),
+                    tags = listOf("device"),
+                    keyTakeaways = listOf("Preserve local files"),
+                    importantConcepts = listOf("Device Preservation"),
+                    actionableSteps = listOf("Do not overwrite"),
+                    modelName = "gemini-3.6-flash",
+                    generatedAt = container.clock.now(),
+                ),
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = completedManifest
+
+        // 3. Sync
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+
+        // 4. Verify local mediaPath and mediaFileName were PRESERVED and not overwritten
+        val updatedItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(updatedItem)
+        assertEquals(localFile.absolutePath, updatedItem!!.mediaPath)
+        assertEquals("device_original.mp4", updatedItem.mediaFileName)
+        assertEquals(localFile.length(), updatedItem.mediaSizeBytes)
+        assertEquals(ProcessingStatus.COMPLETED, updatedItem.processingStatus)
     }
 }

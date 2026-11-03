@@ -414,6 +414,44 @@ class GoogleDriveStorageClient(StorageClient):
         file_metadata = {
             "name": filename,
             "parents": [audio_folder],
+            "appProperties": {
+                "reelix_item_id": item_id,
+                "reelix_type": "audio",
+            },
+        }
+
+        created = service.files().create(
+            body=file_metadata,
+            media_body=media_body,
+            fields="id",
+        ).execute()
+
+        return created.get("id")
+
+    def upload_media(
+        self,
+        local_media_path: Path,
+        item_id: str,
+        mime_type: str = "video/mp4",
+        original_file_name: Optional[str] = None,
+    ) -> Optional[str]:
+        if not local_media_path.exists():
+            return None
+
+        service = self._get_service()
+        media_folder = self._ensure_subfolder("media")
+        filename = original_file_name or f"{item_id}.mp4"
+
+        from googleapiclient.http import MediaFileUpload
+
+        media_body = MediaFileUpload(str(local_media_path), mimetype=mime_type, resumable=True)
+        file_metadata = {
+            "name": filename,
+            "parents": [media_folder],
+            "appProperties": {
+                "reelix_item_id": item_id,
+                "reelix_type": "media",
+            },
         }
 
         created = service.files().create(

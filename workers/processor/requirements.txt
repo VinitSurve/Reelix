@@ -7,3 +7,11 @@ requests>=2.31.0
 openai-whisper>=20231117
 torch>=2.1.0
 numpy>=1.24.0
+# Media extraction: Pinned to verified stable release.
+# UPGRADE PROCEDURE:
+# 1. Test new release locally with test_downloader.py and test_pipeline.py:
+#    pip install --upgrade yt-dlp==YYYY.MM.DD
+#    python -m unittest discover -s workers/processor/tests -v
+# 2. Update the exact pinned version below.
+# 3. Verify GitHub Actions workflow executes without deprecation or breakage.
+yt-dlp==2026.10.26
