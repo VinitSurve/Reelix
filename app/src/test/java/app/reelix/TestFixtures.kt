@@ -2,6 +2,7 @@ package app.reelix
 
 import android.content.ContentResolver
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import app.reelix.core.Clock
 import app.reelix.data.db.ReelixDatabase
@@ -97,6 +98,25 @@ class FakeSettingsRepository(
             it.copy(
                 hasCloudDriveToken = secrets.get("cloud_drive_token") != null,
                 hasCloudDriveRefreshToken = secrets.get("cloud_drive_refresh_token") != null,
+            )
+        }
+    }
+
+    override suspend fun saveCloudDriveAccessToken(accessToken: String) {
+        secrets.put("cloud_drive_token", accessToken.trim())
+        state.update {
+            it.copy(hasCloudDriveToken = true)
+        }
+    }
+
+    override suspend fun clearCloudDriveCredentials() {
+        secrets.remove("cloud_drive_token")
+        secrets.remove("cloud_drive_refresh_token")
+        state.update {
+            it.copy(
+                hasCloudDriveToken = false,
+                hasCloudDriveRefreshToken = false,
+                cloudProcessingEnabled = false,
             )
         }
     }
@@ -307,7 +327,39 @@ class TestAppContainer(
         clock = clock,
     )
 
+    val fakeGoogleDriveAuthManager: FakeGoogleDriveAuthManager = FakeGoogleDriveAuthManager()
+    override val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager = fakeGoogleDriveAuthManager
+
     fun close() {
         database.close()
+    }
+}
+
+class FakeGoogleDriveAuthManager(
+    var initialOutcome: app.reelix.cloud.DriveAuthOutcome = app.reelix.cloud.DriveAuthOutcome.Success("fake_test_token_abc123"),
+    var initialTokenResult: app.reelix.cloud.DriveTokenResult = app.reelix.cloud.DriveTokenResult.Success("fake_test_token_abc123"),
+    var silentRefreshToken: String? = "fake_refreshed_token_xyz789",
+) : app.reelix.cloud.GoogleDriveAuthManager {
+    var startAuthorizationCalled = false
+    var extractTokenCalled = false
+    var silentRefreshCalled = false
+
+    override suspend fun startAuthorization(context: Context): app.reelix.cloud.DriveAuthOutcome {
+        startAuthorizationCalled = true
+        return initialOutcome
+    }
+
+    override fun extractTokenFromResult(
+        context: Context,
+        resultCode: Int,
+        data: Intent?,
+    ): app.reelix.cloud.DriveTokenResult {
+        extractTokenCalled = true
+        return initialTokenResult
+    }
+
+    override suspend fun silentRefresh(context: Context): String? {
+        silentRefreshCalled = true
+        return silentRefreshToken
     }
 }

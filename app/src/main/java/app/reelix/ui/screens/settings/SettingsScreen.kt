@@ -1,8 +1,11 @@
 package app.reelix.ui.screens.settings
 
 import android.content.ContentResolver
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
@@ -21,6 +24,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.FileDownload
@@ -97,6 +101,9 @@ class SettingsViewModel(
     private val storageInspector: StorageInspector,
     private val modelManager: TranscriptionModelManager,
     private val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository? = null,
+    private val cloudSyncClient: app.reelix.cloud.CloudSyncClient? = null,
+    private val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager? = null,
+    private val appContext: Context? = null,
 ) : ViewModel() {
 
     val settings: StateFlow<AppSettings> = settingsRepository.settings
@@ -125,6 +132,12 @@ class SettingsViewModel(
 
     private val _isSyncingCloud = MutableStateFlow(false)
     val isSyncingCloud: StateFlow<Boolean> = _isSyncingCloud.asStateFlow()
+
+    private val _isConnectingDrive = MutableStateFlow(false)
+    val isConnectingDrive: StateFlow<Boolean> = _isConnectingDrive.asStateFlow()
+
+    private val _isCreatingVault = MutableStateFlow(false)
+    val isCreatingVault: StateFlow<Boolean> = _isCreatingVault.asStateFlow()
 
     init {
         refreshStorage()
@@ -367,6 +380,108 @@ class SettingsViewModel(
         _feedback.value = null
     }
 
+    fun connectGoogleDrive(launchResolution: (IntentSenderRequest) -> Unit) {
+        viewModelScope.launch {
+            val manager = googleDriveAuthManager
+            val ctx = appContext
+            if (manager == null || ctx == null) {
+                _feedback.value = "Google Drive authorization is unavailable."
+                return@launch
+            }
+            _isConnectingDrive.value = true
+            try {
+                when (val outcome = manager.startAuthorization(ctx)) {
+                    is app.reelix.cloud.DriveAuthOutcome.Success -> {
+                        settingsRepository.saveCloudDriveAccessToken(outcome.accessToken)
+                        _feedback.value = "Connected to Google Drive successfully."
+                    }
+                    is app.reelix.cloud.DriveAuthOutcome.ResolutionRequired -> {
+                        launchResolution(outcome.intentSenderRequest)
+                    }
+                    is app.reelix.cloud.DriveAuthOutcome.Cancelled -> {
+                        _feedback.value = "Google Drive authorization was cancelled."
+                    }
+                    is app.reelix.cloud.DriveAuthOutcome.Error -> {
+                        _feedback.value = "Google Drive connection error: ${outcome.message}"
+                    }
+                }
+            } catch (e: Exception) {
+                _feedback.value = "Failed to connect Google Drive: ${e.message}"
+            } finally {
+                _isConnectingDrive.value = false
+            }
+        }
+    }
+
+    fun onAuthorizationResult(resultCode: Int, data: Intent?) {
+        viewModelScope.launch {
+            val manager = googleDriveAuthManager
+            val ctx = appContext
+            if (manager == null || ctx == null) return@launch
+            _isConnectingDrive.value = true
+            try {
+                when (val result = manager.extractTokenFromResult(ctx, resultCode, data)) {
+                    is app.reelix.cloud.DriveTokenResult.Success -> {
+                        settingsRepository.saveCloudDriveAccessToken(result.accessToken)
+                        _feedback.value = "Connected to Google Drive successfully."
+                    }
+                    is app.reelix.cloud.DriveTokenResult.Cancelled -> {
+                        _feedback.value = "Google Drive authorization was cancelled."
+                    }
+                    is app.reelix.cloud.DriveTokenResult.Error -> {
+                        _feedback.value = "Google Drive authorization failed: ${result.message}"
+                    }
+                }
+            } catch (e: Exception) {
+                _feedback.value = "Error handling authorization result: ${e.message}"
+            } finally {
+                _isConnectingDrive.value = false
+            }
+        }
+    }
+
+    fun disconnectGoogleDrive() {
+        viewModelScope.launch {
+            settingsRepository.clearCloudDriveCredentials()
+            _feedback.value = "Google Drive disconnected."
+        }
+    }
+
+    fun createReelixVault() {
+        viewModelScope.launch {
+            val client = cloudSyncClient
+            val repo = cloudSyncRepository
+            if (client == null && repo == null) {
+                _feedback.value = "Google Drive client is unavailable."
+                return@launch
+            }
+            _isCreatingVault.value = true
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    client?.createOrGetVaultFolder() ?: repo!!.createOrGetVaultFolder()
+                }
+                result.fold(
+                    onSuccess = { folderId ->
+                        settingsRepository.update { current ->
+                            current.copy(
+                                cloudDriveFolderId = folderId,
+                                cloudProcessingEnabled = true,
+                            )
+                        }
+                        _feedback.value = "Reelix Vault ready! Folder ID configured: $folderId"
+                    },
+                    onFailure = { error ->
+                        _feedback.value = "Failed to create Reelix Vault: ${error.message}"
+                    }
+                )
+            } catch (e: Exception) {
+                _feedback.value = "Failed to create Reelix Vault: ${e.message}"
+            } finally {
+                _isCreatingVault.value = false
+            }
+        }
+    }
+
     companion object {
         fun factory(
             settingsRepository: SettingsRepository,
@@ -375,6 +490,9 @@ class SettingsViewModel(
             storageInspector: StorageInspector,
             modelManager: TranscriptionModelManager,
             cloudSyncRepository: app.reelix.cloud.CloudSyncRepository? = null,
+            cloudSyncClient: app.reelix.cloud.CloudSyncClient? = null,
+            googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager? = null,
+            appContext: Context? = null,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
@@ -385,6 +503,9 @@ class SettingsViewModel(
                     storageInspector = storageInspector,
                     modelManager = modelManager,
                     cloudSyncRepository = cloudSyncRepository,
+                    cloudSyncClient = cloudSyncClient,
+                    googleDriveAuthManager = googleDriveAuthManager,
+                    appContext = appContext,
                 ) as T
         }
     }
@@ -418,6 +539,14 @@ fun SettingsScreen(
     var cloudToken by rememberSaveable { mutableStateOf("") }
     var cloudRefreshToken by rememberSaveable { mutableStateOf("") }
     val isSyncingCloud by viewModel.isSyncingCloud.collectAsStateWithLifecycle()
+    val isConnectingDrive by viewModel.isConnectingDrive.collectAsStateWithLifecycle()
+    val isCreatingVault by viewModel.isCreatingVault.collectAsStateWithLifecycle()
+
+    val authorizationLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult(),
+    ) { result ->
+        viewModel.onAuthorizationResult(result.resultCode, result.data)
+    }
 
     val modelPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -496,6 +625,103 @@ fun SettingsScreen(
                             onCheckedChange = { cloudEnabled = it },
                         )
                         Spacer(Modifier.height(10.dp))
+
+                        // Native Google Drive Connection
+                        if (settings.hasCloudDriveToken) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.CheckCircle,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                                Text(
+                                    text = "Google Drive connected",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                                Spacer(Modifier.weight(1f))
+                                TextButton(
+                                    onClick = viewModel::disconnectGoogleDrive,
+                                    modifier = Modifier.testTag("disconnect_google_drive_button"),
+                                ) {
+                                    Text("Disconnect")
+                                }
+                            }
+                            Spacer(Modifier.height(6.dp))
+
+                            // Create Reelix Vault button when connected but no folder ID configured
+                            if (cloudFolderId.isBlank()) {
+                                Button(
+                                    onClick = viewModel::createReelixVault,
+                                    enabled = !isCreatingVault,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("create_reelix_vault_button"),
+                                ) {
+                                    if (isCreatingVault) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                            color = MaterialTheme.colorScheme.onPrimary,
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("Creating Reelix Vault...")
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Outlined.CreateNewFolder,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("Create Reelix Vault")
+                                    }
+                                }
+                                Spacer(Modifier.height(6.dp))
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                viewModel.connectGoogleDrive { intentSenderRequest ->
+                                    authorizationLauncher.launch(intentSenderRequest)
+                                }
+                            },
+                            enabled = !isConnectingDrive,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("connect_google_drive_button"),
+                        ) {
+                            if (isConnectingDrive) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text("Connecting...")
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Outlined.Link,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    if (settings.hasCloudDriveToken) "Reconnect Google Drive"
+                                    else "Connect Google Drive"
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(10.dp))
+
                         OutlinedTextField(
                             value = cloudFolderId,
                             onValueChange = { cloudFolderId = it },

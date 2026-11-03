@@ -28,6 +28,8 @@ class CloudSyncRepository(
     private val itemDao = db.savedItemDao()
     private val processingDao = db.processingDao()
 
+    suspend fun createOrGetVaultFolder(): Result<String> = cloudClient.createOrGetVaultFolder()
+
     suspend fun uploadPendingItem(itemId: String): Boolean = withContext(Dispatchers.IO) {
         val item = itemDao.getById(itemId) ?: return@withContext false
         if (!cloudClient.isConfigured()) {

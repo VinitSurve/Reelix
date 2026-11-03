@@ -128,6 +128,7 @@ interface CloudSyncClient {
     suspend fun submitJobManifest(manifest: CloudJobManifest): Boolean
     suspend fun fetchJobManifest(itemId: String): CloudJobManifest?
     suspend fun listCompletedJobs(): List<CloudJobManifest>
+    suspend fun createOrGetVaultFolder(): Result<String>
 }
 
 data class MockUploadedFile(
@@ -472,34 +473,140 @@ class GoogleDriveCloudClient(
         }
     }
 
-    private fun ensureVaultFolder(token: String): String {
-        val q = "name = 'Reelix_Vault' and mimeType = 'application/vnd.google-apps.folder' and 'root' in parents and trashed = false"
-        val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
-        val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $token").get().build()
-        client.newCall(req).execute().use { resp ->
-            if (resp.isSuccessful) {
-                val json = JSONObject(resp.body?.string().orEmpty())
-                val arr = json.optJSONArray("files")
-                if (arr != null && arr.length() > 0) {
-                    return arr.getJSONObject(0).getString("id")
-                }
+    override suspend fun createOrGetVaultFolder(): Result<String> = withContext(Dispatchers.IO) {
+        var token = tokenProvider()
+        if (token.isNullOrBlank()) {
+            val refreshed = tokenRefresher?.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+            } else {
+                return@withContext Result.failure(
+                    IllegalStateException("Google Drive authentication token missing. Please connect Google Drive in Settings.")
+                )
             }
         }
 
+        try {
+            // 1. Search for existing Reelix_Vault folder to avoid duplicate creation
+            val existingFolderId = findExistingVaultFolder(token) { refreshedToken ->
+                token = refreshedToken
+            }
+            if (existingFolderId != null) {
+                ReelixLog.d("Found existing Reelix_Vault folder (id=$existingFolderId); reusing")
+                return@withContext Result.success(existingFolderId)
+            }
+
+            // 2. Create the Reelix_Vault folder
+            val createdFolderId = executeCreateVaultFolder(token) { refreshedToken ->
+                token = refreshedToken
+            }
+            ReelixLog.d("Successfully created Reelix_Vault folder (id=$createdFolderId)")
+            Result.success(createdFolderId)
+        } catch (e: java.io.IOException) {
+            ReelixLog.w("Network failure while creating Reelix_Vault folder: ${e.message}")
+            Result.failure(java.io.IOException("Network error while connecting to Google Drive: ${e.message}", e))
+        } catch (e: Exception) {
+            ReelixLog.w("Unexpected error while creating Reelix_Vault folder: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun findExistingVaultFolder(
+        initialToken: String,
+        onTokenRefreshed: (String) -> Unit,
+    ): String? {
+        var token = initialToken
+        val q = "name = 'Reelix_Vault' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id,name)&spaces=drive"
+
+        fun buildRequest(tok: String) = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $tok")
+            .get()
+            .build()
+
+        var resp = client.newCall(buildRequest(token)).execute()
+        if (resp.code == 401 && tokenRefresher != null) {
+            resp.close()
+            val refreshed = tokenRefresher.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+                onTokenRefreshed(refreshed)
+                resp = client.newCall(buildRequest(token)).execute()
+            }
+        }
+
+        resp.use { response ->
+            if (!response.isSuccessful) {
+                val errorBody = response.body?.string().orEmpty()
+                val errorMsg = parseDriveErrorMessage(response.code, errorBody)
+                throw java.io.IOException("Google Drive query failed ($errorMsg)")
+            }
+            val json = JSONObject(response.body?.string().orEmpty())
+            val arr = json.optJSONArray("files")
+            if (arr != null && arr.length() > 0) {
+                return arr.getJSONObject(0).getString("id")
+            }
+            return null
+        }
+    }
+
+    private suspend fun executeCreateVaultFolder(
+        initialToken: String,
+        onTokenRefreshed: (String) -> Unit,
+    ): String {
+        var token = initialToken
         val meta = JSONObject().apply {
             put("name", "Reelix_Vault")
             put("mimeType", "application/vnd.google-apps.folder")
             put("parents", org.json.JSONArray().put("root"))
         }
-        val createReq = Request.Builder()
+
+        fun buildRequest(tok: String) = Request.Builder()
             .url("https://www.googleapis.com/drive/v3/files")
-            .addHeader("Authorization", "Bearer $token")
-            .post(meta.toString().toByteArray().toRequestBody("application/json".toMediaType()))
+            .addHeader("Authorization", "Bearer $tok")
+            .post(meta.toString().toByteArray().toRequestBody("application/json; charset=UTF-8".toMediaType()))
             .build()
-        client.newCall(createReq).execute().use { resp ->
-            val json = JSONObject(resp.body?.string().orEmpty())
+
+        var resp = client.newCall(buildRequest(token)).execute()
+        if (resp.code == 401 && tokenRefresher != null) {
+            resp.close()
+            val refreshed = tokenRefresher.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+                onTokenRefreshed(refreshed)
+                resp = client.newCall(buildRequest(token)).execute()
+            }
+        }
+
+        resp.use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val errorMsg = parseDriveErrorMessage(response.code, body)
+                throw java.io.IOException("Google Drive folder creation failed ($errorMsg)")
+            }
+            val json = JSONObject(body)
             return json.getString("id")
         }
+    }
+
+    private fun parseDriveErrorMessage(statusCode: Int, responseBody: String): String {
+        return try {
+            val json = JSONObject(responseBody)
+            val err = json.optJSONObject("error")
+            val message = err?.optString("message")
+            if (!message.isNullOrBlank()) {
+                "HTTP $statusCode: $message"
+            } else {
+                "HTTP $statusCode"
+            }
+        } catch (_: Exception) {
+            "HTTP $statusCode"
+        }
+    }
+
+    private suspend fun ensureVaultFolder(token: String): String {
+        return createOrGetVaultFolder().getOrThrow()
     }
 
     private fun ensureSubfolder(name: String, parentId: String, token: String): String {
@@ -618,6 +725,15 @@ class MockCloudSyncClient(
             ),
         )
         return CloudUploadResult.Success(driveFileId = fileId, sizeBytes = file.length())
+    }
+
+    var nextVaultFolderId: String = "mock_reelix_vault_folder_id_123"
+    var createVaultResult: Result<String>? = null
+    var createVaultCallCount = 0
+
+    override suspend fun createOrGetVaultFolder(): Result<String> {
+        createVaultCallCount++
+        return createVaultResult ?: Result.success(nextVaultFolderId)
     }
 
     override suspend fun submitJobManifest(manifest: CloudJobManifest): Boolean {

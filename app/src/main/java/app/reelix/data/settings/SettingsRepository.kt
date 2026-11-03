@@ -41,6 +41,12 @@ interface SettingsRepository {
         clientId: String? = null,
         clientSecret: String? = null,
     )
+    suspend fun saveCloudDriveAccessToken(accessToken: String) {
+        setCloudDriveCredentials(accessToken = accessToken)
+    }
+    suspend fun clearCloudDriveCredentials() {
+        setCloudDriveCredentials(accessToken = null, refreshToken = null, clientId = null, clientSecret = null)
+    }
     suspend fun refreshCloudDriveAccessToken(): String?
     suspend fun getValidDriveAccessToken(): String?
     suspend fun clear()
@@ -55,6 +61,8 @@ class DataStoreSettingsRepository(
     private val dataStore: DataStore<Preferences>,
     private val secretStore: SecretStore,
     private val httpClient: OkHttpClient = OkHttpClient(),
+    private val context: Context? = null,
+    private val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager? = null,
 ) : SettingsRepository {
 
     private object Keys {
@@ -170,7 +178,37 @@ class DataStoreSettingsRepository(
         }
     }
 
+    override suspend fun saveCloudDriveAccessToken(accessToken: String) {
+        if (accessToken.isNotBlank()) {
+            secretStore.put(CLOUD_DRIVE_TOKEN_ALIAS, accessToken.trim())
+            dataStore.edit { p ->
+                p[Keys.cloudProcessingEnabled] = p[Keys.cloudProcessingEnabled] ?: false
+            }
+        }
+    }
+
+    override suspend fun clearCloudDriveCredentials() {
+        secretStore.remove(CLOUD_DRIVE_TOKEN_ALIAS)
+        secretStore.remove(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS)
+        secretStore.remove(CLOUD_DRIVE_CLIENT_ID_ALIAS)
+        secretStore.remove(CLOUD_DRIVE_CLIENT_SECRET_ALIAS)
+        dataStore.edit { p ->
+            p[Keys.cloudProcessingEnabled] = false
+        }
+    }
+
     override suspend fun refreshCloudDriveAccessToken(): String? = withContext(Dispatchers.IO) {
+        // 1. Attempt silent refresh via native Google Identity AuthorizationClient if available
+        if (context != null && googleDriveAuthManager != null) {
+            val nativeToken = googleDriveAuthManager.silentRefresh(context)
+            if (!nativeToken.isNullOrBlank()) {
+                secretStore.put(CLOUD_DRIVE_TOKEN_ALIAS, nativeToken)
+                ReelixLog.d("Successfully refreshed Google Drive token via native AuthorizationClient")
+                return@withContext nativeToken
+            }
+        }
+
+        // 2. Fall back to OAuth refresh token flow if configured
         val refreshToken = secretStore.get(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS) ?: return@withContext null
         val clientId = secretStore.get(CLOUD_DRIVE_CLIENT_ID_ALIAS)
         val clientSecret = secretStore.get(CLOUD_DRIVE_CLIENT_SECRET_ALIAS)

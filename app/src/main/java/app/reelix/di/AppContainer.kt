@@ -54,6 +54,7 @@ interface AppContainer {
     val pipeline: ProcessingPipeline
     val processingScheduler: ProcessingScheduler
     val shareIntakeUseCase: ShareIntakeUseCase
+    val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager
     val cloudSyncClient: app.reelix.cloud.CloudSyncClient
     val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository
 }
@@ -114,10 +115,17 @@ class DefaultAppContainer(
         )
     }
 
+    override val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager by lazy {
+        app.reelix.cloud.DefaultGoogleDriveAuthManager(appContext)
+    }
+
     override val settingsRepository: SettingsRepository by lazy {
         DataStoreSettingsRepository(
             dataStore = appContext.settingsDataStore(),
             secretStore = secretStore,
+            httpClient = httpClient,
+            context = appContext,
+            googleDriveAuthManager = googleDriveAuthManager,
         )
     }
 

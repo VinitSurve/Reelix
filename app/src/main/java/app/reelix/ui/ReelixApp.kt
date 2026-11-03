@@ -248,6 +248,7 @@ private fun ReelixNavHost(
         }
 
         composable(TopDestination.SETTINGS.route) {
+            val context = androidx.compose.ui.platform.LocalContext.current
             val vm: SettingsViewModel = viewModel(
                 factory = SettingsViewModel.factory(
                     settingsRepository = container.settingsRepository,
@@ -256,6 +257,9 @@ private fun ReelixNavHost(
                     storageInspector = container.storageInspector,
                     modelManager = container.transcriptionModelManager,
                     cloudSyncRepository = container.cloudSyncRepository,
+                    cloudSyncClient = container.cloudSyncClient,
+                    googleDriveAuthManager = container.googleDriveAuthManager,
+                    appContext = context.applicationContext,
                 ),
             )
             SettingsScreen(viewModel = vm)
