@@ -62,29 +62,109 @@ def get_authorized_service(client_id: str, client_secret: str, refresh_token: st
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def resolve_root_folder_id(service) -> str:
-    """Resolves the user's actual Google Drive root folder ID using the Drive API.
+def verify_folder_is_in_root(
+    service,
+    folder_id: str,
+    folder_name: str,
+) -> List[str]:
+    """Verifies that folder_id is located directly under Google Drive 'root' using Drive query semantics.
 
-    In Google Drive API v3, querying files().get(fileId="root") returns the real alphanumeric ID
-    of the user's My Drive root folder, which matches the 'parents' array of top-level items.
-    If the actual root folder ID cannot be resolved, an exception is raised to abort verification.
+    Under the least-privilege 'drive.file' scope, an application cannot call files().get(fileId='root')
+    because the root directory itself was created by Google/user, not by the application.
+    However, Google Drive search supports the query condition "'root' in parents" to discover
+    app-accessible items placed directly in the user's root folder.
+
+    This function:
+    1. Exhaustively paginates files().list(q="'root' in parents and name = ... and trashed = false").
+    2. Confirms that folder_id is returned by Drive as a direct child of 'root'.
+    3. Returns the parents list (actual root folder ID) associated with the folder.
     """
-    from googleapiclient.errors import HttpError
+    clean_folder = folder_id.strip()
+    safe_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"'root' in parents and name = '{safe_name}' and trashed = false"
 
-    try:
-        root_file = service.files().get(fileId="root", fields="id").execute()
-        root_id = (root_file.get("id") or "").strip()
-        if root_id:
-            logger.info("  ✓ Resolved Drive actual root folder ID: %s", root_id)
-            return root_id
-    except HttpError as e:
-        logger.error("Could not resolve 'root' folder ID directly (HTTP %d: %s). Aborting verification.", e.resp.status, e.reason)
-        raise RuntimeError(f"Failed to resolve Drive actual root folder ID: HTTP {e.resp.status} - {e.reason}") from e
-    except Exception as e:
-        logger.error("Unexpected error resolving 'root' ID: %s. Aborting verification.", e)
-        raise RuntimeError(f"Unexpected error resolving Drive actual root folder ID: {e}") from e
+    page_token: Optional[str] = None
+    matching_item: Optional[Dict[str, Any]] = None
+    page_count = 0
+    seen_tokens: set[str] = set()
 
-    raise RuntimeError("Drive API returned an empty or invalid root folder ID. Aborting verification.")
+    while True:
+        page_count += 1
+        res = service.files().list(
+            q=q,
+            fields="nextPageToken, files(id, name, mimeType, parents)",
+            pageToken=page_token,
+            pageSize=100,
+        ).execute()
+
+        if not isinstance(res, dict):
+            raise ValueError(
+                f"SAFETY VIOLATION: Drive files().list() returned unexpected type {type(res).__name__} (expected dict)."
+            )
+
+        files_on_page = res.get("files", [])
+        if not isinstance(files_on_page, list):
+            raise ValueError(
+                f"SAFETY VIOLATION: Drive files().list() 'files' field is {type(files_on_page).__name__} (expected list)."
+            )
+
+        for f in files_on_page:
+            if isinstance(f, dict) and f.get("id") == clean_folder:
+                matching_item = f
+                break
+
+        if matching_item is not None:
+            break
+
+        raw_token = res.get("nextPageToken")
+        if not raw_token or not isinstance(raw_token, str):
+            break
+        page_token = raw_token.strip()
+        if not page_token:
+            break
+        if page_token in seen_tokens:
+            raise RuntimeError(
+                f"Drive API pagination loop detected: repeated nextPageToken '{page_token}' received from files().list()."
+            )
+        seen_tokens.add(page_token)
+
+    if matching_item is None:
+        raise ValueError(
+            f"SAFETY VIOLATION: Test folder '{folder_name}' ({clean_folder}) is not located directly in Drive root. "
+            "Drive query \"'root' in parents\" returned no matching item."
+        )
+
+    if matching_item.get("id") != clean_folder:
+        raise ValueError(
+            f"SAFETY VIOLATION: Matching item ID '{matching_item.get('id')}' does not match requested folder ID '{clean_folder}'."
+        )
+
+    if matching_item.get("mimeType") != "application/vnd.google-apps.folder":
+        raise ValueError(
+            f"SAFETY VIOLATION: Item '{folder_name}' ({clean_folder}) returned by root query is not a folder "
+            f"(mimeType={matching_item.get('mimeType')})."
+        )
+
+    parents = matching_item.get("parents")
+    if not isinstance(parents, list) or not parents:
+        raise ValueError(
+            f"SAFETY VIOLATION: Drive query confirmed folder is in root, but returned empty parents list for {clean_folder}."
+        )
+
+    if not all(isinstance(p, str) and p.strip() for p in parents):
+        raise ValueError(
+            f"SAFETY VIOLATION: Drive query returned invalid or non-string parents for {clean_folder}: {parents!r}."
+        )
+
+    clean_parents = [p.strip() for p in parents]
+    actual_root = clean_parents[0]
+    if not actual_root or actual_root == "root":
+        raise ValueError(
+            f"SAFETY VIOLATION: Drive returned invalid root parent ID '{actual_root}' for {clean_folder}."
+        )
+
+    logger.info("  ✓ Confirmed test folder is directly under Drive 'root' via Drive query API: parents=%s", clean_parents)
+    return clean_parents
 
 
 def list_all_children(
@@ -98,6 +178,7 @@ def list_all_children(
     children: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
     page_count = 0
+    seen_tokens: set[str] = set()
 
     while True:
         page_count += 1
@@ -108,12 +189,29 @@ def list_all_children(
             pageSize=100,
         ).execute()
 
-        files_on_page = res.get("files", [])
-        children.extend(files_on_page)
-        page_token = res.get("nextPageToken")
+        if not isinstance(res, dict):
+            raise ValueError(
+                f"SAFETY VIOLATION: Drive files().list() returned unexpected type {type(res).__name__} (expected dict)."
+            )
 
+        files_on_page = res.get("files", [])
+        if not isinstance(files_on_page, list):
+            raise ValueError(
+                f"SAFETY VIOLATION: Drive files().list() 'files' field is {type(files_on_page).__name__} (expected list)."
+            )
+
+        children.extend(files_on_page)
+        raw_token = res.get("nextPageToken")
+        if not raw_token or not isinstance(raw_token, str):
+            break
+        page_token = raw_token.strip()
         if not page_token:
             break
+        if page_token in seen_tokens:
+            raise RuntimeError(
+                f"Drive API pagination loop detected: repeated nextPageToken '{page_token}' received from files().list()."
+            )
+        seen_tokens.add(page_token)
 
     if page_count > 1:
         logger.info("  (Paginated list: traversed %d pages, retrieved %d total items)", page_count, len(children))
@@ -198,19 +296,35 @@ def validate_test_targets(
             "Refusing to operate on unverified resources."
         )
 
-    # Resolve real root folder ID and validate parentage exclusively against resolved actual root ID
-    actual_root_id = resolve_root_folder_id(service)
     folder_parents = folder.get("parents", [])
-    if actual_root_id not in folder_parents:
-        raise ValueError(
-            f"SAFETY VIOLATION: Test folder '{folder_name}' is not located directly in Drive root "
-            f"(resolved actual root ID: '{actual_root_id}'). Observed parents: {folder_parents}."
-        )
+    if not folder_parents:
+        raise ValueError(f"SAFETY VIOLATION: Test folder '{folder_name}' has no parents listed in Drive.")
 
     # Reject if nested inside the production vault
     if clean_vault in folder_parents:
         raise ValueError(
             f"SAFETY VIOLATION: Test folder '{folder_name}' is nested inside production vault {clean_vault}."
+        )
+
+    # Verify folder is directly in root via Drive search query ('root' in parents)
+    root_query_parents = verify_folder_is_in_root(service, clean_folder, folder_name)
+    actual_root_id = root_query_parents[0]
+
+    # Validate that the actual root ID returned by Drive search query matches the folder's parent metadata
+    if actual_root_id not in folder_parents:
+        raise ValueError(
+            f"SAFETY VIOLATION: Test folder '{folder_name}' is not located directly in Drive root "
+            f"(resolved actual root ID from query: '{actual_root_id}'). Observed parents: {folder_parents}."
+        )
+
+    if actual_root_id == clean_vault:
+        raise ValueError(
+            f"SAFETY VIOLATION: Root folder ID matches production vault ID ({clean_vault})."
+        )
+
+    if actual_root_id == "root":
+        raise ValueError(
+            "SAFETY VIOLATION: Root folder ID resolved to literal string 'root' instead of actual alphanumeric ID."
         )
 
     logger.info("  ✓ Folder validated: '%s' (%s) directly under Drive root '%s' [test_id=%s]", folder_name, clean_folder, actual_root_id, folder_test_id)

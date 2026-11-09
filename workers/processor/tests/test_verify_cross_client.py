@@ -16,9 +16,9 @@ from workers.processor.scripts.verify_cross_client import (
     SAFE_FOLDER_PREFIX,
     cleanup_validated_test_targets,
     list_all_children,
-    resolve_root_folder_id,
     run_cross_client_verification,
     validate_test_targets,
+    verify_folder_is_in_root,
 )
 
 
@@ -33,6 +33,7 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
         self.production_vault_id = "production_vault_99999"
         self.real_root_id = "0Areal_drive_root_id_98765"
         self.valid_test_id = "20261102_abcd"
+        self._setup_valid_mocks()
 
     def _setup_valid_mocks(self):
         """Configures mock_service to return valid folder, file, root ID, and children."""
@@ -69,29 +70,212 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
 
         def files_list(q=None, fields=None, pageToken=None, pageSize=None):
             req = MagicMock()
-            req.execute.return_value = {
-                "files": [
-                    {
-                        "id": self.valid_file_id,
-                        "name": "manifest_probe.json",
-                        "mimeType": "application/json",
-                        "parents": [self.valid_folder_id],
-                    }
-                ],
-                "nextPageToken": None,
-            }
+            if q and "'root' in parents" in q:
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_folder_id,
+                            "name": self.valid_folder_name,
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [self.real_root_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
+            else:
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_file_id,
+                            "name": "manifest_probe.json",
+                            "mimeType": "application/json",
+                            "parents": [self.valid_folder_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
             return req
 
         self.mock_service.files().get.side_effect = files_get
         self.mock_service.files().list.side_effect = files_list
 
-    def test_resolve_root_folder_id_returns_real_id(self):
-        root_req = MagicMock()
-        root_req.execute.return_value = {"id": "0AJreal_root_id_abc"}
-        self.mock_service.files().get.return_value = root_req
+    def test_validation_never_calls_files_get_on_root_and_uses_no_404_parsing(self):
+        """validate_test_targets must NEVER call files().get(fileId='root') and must not parse 404 errors."""
+        self._setup_valid_mocks()
+        orig_get = self.mock_service.files().get.side_effect
 
-        resolved = resolve_root_folder_id(self.mock_service)
-        self.assertEqual("0AJreal_root_id_abc", resolved)
+        def guarded_files_get(fileId, fields=None):
+            if fileId == "root":
+                self.fail("SECURITY VIOLATION: files().get(fileId='root') must NEVER be called!")
+            return orig_get(fileId, fields=fields)
+
+        self.mock_service.files().get.side_effect = guarded_files_get
+
+        folder, file_obj = validate_test_targets(
+            self.mock_service,
+            self.valid_folder_id,
+            self.valid_file_id,
+            self.production_vault_id,
+        )
+        self.assertEqual(self.valid_folder_id, folder["id"])
+        self.assertEqual(self.valid_file_id, file_obj["id"])
+
+    def test_folder_with_missing_parents_metadata_rejected(self):
+        """Folder with missing or empty 'parents' list must be rejected."""
+        self._setup_valid_mocks()
+
+        def files_get_no_parents(fileId, fields=None):
+            req = MagicMock()
+            if fileId == self.valid_folder_id:
+                req.execute.return_value = {
+                    "id": self.valid_folder_id,
+                    "name": self.valid_folder_name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                    "trashed": False,
+                    "properties": {
+                        "reelix_type": "cross_client_test",
+                        "reelix_test_id": self.valid_test_id,
+                    },
+                }
+            return req
+
+        self.mock_service.files().get.side_effect = files_get_no_parents
+
+        with self.assertRaises(ValueError) as ctx:
+            validate_test_targets(
+                self.mock_service,
+                self.valid_folder_id,
+                self.valid_file_id,
+                self.production_vault_id,
+            )
+        self.assertIn("has no parents listed in Drive", str(ctx.exception))
+
+    def test_folder_with_empty_parent_string_rejected(self):
+        """Folder with malformed parent string ('') must be rejected."""
+        self._setup_valid_mocks()
+
+        def files_get_empty_parent(fileId, fields=None):
+            req = MagicMock()
+            if fileId == self.valid_folder_id:
+                req.execute.return_value = {
+                    "id": self.valid_folder_id,
+                    "name": self.valid_folder_name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [""],
+                    "trashed": False,
+                    "properties": {
+                        "reelix_type": "cross_client_test",
+                        "reelix_test_id": self.valid_test_id,
+                    },
+                }
+            return req
+
+        self.mock_service.files().get.side_effect = files_get_empty_parent
+
+        with self.assertRaises(ValueError) as ctx:
+            validate_test_targets(
+                self.mock_service,
+                self.valid_folder_id,
+                self.valid_file_id,
+                self.production_vault_id,
+            )
+        self.assertIn("not located directly in Drive root", str(ctx.exception))
+
+    def test_verify_folder_is_in_root_paginates_and_finds_folder(self):
+        """verify_folder_is_in_root traverses pages of root query and identifies test folder."""
+        call_count = [0]
+
+        def files_list(q=None, fields=None, pageToken=None, pageSize=None):
+            req = MagicMock()
+            call_count[0] += 1
+            if pageToken is None:
+                # Page 1: contains other folder in root
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": "other_folder_id_777",
+                            "name": "Other_Folder",
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [self.real_root_id],
+                        }
+                    ],
+                    "nextPageToken": "token_page_2",
+                }
+            else:
+                # Page 2: contains valid_folder_id
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_folder_id,
+                            "name": self.valid_folder_name,
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [self.real_root_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
+            return req
+
+        self.mock_service.files().list.side_effect = files_list
+        parents = verify_folder_is_in_root(self.mock_service, self.valid_folder_id, self.valid_folder_name)
+        self.assertEqual([self.real_root_id], parents)
+        self.assertEqual(2, call_count[0])
+
+    def test_verify_folder_is_in_root_aborts_when_not_returned_by_root_in_parents(self):
+        """When Drive 'root' in parents query does not return folder, raises ValueError."""
+        self.mock_service.files().list.side_effect = None
+        req = MagicMock()
+        req.execute.return_value = {"files": [], "nextPageToken": None}
+        self.mock_service.files().list.return_value = req
+
+        with self.assertRaises(ValueError) as ctx:
+            verify_folder_is_in_root(self.mock_service, self.valid_folder_id, self.valid_folder_name)
+        self.assertIn("not located directly in Drive root", str(ctx.exception))
+
+    def test_verify_folder_is_in_root_empty_parents_rejected(self):
+        """When Drive query returns folder with empty parents list, raises ValueError."""
+        self._setup_valid_mocks()
+        req = MagicMock()
+        req.execute.return_value = {
+            "files": [
+                {
+                    "id": self.valid_folder_id,
+                    "name": self.valid_folder_name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [],
+                }
+            ],
+            "nextPageToken": None,
+        }
+        self.mock_service.files().list.side_effect = None
+        self.mock_service.files().list.return_value = req
+
+        with self.assertRaises(ValueError) as ctx:
+            verify_folder_is_in_root(self.mock_service, self.valid_folder_id, self.valid_folder_name)
+        self.assertIn("returned empty parents list", str(ctx.exception))
+
+    def test_verify_folder_is_in_root_literal_root_rejected(self):
+        """When Drive query returns folder with literal 'root' parent ID, raises ValueError."""
+        self._setup_valid_mocks()
+        req = MagicMock()
+        req.execute.return_value = {
+            "files": [
+                {
+                    "id": self.valid_folder_id,
+                    "name": self.valid_folder_name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": ["root"],
+                }
+            ],
+            "nextPageToken": None,
+        }
+        self.mock_service.files().list.side_effect = None
+        self.mock_service.files().list.return_value = req
+
+        with self.assertRaises(ValueError) as ctx:
+            verify_folder_is_in_root(self.mock_service, self.valid_folder_id, self.valid_folder_name)
+        self.assertIn("invalid root parent ID 'root'", str(ctx.exception))
 
     def test_root_folder_validation_succeeds_with_resolved_real_root_id(self):
         """Verifies that folder parentage is compared against the resolved real root ID and accepted."""
@@ -105,43 +289,107 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
         self.assertEqual(self.valid_folder_id, folder["id"])
         self.assertEqual(self.valid_file_id, file_obj["id"])
 
-    def test_root_resolution_failure_aborts_validation(self):
-        """When Drive API fails to resolve the actual root folder ID, validation must raise RuntimeError and abort."""
+    def test_root_query_failure_aborts_validation(self):
+        """When Drive query API fails with HTTP 500, validate_test_targets raises HttpError and aborts."""
         from googleapiclient.errors import HttpError
 
         self._setup_valid_mocks()
         resp = MagicMock()
         resp.status = 500
-        http_err = HttpError(resp, b"Root resolution failed")
+        http_err = HttpError(resp, b"Root query failed")
 
-        def files_get_with_root_failure(fileId, fields=None):
+        def files_list_error(q=None, fields=None, pageToken=None, pageSize=None):
             req = MagicMock()
-            if fileId == "root":
-                req.execute.side_effect = http_err
-            elif fileId == self.valid_folder_id:
-                req.execute.return_value = {
-                    "id": self.valid_folder_id,
-                    "name": self.valid_folder_name,
-                    "mimeType": "application/vnd.google-apps.folder",
-                    "parents": [self.real_root_id],
-                    "trashed": False,
-                    "properties": {
-                        "reelix_type": "cross_client_test",
-                        "reelix_test_id": self.valid_test_id,
-                    },
-                }
+            req.execute.side_effect = http_err
             return req
 
-        self.mock_service.files().get.side_effect = files_get_with_root_failure
+        self.mock_service.files().list.side_effect = files_list_error
 
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(HttpError):
             validate_test_targets(
                 self.mock_service,
                 self.valid_folder_id,
                 self.valid_file_id,
                 self.production_vault_id,
             )
-        self.assertIn("Failed to resolve Drive actual root folder ID", str(ctx.exception))
+
+    def test_root_matching_production_vault_rejected(self):
+        """If resolved actual root ID matches production vault ID, validation must reject."""
+        self._setup_valid_mocks()
+
+        def files_list_vault_root(q=None, fields=None, pageToken=None, pageSize=None):
+            req = MagicMock()
+            if q and "'root' in parents" in q:
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_folder_id,
+                            "name": self.valid_folder_name,
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [self.production_vault_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
+            else:
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_file_id,
+                            "name": "manifest_probe.json",
+                            "mimeType": "application/json",
+                            "parents": [self.valid_folder_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
+            return req
+
+        self.mock_service.files().list.side_effect = files_list_vault_root
+
+        with self.assertRaises(ValueError) as ctx:
+            validate_test_targets(
+                self.mock_service,
+                self.valid_folder_id,
+                self.valid_file_id,
+                self.production_vault_id,
+            )
+        self.assertTrue(
+            "nested inside production vault" in str(ctx.exception)
+            or "matches production vault ID" in str(ctx.exception)
+            or "not located directly in Drive root" in str(ctx.exception)
+        )
+
+    def test_root_query_item_not_folder_rejected(self):
+        """If the item returned by root query is not a folder, validation must reject."""
+        self._setup_valid_mocks()
+
+        def files_list_not_folder(q=None, fields=None, pageToken=None, pageSize=None):
+            req = MagicMock()
+            if q and "'root' in parents" in q:
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_folder_id,
+                            "name": self.valid_folder_name,
+                            "mimeType": "application/json",
+                            "parents": [self.real_root_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
+            return req
+
+        self.mock_service.files().list.side_effect = files_list_not_folder
+
+        with self.assertRaises(ValueError) as ctx:
+            validate_test_targets(
+                self.mock_service,
+                self.valid_folder_id,
+                self.valid_file_id,
+                self.production_vault_id,
+            )
+        self.assertIn("returned by root query is not a folder", str(ctx.exception))
 
     def test_folder_with_literal_root_parent_but_unmatched_actual_root_id_rejected(self):
         """A folder with literal 'root' parent string must be REJECTED when actual root ID is a real alphanumeric ID."""
@@ -207,6 +455,8 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
         self.assertIn("matches production GDRIVE_FOLDER_ID", str(ctx.exception))
 
     def test_wrong_folder_name_rejected(self):
+        self._setup_valid_mocks()
+        self.mock_service.files().get.side_effect = None
         req = MagicMock()
         req.execute.return_value = {
             "id": self.valid_folder_id,
@@ -227,6 +477,8 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
         self.assertIn("does not start with required prefix", str(ctx.exception))
 
     def test_nested_folder_rejected_when_not_under_root(self):
+        self._setup_valid_mocks()
+
         def files_get(fileId, fields=None):
             req = MagicMock()
             if fileId == "root":
@@ -245,7 +497,16 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
                 }
             return req
 
+        def files_list(q=None, fields=None, pageToken=None, pageSize=None):
+            req = MagicMock()
+            if q and "'root' in parents" in q:
+                req.execute.return_value = {"files": [], "nextPageToken": None}
+            else:
+                req.execute.return_value = {"files": [], "nextPageToken": None}
+            return req
+
         self.mock_service.files().get.side_effect = files_get
+        self.mock_service.files().list.side_effect = files_list
 
         with self.assertRaises(ValueError) as ctx:
             validate_test_targets(
@@ -342,6 +603,19 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
 
         def paginated_list(q=None, fields=None, pageToken=None, pageSize=None):
             req = MagicMock()
+            if q and "'root' in parents" in q:
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_folder_id,
+                            "name": self.valid_folder_name,
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [self.real_root_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
+                return req
             if pageToken == "page_2_token":
                 req.execute.return_value = page2
             else:
@@ -373,6 +647,19 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
 
         def paginated_list(q=None, fields=None, pageToken=None, pageSize=None):
             req = MagicMock()
+            if q and "'root' in parents" in q:
+                req.execute.return_value = {
+                    "files": [
+                        {
+                            "id": self.valid_folder_id,
+                            "name": self.valid_folder_name,
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [self.real_root_id],
+                        }
+                    ],
+                    "nextPageToken": None,
+                }
+                return req
             if pageToken == "page_2_token":
                 req.execute.return_value = page2
             else:
@@ -389,6 +676,8 @@ class TestVerifyCrossClientSafeguards(unittest.TestCase):
 
     def test_cleanup_never_called_when_preflight_validation_fails(self):
         """Critical safeguard test: cleanup_validated_test_targets must NEVER be called if validation fails."""
+        self._setup_valid_mocks()
+        self.mock_service.files().get.side_effect = None
         req = MagicMock()
         req.execute.return_value = {
             "id": self.valid_folder_id,
