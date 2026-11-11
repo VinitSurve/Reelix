@@ -1091,6 +1091,30 @@ class TestPipeline(unittest.TestCase):
             code_experimental = main(["--experimental-firestore"])
             self.assertEqual(0, code_experimental)
 
+    def test_process_job_aborts_if_coordinator_storage_claim_fails(self):
+        job = JobManifest(
+            item_id="item-coord-storage-fail",
+            source="URL",
+            status=JobStatus.QUEUED,
+            caption="Test manifest for coordinator claim",
+            created_at=1000,
+            updated_at=1000,
+        )
+        self.storage.update_job(job)
+
+        mock_coordinator = MagicMock()
+        mock_coordinator.claim_job.return_value = job
+
+        # Mock storage claim_job to fail (e.g. concurrent claim or network error)
+        with patch.object(self.storage, "claim_job", return_value=False):
+            pipeline = CloudProcessingPipeline(
+                config=self.config,
+                storage=self.storage,
+                coordinator=mock_coordinator,
+            )
+            success = pipeline.process_job(job)
+            self.assertFalse(success, "Must return False when storage claim fails even if coordinator succeeded")
+
     def test_continuous_heartbeat_background_thread_renews_periodically(self):
         from workers.processor.src.pipeline import ContinuousHeartbeatManager
         now_ms = int(time.time() * 1000)

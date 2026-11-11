@@ -282,6 +282,7 @@ class TestAppContainer(
         thumbnails = thumbnails,
         mediaStorage = mediaStorage,
         clock = clock,
+        settingsRepository = fakeSettings,
     )
 
     override val processingRepository: ProcessingRepository = ProcessingRepository(

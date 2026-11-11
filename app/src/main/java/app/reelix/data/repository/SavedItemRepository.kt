@@ -52,11 +52,21 @@ class SavedItemRepository(
     private val mediaStorage: MediaStorage,
     private val clock: Clock = Clock.SYSTEM,
     private val idGenerator: () -> String = { UUID.randomUUID().toString() },
+    private val settingsRepository: app.reelix.data.settings.SettingsRepository? = null,
 ) {
     private val itemDao = db.savedItemDao()
     private val tagDao = db.tagDao()
     private val processingDao = db.processingDao()
     private val saveMutex = Mutex()
+
+    private suspend fun initialProcessingStatus(): ProcessingStatus {
+        val cloudEnabled = settingsRepository?.current()?.cloudProcessingEnabled ?: false
+        return if (cloudEnabled) {
+            ProcessingStatus.WAITING_UPLOAD
+        } else {
+            ProcessingStatus.QUEUED
+        }
+    }
 
     // ---------- Saving Links ----------
 
@@ -102,7 +112,7 @@ class SavedItemRepository(
                 caption = initialCaption,
                 userNotes = initialNotes,
                 category = initialCategory,
-                processingStatus = ProcessingStatus.QUEUED,
+                processingStatus = initialProcessingStatus(),
                 createdAt = now,
                 updatedAt = now,
             ),
@@ -154,7 +164,7 @@ class SavedItemRepository(
                     mediaSizeBytes = media.sizeBytes,
                     mediaDurationMs = media.durationMs,
                     mediaFileName = media.originalFileName,
-                    processingStatus = ProcessingStatus.QUEUED,
+                    processingStatus = initialProcessingStatus(),
                     createdAt = now,
                     updatedAt = now,
                 ),

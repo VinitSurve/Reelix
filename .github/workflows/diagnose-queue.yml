@@ -1,0 +1,59 @@
+name: Diagnose Reelix Google Drive Queue & Folder Identity
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_folder_id:
+        description: "Optional Google Drive folder ID configured in Android app (for identity comparison)"
+        required: false
+        default: ""
+      android_folder_hash:
+        description: "Optional SHA-256 fingerprint of Android folder ID (if comparing without raw ID)"
+        required: false
+        default: ""
+
+concurrency:
+  group: reelix-processing
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  diagnose-queue:
+    name: Run Safe Drive Queue Diagnostics
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "workers/processor/requirements.txt"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r workers/processor/requirements.txt
+
+      - name: Execute Drive Queue Diagnostics
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          ANDROID_FOLDER_ID: ${{ github.event.inputs.android_folder_id }}
+          ANDROID_FOLDER_HASH: ${{ github.event.inputs.android_folder_hash }}
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "$ANDROID_FOLDER_ID" ]; then
+            EXTRA_ARGS+=(--android-folder-id "$ANDROID_FOLDER_ID")
+          fi
+          if [ -n "$ANDROID_FOLDER_HASH" ]; then
+            EXTRA_ARGS+=(--android-folder-hash "$ANDROID_FOLDER_HASH")
+          fi
+          python workers/processor/scripts/diagnose_drive_queue.py "${EXTRA_ARGS[@]}"

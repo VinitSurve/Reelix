@@ -149,7 +149,7 @@ class GoogleDriveStorageClient(StorageClient):
         service = self._get_service()
         jobs_folder = self._ensure_subfolder("jobs")
 
-        query = f"'{jobs_folder}' in parents and name contains '.json' and trashed = false"
+        query = f"'{jobs_folder}' in parents and trashed = false"
         now_ms = int(time.time() * 1000)
         default_lease_ms = self.config.lease_timeout_ms
         manifests: List[JobManifest] = []
@@ -166,6 +166,9 @@ class GoogleDriveStorageClient(StorageClient):
             ).execute()
 
             for f in res.get("files", []):
+                file_name = f.get("name", "")
+                if not file_name.endswith(".json"):
+                    continue
                 try:
                     content = self._download_bytes(f["id"])
                     manifest = JobManifest.from_json(content.decode("utf-8"))

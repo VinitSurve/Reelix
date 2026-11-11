@@ -29,7 +29,15 @@ class CloudSyncRepository(
     private val itemDao = db.savedItemDao()
     private val processingDao = db.processingDao()
 
-    suspend fun createOrGetVaultFolder(): Result<String> = cloudClient.createOrGetVaultFolder()
+    suspend fun createOrGetVaultFolder(): Result<String> {
+        val result = cloudClient.createOrGetVaultFolder()
+        result.onSuccess { folderId ->
+            if (folderId.isNotBlank() && settingsRepository.current().cloudDriveFolderId.isBlank()) {
+                settingsRepository.update { it.copy(cloudDriveFolderId = folderId) }
+            }
+        }
+        return result
+    }
 
     suspend fun createCrossClientTestProbe(): Result<CrossClientProbeResult> = cloudClient.createCrossClientTestProbe()
 
@@ -45,6 +53,27 @@ class CloudSyncRepository(
             ReelixLog.w("Cloud client is not configured; skipping upload for $itemId")
             return@withContext false
         }
+
+        // Canonical root folder persistence: if Settings doesn't have folder ID saved, ensure & persist it
+        val currentFolder = settingsRepository.current().cloudDriveFolderId
+        if (currentFolder.isBlank()) {
+            val vaultRes = cloudClient.createOrGetVaultFolder()
+            vaultRes.onSuccess { fid ->
+                if (fid.isNotBlank()) {
+                    settingsRepository.update { it.copy(cloudDriveFolderId = fid) }
+                }
+            }
+        }
+
+        val startNow = clock.now()
+        // Update local status to UPLOADING while media and manifest are in transit
+        itemDao.updateProcessingStatus(
+            id = itemId,
+            status = ProcessingStatus.UPLOADING,
+            nextAttemptAt = null,
+            lastError = null,
+            now = startNow,
+        )
 
         val mediaFile = item.mediaPath?.let { File(it) }?.takeIf { it.exists() }
         var mediaInfo: CloudMediaInfo? = null
@@ -69,6 +98,13 @@ class CloudSyncRepository(
                 }
                 is CloudUploadResult.Failure -> {
                     ReelixLog.w("Failed to upload media for item $itemId: ${uploadRes.error}")
+                    itemDao.updateProcessingStatus(
+                        id = itemId,
+                        status = ProcessingStatus.WAITING_UPLOAD,
+                        nextAttemptAt = startNow + 60_000L,
+                        lastError = "Media upload failed: ${uploadRes.error}",
+                        now = startNow,
+                    )
                     return@withContext false
                 }
             }
@@ -114,28 +150,38 @@ class CloudSyncRepository(
 
         val submitted = cloudClient.submitJobManifest(manifest)
         if (submitted) {
-            val now = clock.now()
-            if (remoteManifest?.status != "PROCESSING") {
-                itemDao.updateProcessingStatus(
-                    id = itemId,
-                    status = ProcessingStatus.PROCESSING,
-                    nextAttemptAt = null,
-                    lastError = null,
-                    now = now,
-                )
-                processingDao.insertEvent(
-                    ProcessingEventEntity(
-                        savedItemId = itemId,
-                        stage = null,
-                        status = "CLOUD_OFFLOADED",
-                        message = "Job submitted to cloud queue for GitHub Actions processing",
-                        createdAt = now,
-                    ),
-                )
-            }
+            val confirmedNow = clock.now()
+            // Honest state: item is confirmed QUEUED on Google Drive queue (or PROCESSING if already processing remotely)
+            val nextStatus = if (remoteManifest?.status == "PROCESSING") ProcessingStatus.PROCESSING else ProcessingStatus.QUEUED
+            itemDao.updateProcessingStatus(
+                id = itemId,
+                status = nextStatus,
+                nextAttemptAt = null,
+                lastError = null,
+                now = confirmedNow,
+            )
+            processingDao.insertEvent(
+                ProcessingEventEntity(
+                    savedItemId = itemId,
+                    stage = null,
+                    status = "CLOUD_OFFLOADED",
+                    message = "Job manifest confirmed on Google Drive queue (status: ${manifest.status})",
+                    createdAt = confirmedNow,
+                ),
+            )
             return@withContext true
+        } else {
+            // Manifest submission failed: restore WAITING_UPLOAD with error and backoff
+            val failNow = clock.now()
+            itemDao.updateProcessingStatus(
+                id = itemId,
+                status = ProcessingStatus.WAITING_UPLOAD,
+                nextAttemptAt = failNow + 60_000L,
+                lastError = "Failed to submit job manifest to Google Drive queue",
+                now = failNow,
+            )
+            return@withContext false
         }
-        return@withContext false
     }
 
     suspend fun syncCompletedJobs(): Int = withContext(Dispatchers.IO) {
@@ -301,6 +347,26 @@ class CloudSyncRepository(
                                     stage = ProcessingStage.COMPLETION,
                                     status = "CLOUD_INCOMPLETE",
                                     message = "Cloud processing incomplete ($reason); attention required",
+                                    createdAt = now,
+                                ),
+                            )
+                        }
+                    }
+                    "PROCESSING" -> {
+                        if (item.processingStatus != ProcessingStatus.PROCESSING) {
+                            itemDao.updateProcessingStatus(
+                                id = manifest.itemId,
+                                status = ProcessingStatus.PROCESSING,
+                                nextAttemptAt = null,
+                                lastError = null,
+                                now = now,
+                            )
+                            processingDao.insertEvent(
+                                ProcessingEventEntity(
+                                    savedItemId = manifest.itemId,
+                                    stage = null,
+                                    status = "CLOUD_PROCESSING",
+                                    message = "Job claimed by cloud worker (${manifest.claimedBy ?: "active"}); processing in progress",
                                     createdAt = now,
                                 ),
                             )

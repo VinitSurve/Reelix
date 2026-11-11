@@ -138,6 +138,7 @@ class DefaultAppContainer(
             thumbnails = thumbnails,
             mediaStorage = mediaStorage,
             clock = clock,
+            settingsRepository = settingsRepository,
         )
     }
 

@@ -65,6 +65,36 @@ class TestDriveClient(unittest.TestCase):
             self.assertEqual("item-drive-1", jobs[0].item_id)
             self.assertEqual(JobStatus.QUEUED, jobs[0].status)
 
+    def test_list_queued_jobs_ignores_non_json_files_and_uses_safe_query(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list.return_value.execute.return_value = {
+            "files": [
+                {"id": "file-1", "name": "job1.json", "version": 2, "modifiedTime": "2026-11-01T12:00:00Z"},
+                {"id": "file-2", "name": "readme.txt", "version": 1, "modifiedTime": "2026-11-01T12:01:00Z"},
+                {"id": "file-3", "name": "preview.mp4", "version": 1, "modifiedTime": "2026-11-01T12:02:00Z"},
+            ]
+        }
+
+        sample_manifest = JobManifest(
+            item_id="item-drive-1",
+            source="URL",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=sample_manifest.to_json().encode("utf-8")):
+            jobs = self.client.list_queued_jobs(limit=5)
+            self.assertEqual(1, len(jobs))
+            self.assertEqual("item-drive-1", jobs[0].item_id)
+            call_kwargs = mock_files.list.call_args[1]
+            self.assertIn("'jobs-folder-id' in parents and trashed = false", call_kwargs["q"])
+            self.assertNotIn("name contains", call_kwargs["q"])
+
     @patch("google.oauth2.credentials.Credentials")
     @patch("googleapiclient.discovery.build")
     def test_oauth_credentials_initialization(self, mock_build, mock_creds_cls):

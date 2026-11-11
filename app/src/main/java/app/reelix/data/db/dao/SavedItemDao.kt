@@ -96,7 +96,7 @@ interface SavedItemDao {
     @Query(
         """
         SELECT COUNT(*) AS total,
-            COALESCE(SUM(CASE WHEN processingStatus IN ('QUEUED','PROCESSING','WAITING_RETRY') THEN 1 ELSE 0 END), 0) AS awaiting,
+            COALESCE(SUM(CASE WHEN processingStatus IN ('SAVED_LOCALLY','WAITING_UPLOAD','UPLOADING','QUEUED','PROCESSING','WAITING_RETRY') THEN 1 ELSE 0 END), 0) AS awaiting,
             COALESCE(SUM(CASE WHEN mediaAvailable = 1 OR mediaPath IS NOT NULL THEN 1 ELSE 0 END), 0) AS mediaAvailable,
             COALESCE(SUM(CASE WHEN transcriptionStatus = 'SUCCEEDED' THEN 1 ELSE 0 END), 0) AS transcribed,
             COALESCE(SUM(CASE WHEN analysisStatus = 'SUCCEEDED' THEN 1 ELSE 0 END), 0) AS aiEnriched,
@@ -114,7 +114,7 @@ interface SavedItemDao {
             "   OR (:filterMode = 'MEDIA' AND (si.mediaAvailable = 1 OR si.mediaPath IS NOT NULL)) " +
             "   OR (:filterMode = 'TRANSCRIBED' AND si.transcriptionStatus = 'SUCCEEDED') " +
             "   OR (:filterMode = 'AI' AND si.analysisStatus = 'SUCCEEDED') " +
-            "   OR (:filterMode = 'AWAITING' AND si.processingStatus IN ('QUEUED','PROCESSING','WAITING_RETRY')) " +
+            "   OR (:filterMode = 'AWAITING' AND si.processingStatus IN ('SAVED_LOCALLY','WAITING_UPLOAD','UPLOADING','QUEUED','PROCESSING','WAITING_RETRY')) " +
             "   OR (:filterMode = 'ATTENTION' AND si.processingStatus = 'NEEDS_ATTENTION') " +
             ") " +
             ORDERING + " LIMIT :limit",
@@ -135,7 +135,7 @@ interface SavedItemDao {
             "   OR (:filterMode = 'MEDIA' AND (si.mediaAvailable = 1 OR si.mediaPath IS NOT NULL)) " +
             "   OR (:filterMode = 'TRANSCRIBED' AND si.transcriptionStatus = 'SUCCEEDED') " +
             "   OR (:filterMode = 'AI' AND si.analysisStatus = 'SUCCEEDED') " +
-            "   OR (:filterMode = 'AWAITING' AND si.processingStatus IN ('QUEUED','PROCESSING','WAITING_RETRY')) " +
+            "   OR (:filterMode = 'AWAITING' AND si.processingStatus IN ('SAVED_LOCALLY','WAITING_UPLOAD','UPLOADING','QUEUED','PROCESSING','WAITING_RETRY')) " +
             "   OR (:filterMode = 'ATTENTION' AND si.processingStatus = 'NEEDS_ATTENTION') " +
             ") " +
             ORDERING + " LIMIT :limit",
@@ -153,7 +153,7 @@ interface SavedItemDao {
     @Query(
         """
         SELECT id FROM saved_items
-        WHERE processingStatus = 'QUEUED'
+        WHERE processingStatus IN ('QUEUED', 'WAITING_UPLOAD')
            OR (processingStatus = 'WAITING_RETRY' AND (nextAttemptAt IS NULL OR nextAttemptAt <= :now))
         ORDER BY createdAt ASC LIMIT :limit
         """,
@@ -163,7 +163,7 @@ interface SavedItemDao {
     @Query(
         """
         SELECT COUNT(*) FROM saved_items
-        WHERE processingStatus = 'QUEUED'
+        WHERE processingStatus IN ('QUEUED', 'WAITING_UPLOAD')
            OR (processingStatus = 'WAITING_RETRY' AND (nextAttemptAt IS NULL OR nextAttemptAt <= :now))
         """,
     )
@@ -177,15 +177,26 @@ interface SavedItemDao {
         """
         UPDATE saved_items SET processingStatus = 'PROCESSING', updatedAt = :now
         WHERE id = :id AND (
-            processingStatus = 'QUEUED'
+            processingStatus IN ('QUEUED', 'WAITING_UPLOAD')
             OR (processingStatus = 'WAITING_RETRY' AND (nextAttemptAt IS NULL OR nextAttemptAt <= :now))
         )
         """,
     )
     suspend fun claim(id: String, now: Long): Int
 
-    /** Items left in PROCESSING by a killed process are returned to the queue. */
-    @Query("UPDATE saved_items SET processingStatus = 'QUEUED', updatedAt = :now WHERE processingStatus = 'PROCESSING'")
+    /** Items left in PROCESSING or UPLOADING by an interrupted process are returned to the queue. */
+    @Query(
+        """
+        UPDATE saved_items
+        SET processingStatus = CASE
+            WHEN processingStatus = 'UPLOADING' THEN 'WAITING_UPLOAD'
+            WHEN processingStatus = 'PROCESSING' THEN 'QUEUED'
+            ELSE processingStatus
+        END,
+        updatedAt = :now
+        WHERE processingStatus IN ('UPLOADING', 'PROCESSING')
+        """,
+    )
     suspend fun resetInterrupted(now: Long): Int
 
     @Query(

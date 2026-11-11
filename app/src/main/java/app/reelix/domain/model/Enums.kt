@@ -11,6 +11,9 @@ enum class ContentType(val label: String) {
 
 /** Overall lifecycle of a saved item in the processing queue. */
 enum class ProcessingStatus(val label: String) {
+    SAVED_LOCALLY("Saved locally"),
+    WAITING_UPLOAD("Waiting to upload"),
+    UPLOADING("Uploading"),
     QUEUED("Queued"),
     PROCESSING("Processing"),
     WAITING_RETRY("Retry scheduled"),
@@ -18,10 +21,19 @@ enum class ProcessingStatus(val label: String) {
     NEEDS_ATTENTION("Needs attention"),
     ;
 
-    val isAwaiting: Boolean get() = this == QUEUED || this == PROCESSING || this == WAITING_RETRY
+    val isAwaiting: Boolean
+        get() = this == SAVED_LOCALLY || this == WAITING_UPLOAD || this == UPLOADING ||
+            this == QUEUED || this == PROCESSING || this == WAITING_RETRY
 
     companion object {
-        val AWAITING: Set<ProcessingStatus> = setOf(QUEUED, PROCESSING, WAITING_RETRY)
+        val AWAITING: Set<ProcessingStatus> = setOf(
+            SAVED_LOCALLY,
+            WAITING_UPLOAD,
+            UPLOADING,
+            QUEUED,
+            PROCESSING,
+            WAITING_RETRY,
+        )
     }
 }
 

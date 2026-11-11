@@ -482,8 +482,8 @@ class GoogleDriveCloudClient(
                     if (resp.isSuccessful) {
                         val body = resp.body?.string().orEmpty()
                         val manifest = CloudJobManifest.fromJson(body)
-                        // Return settled manifests (COMPLETED, PARTIAL, FAILED, WAITING_RETRY) for honest synchronization
-                        if (manifest.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY")) {
+                        // Return settled & active manifests (COMPLETED, PARTIAL, FAILED, WAITING_RETRY, PROCESSING) for honest synchronization
+                        if (manifest.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY", "PROCESSING")) {
                             settled.add(manifest)
                         }
                     }
@@ -1043,5 +1043,5 @@ class MockCloudSyncClient(
     override suspend fun fetchJobManifest(itemId: String): CloudJobManifest? = jobs[itemId]
 
     override suspend fun listCompletedJobs(): List<CloudJobManifest> =
-        jobs.values.filter { it.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY") }
+        jobs.values.filter { it.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY", "PROCESSING") }
 }

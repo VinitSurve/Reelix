@@ -275,7 +275,12 @@ class CloudProcessingPipeline:
                 return False
             job = claimed_manifest
             # Also sync claim to storage manifest
-            self.storage.claim_job(job, runner_id=self.config.runner_id)
+            if not self.storage.claim_job(job, runner_id=self.config.runner_id):
+                logger.warning(
+                    "Could not claim job %s in storage manifest (storage claim failed); skipping",
+                    job.item_id,
+                )
+                return False
         else:
             if not self.storage.claim_job(job, runner_id=self.config.runner_id):
                 logger.warning(

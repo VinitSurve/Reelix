@@ -192,10 +192,10 @@ class CloudSyncTest {
         assertEquals("sample_clip.mp4", manifest.media!!.fileName)
         assertTrue(container.fakeCloudClient.uploadedFiles.isNotEmpty())
 
-        // Verify local DB status updated to PROCESSING
+        // Verify local DB status updated to QUEUED (truly confirmed in Google Drive queue)
         val item = container.savedItemRepository.getItem(itemId)
         assertNotNull(item)
-        assertEquals(ProcessingStatus.PROCESSING, item!!.processingStatus)
+        assertEquals(ProcessingStatus.QUEUED, item!!.processingStatus)
     }
 
     @Test
@@ -1470,5 +1470,52 @@ class CloudSyncTest {
         val searchTakeaway = container.savedItemRepository.search("thundering", ItemQuery()).first()
         assertEquals(1, searchTakeaway.size)
         assertEquals(itemId, searchTakeaway.first().id)
+    }
+
+    @Test
+    fun honestLifecycle_cloudEnabledSavesAsWaitingUpload_andUploadSetsQueued() = runTest {
+        // Enable cloud processing
+        container.fakeSettings.update { it.copy(cloudProcessingEnabled = true) }
+
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/reel/DfgFcSzlTae/",
+            normalizedUrl = "https://www.instagram.com/reel/DfgFcSzlTae/",
+            shortcode = "DfgFcSzlTae",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link)
+        assertTrue(outcome is LinkSaveOutcome.Saved)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        // 1. Must be WAITING_UPLOAD when saved, NOT QUEUED or PROCESSING
+        val savedItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(savedItem)
+        assertEquals(ProcessingStatus.WAITING_UPLOAD, savedItem!!.processingStatus)
+
+        // 2. If client is unconfigured, upload fails and status remains WAITING_UPLOAD
+        container.fakeCloudClient.isEnabled = false
+        val uploadFailed = container.cloudSyncRepository.uploadPendingItem(itemId)
+        assertFalse(uploadFailed)
+        val itemAfterFail = container.savedItemRepository.getItem(itemId)
+        assertEquals(ProcessingStatus.WAITING_UPLOAD, itemAfterFail!!.processingStatus)
+
+        // 3. When upload succeeds, status becomes QUEUED (confirmed on Google Drive)
+        container.fakeCloudClient.isEnabled = true
+        val uploadSuccess = container.cloudSyncRepository.uploadPendingItem(itemId)
+        assertTrue(uploadSuccess)
+        val itemAfterSuccess = container.savedItemRepository.getItem(itemId)
+        assertEquals(ProcessingStatus.QUEUED, itemAfterSuccess!!.processingStatus)
+
+        // 4. When cloud worker claims and sets remote manifest to PROCESSING, sync updates local status to PROCESSING
+        val remoteManifest = container.fakeCloudClient.jobs[itemId]!!
+        container.fakeCloudClient.jobs[itemId] = remoteManifest.copy(
+            status = "PROCESSING",
+            claimedBy = "gha-worker-99",
+            claimedAt = container.clock.now(),
+        )
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+        val itemClaimed = container.savedItemRepository.getItem(itemId)
+        assertEquals(ProcessingStatus.PROCESSING, itemClaimed!!.processingStatus)
     }
 }
