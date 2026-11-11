@@ -22,6 +22,7 @@ on:
 concurrency:
   group: reelix-processing
   cancel-in-progress: false
+  queue: max
 
 jobs:
   process-queue:
@@ -40,11 +41,12 @@ jobs:
           cache: "pip"
           cache-dependency-path: "workers/processor/requirements.txt"
 
-      - name: Install system FFmpeg
+      - name: Install system FFmpeg and Tesseract OCR
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg tesseract-ocr
           ffmpeg -version
+          tesseract --version
 
       - name: Cache Whisper model weights
         uses: actions/cache@v4

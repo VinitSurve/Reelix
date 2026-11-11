@@ -19,6 +19,7 @@ name: Verify Cross-Client Google Drive Access
 concurrency:
   group: reelix-processing
   cancel-in-progress: false
+  queue: max
 
 jobs:
   verify-cross-client:
