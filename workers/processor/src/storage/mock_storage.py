@@ -8,7 +8,14 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..models import JobManifest, JobStatus, compute_file_sha256
+from ..models import (
+    JobManifest,
+    JobStatus,
+    TransitionRecord,
+    TransitionType,
+    compute_file_sha256,
+    fold_transitions,
+)
 from . import StorageClient
 
 
@@ -25,10 +32,14 @@ class MockStorageClient(StorageClient):
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
+        self.transitions_dir = self.root_dir / "transitions"
+        self.transitions_dir.mkdir(parents=True, exist_ok=True)
 
         self._files: Dict[str, Path] = {}
         self.etags: Dict[str, str] = {}
         self._etag_counter = 0
+        self.simulated_listing_delay: Dict[str, int] = {}
+        self.simulated_upload_conflicts: Dict[str, bool] = {}
 
     def register_media(self, file_id: str, path: Path):
         self._files[file_id] = path
@@ -235,3 +246,64 @@ class MockStorageClient(StorageClient):
         shutil.copy2(local_media_path, dest)
         self._files[file_id] = dest
         return file_id
+
+    def append_transition(self, transition: TransitionRecord) -> bool:
+        """Appends an immutable transition record to the item's transition directory."""
+        item_dir = self.transitions_dir / transition.item_id
+        item_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{transition.deterministic_transition_id}.json"
+
+        # Check for simulated 409 conflict
+        if self.simulated_upload_conflicts.get(filename, False):
+            # In real Drive, a 409 indicates the file was already uploaded
+            # We preserve existing file or write if not present
+            target = item_dir / filename
+            if not target.exists():
+                target.write_text(transition.to_json(), encoding="utf-8")
+            return False
+
+        target = item_dir / filename
+        target.write_text(transition.to_json(), encoding="utf-8")
+        return True
+
+    def list_transitions(self, item_id: str) -> List[TransitionRecord]:
+        """Lists and deserializes all transitions for the given item."""
+        item_dir = self.transitions_dir / item_id
+        if not item_dir.exists():
+            return []
+
+        results: List[TransitionRecord] = []
+        for file in sorted(item_dir.glob("*.json")):
+            # Check simulated listing delay
+            remaining_delay = self.simulated_listing_delay.get(file.name, 0)
+            if remaining_delay > 0:
+                self.simulated_listing_delay[file.name] = remaining_delay - 1
+                continue
+
+            try:
+                t = TransitionRecord.from_json(file.read_text(encoding="utf-8"))
+                results.append(t)
+            except Exception:
+                continue
+        return results
+
+    def find_transition(self, item_id: str, deterministic_transition_id: str) -> Optional[TransitionRecord]:
+        """Searches specifically for an already-created transition record by its deterministic identity."""
+        item_dir = self.transitions_dir / item_id
+        target = item_dir / f"{deterministic_transition_id}.json"
+        if target.exists():
+            try:
+                return TransitionRecord.from_json(target.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+        return None
+
+    def rebuild_projection(self, item_id: str) -> Optional[JobManifest]:
+        """Folds transitions for an item and updates jobs/{item_id}.json projection."""
+        transitions = self.list_transitions(item_id)
+        if not transitions:
+            return self.get_job(item_id)
+        base = self.get_job(item_id)
+        folded, _ = fold_transitions(item_id, transitions, base_manifest=base)
+        self.update_job(folded)
+        return folded

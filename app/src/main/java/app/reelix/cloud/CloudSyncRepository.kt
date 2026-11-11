@@ -328,8 +328,20 @@ class CloudSyncRepository(
         for (manifest in completed) {
             val wasSynced = db.withTransaction {
                 val item = itemDao.getById(manifest.itemId) ?: return@withTransaction false
+
+                // 3-Dimensional Staleness Protection (Generation -> Attempt Epoch -> Projection Version)
+                val isStaleGeneration = manifest.generation < item.lastSyncedGeneration
+                val isStaleEpoch = manifest.generation == item.lastSyncedGeneration && manifest.activeAttemptEpoch < item.lastSyncedAttemptEpoch
+                val isStaleVersion = manifest.generation == item.lastSyncedGeneration &&
+                    manifest.activeAttemptEpoch == item.lastSyncedAttemptEpoch &&
+                    manifest.projectionVersion < item.lastSyncedProjectionVersion
+
+                if (isStaleGeneration || isStaleEpoch || isStaleVersion) {
+                    return@withTransaction false
+                }
+
                 // Only update if not already marked COMPLETED
-                if (item.processingStatus == ProcessingStatus.COMPLETED && item.analysisStatus == StageStatus.SUCCEEDED) {
+                if (item.processingStatus == ProcessingStatus.COMPLETED && item.analysisStatus == StageStatus.SUCCEEDED && manifest.generation <= item.lastSyncedGeneration) {
                     return@withTransaction false
                 }
 
@@ -575,6 +587,13 @@ class CloudSyncRepository(
                         )
                     }
                 }
+                itemDao.updateSyncDimensions(
+                    id = manifest.itemId,
+                    gen = maxOf(item.lastSyncedGeneration, manifest.generation),
+                    epoch = if (manifest.generation > item.lastSyncedGeneration) manifest.activeAttemptEpoch else maxOf(item.lastSyncedAttemptEpoch, manifest.activeAttemptEpoch),
+                    ver = maxOf(item.lastSyncedProjectionVersion, manifest.projectionVersion),
+                    now = now,
+                )
                 true
             }
             if (wasSynced) {

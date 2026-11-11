@@ -1802,4 +1802,167 @@ class CloudSyncTest {
         val item = container.savedItemRepository.getItem(itemId)!!
         assertEquals(ProcessingStatus.COMPLETED, item.processingStatus)
     }
+
+    @Test
+    fun androidRejectsStaleGenerationRegression() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/stale-gen/",
+            normalizedUrl = "https://www.instagram.com/p/stale-gen",
+            shortcode = "stale-gen",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        // First sync Generation 2 COMPLETED
+        val gen2Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 2,
+            activeGeneration = 2,
+            activeAttemptEpoch = 1,
+            projectionVersion = 5L,
+            stages = CloudStageStates(acquisition = "SKIPPED", audioExtraction = "SKIPPED", transcription = "SKIPPED", geminiAnalysis = "SKIPPED"),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = gen2Manifest
+        val synced1 = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced1)
+
+        val item1 = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(2, item1.lastSyncedGeneration)
+        assertEquals(5L, item1.lastSyncedProjectionVersion)
+
+        // Now simulate a delayed older Generation 1 manifest arriving
+        val staleGen1 = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 1,
+            activeGeneration = 1,
+            activeAttemptEpoch = 1,
+            projectionVersion = 3L,
+            stages = CloudStageStates(acquisition = "SKIPPED", audioExtraction = "SKIPPED", transcription = "SKIPPED", geminiAnalysis = "SKIPPED"),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = staleGen1
+        val synced2 = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals("Stale older generation must be rejected", 0, synced2)
+
+        // Room must retain Generation 2 state
+        val item2 = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(2, item2.lastSyncedGeneration)
+        assertEquals(5L, item2.lastSyncedProjectionVersion)
+    }
+
+    @Test
+    fun androidRejectsStaleEpochRegressionWithinSameGeneration() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/stale-epoch/",
+            normalizedUrl = "https://www.instagram.com/p/stale-epoch",
+            shortcode = "stale-epoch",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        // Sync Gen 2, Epoch 2, Projection Version 6
+        val epoch2Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 2,
+            activeGeneration = 2,
+            activeAttemptEpoch = 2,
+            projectionVersion = 6L,
+            stages = CloudStageStates(acquisition = "SKIPPED", audioExtraction = "SKIPPED", transcription = "SKIPPED", geminiAnalysis = "SKIPPED"),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = epoch2Manifest
+        container.cloudSyncRepository.syncCompletedJobs()
+
+        val item1 = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(2, item1.lastSyncedAttemptEpoch)
+
+        // Stale Epoch 1 arrives
+        val staleEpoch1 = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 2,
+            activeGeneration = 2,
+            activeAttemptEpoch = 1,
+            projectionVersion = 7L,
+            stages = CloudStageStates(acquisition = "SKIPPED", audioExtraction = "SKIPPED", transcription = "SKIPPED", geminiAnalysis = "SKIPPED"),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = staleEpoch1
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals("Stale epoch within same generation must be rejected", 0, synced)
+
+        val item2 = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(2, item2.lastSyncedAttemptEpoch)
+    }
+
+    @Test
+    fun androidRejectsStaleProjectionVersionRegressionWithinSameGenerationAndEpoch() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/stale-ver/",
+            normalizedUrl = "https://www.instagram.com/p/stale-ver",
+            shortcode = "stale-ver",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        // Sync Gen 2, Epoch 1, Projection Version 10
+        val v10Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 2,
+            activeGeneration = 2,
+            activeAttemptEpoch = 1,
+            projectionVersion = 10L,
+            stages = CloudStageStates(acquisition = "SKIPPED", audioExtraction = "SKIPPED", transcription = "SKIPPED", geminiAnalysis = "SKIPPED"),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = v10Manifest
+        container.cloudSyncRepository.syncCompletedJobs()
+
+        val item1 = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(10L, item1.lastSyncedProjectionVersion)
+
+        // Delayed write with Projection Version 8 arrives
+        val v8Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 2,
+            activeGeneration = 2,
+            activeAttemptEpoch = 1,
+            projectionVersion = 8L,
+            stages = CloudStageStates(acquisition = "SKIPPED", audioExtraction = "SKIPPED", transcription = "SKIPPED", geminiAnalysis = "SKIPPED"),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = v8Manifest
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals("Stale projection version within same gen and epoch must be rejected", 0, synced)
+
+        val item2 = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(10L, item2.lastSyncedProjectionVersion)
+    }
 }

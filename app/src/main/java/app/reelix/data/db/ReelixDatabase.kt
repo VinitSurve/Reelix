@@ -38,7 +38,7 @@ abstract class ReelixDatabase : RoomDatabase() {
     abstract fun searchDao(): SearchDao
 
     companion object {
-        const val VERSION = 2
+        const val VERSION = 3
         const val NAME = "reelix.db"
 
         /** Explicit migration from schema v1 to v2: adds media & extended AI fields, recreates FTS. */
@@ -70,7 +70,16 @@ abstract class ReelixDatabase : RoomDatabase() {
             }
         }
 
-        val MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2)
+        /** Migration v2 to v3: adds projection consistency tracking dimensions to prevent stale rollback. */
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `saved_items` ADD COLUMN `lastSyncedGeneration` INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE `saved_items` ADD COLUMN `lastSyncedAttemptEpoch` INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE `saved_items` ADD COLUMN `lastSyncedProjectionVersion` INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        val MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
 
         fun build(context: Context): ReelixDatabase =
             Room.databaseBuilder(context.applicationContext, ReelixDatabase::class.java, NAME)

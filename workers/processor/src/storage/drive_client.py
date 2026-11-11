@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..config import WorkerConfig
-from ..models import JobManifest, JobStatus, compute_file_sha256
+from ..models import (
+    JobManifest,
+    JobStatus,
+    TransitionRecord,
+    TransitionType,
+    compute_file_sha256,
+    fold_transitions,
+)
 from . import StorageClient
 
 logger = logging.getLogger(__name__)
@@ -791,3 +798,151 @@ class GoogleDriveStorageClient(StorageClient):
         while not done:
             _, done = downloader.next_chunk()
         return fh.getvalue()
+
+    def _ensure_item_transitions_folder(self, item_id: str) -> str:
+        """Finds or creates transitions/{item_id} subfolder in Drive."""
+        key = f"transitions_{item_id}"
+        if key in self._subfolders:
+            return self._subfolders[key]
+
+        transitions_root = self._ensure_subfolder("transitions")
+        service = self._get_service()
+        query = (
+            f"name = '{item_id}' and mimeType = 'application/vnd.google-apps.folder' "
+            f"and '{transitions_root}' in parents and trashed = false"
+        )
+        res = service.files().list(q=query, fields="files(id, name)").execute()
+        files = res.get("files", [])
+        if files:
+            self._subfolders[key] = files[0]["id"]
+            return files[0]["id"]
+
+        meta = {
+            "name": item_id,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [transitions_root],
+        }
+        created = service.files().create(body=meta, fields="id").execute()
+        self._subfolders[key] = created["id"]
+        return created["id"]
+
+    def append_transition(self, transition: TransitionRecord) -> bool:
+        """Appends an immutable transition record to the item's Drive transition folder.
+
+        Uses pre-generated file ID where possible, and handles retries / HTTP 409 conflict
+        by running the 6-point verification protocol before reporting success or fork.
+        """
+        service = self._get_service()
+        item_folder = self._ensure_item_transitions_folder(transition.item_id)
+        filename = f"{transition.deterministic_transition_id}.json"
+
+        # Search-before-create: check if already exists to prevent redundant uploads
+        existing = self.find_transition(transition.item_id, transition.deterministic_transition_id)
+        if existing is not None:
+            if existing.payload_integrity_hash == transition.payload_integrity_hash:
+                logger.info("Transition %s already exists on Drive with matching hash; deduplicating", filename)
+                return True
+            else:
+                logger.error("INTEGRITY FORK: Transition %s already exists with conflicting hash!", filename)
+                return False
+
+        from googleapiclient.http import MediaIoBaseUpload
+
+        body_bytes = transition.to_json().encode("utf-8")
+        media_body = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json")
+
+        file_metadata = {
+            "name": filename,
+            "parents": [item_folder],
+            "mimeType": "application/json",
+            "properties": {
+                "reelix_item_id": transition.item_id,
+                "reelix_generation": str(transition.generation),
+                "reelix_epoch": str(transition.attempt_epoch),
+                "reelix_seq": str(transition.transition_seq),
+                "reelix_hash": transition.payload_integrity_hash,
+            },
+        }
+        if transition.pregenerated_file_id:
+            file_metadata["id"] = transition.pregenerated_file_id
+
+        try:
+            created = service.files().create(
+                body=file_metadata,
+                media_body=media_body,
+                fields="id, name",
+            ).execute()
+            logger.info("Committed transition %s to Drive (id=%s)", filename, created.get("id"))
+            return True
+        except Exception as e:
+            from googleapiclient.errors import HttpError
+            if isinstance(e, HttpError) and getattr(e, "resp", None) and e.resp.status in (409, 400):
+                # Retry verification: fetch file and execute 6-point check
+                verified = self.find_transition(transition.item_id, transition.deterministic_transition_id)
+                if verified and verified.payload_integrity_hash == transition.payload_integrity_hash:
+                    logger.info("HTTP 409 on transition creation for %s, verified matching payload on Drive", filename)
+                    return True
+                logger.error("HTTP 409 conflict could not be verified for %s: %s", filename, e)
+                return False
+            logger.error("Failed to append transition %s to Drive: %s", filename, e)
+            return False
+
+    def list_transitions(self, item_id: str, max_retries: int = 3) -> List[TransitionRecord]:
+        """Lists and deserializes all transition records in transitions/{item_id}/ with bounded retry."""
+        service = self._get_service()
+        item_folder = self._ensure_item_transitions_folder(item_id)
+        query = f"'{item_folder}' in parents and trashed = false"
+
+        for attempt in range(max_retries):
+            try:
+                res = service.files().list(q=query, fields="files(id, name)").execute()
+                files = res.get("files", [])
+                records: List[TransitionRecord] = []
+                for f in files:
+                    try:
+                        raw = self._download_bytes(f["id"])
+                        records.append(TransitionRecord.from_json(raw.decode("utf-8")))
+                    except Exception as err:
+                        logger.warning("Could not parse transition file %s (%s): %s", f.get("name"), f.get("id"), err)
+                        continue
+                records.sort(key=lambda r: (r.generation, r.attempt_epoch, r.transition_seq))
+                return records
+            except Exception as e:
+                backoff = (2 ** attempt) * 0.5
+                logger.warning("Error listing transitions for %s (attempt %d/%d): %s; backing off %.1fs", item_id, attempt + 1, max_retries, e, backoff)
+                time.sleep(backoff)
+        return []
+
+    def find_transition(self, item_id: str, deterministic_transition_id: str, max_retries: int = 3) -> Optional[TransitionRecord]:
+        """Searches specifically for an existing transition with bounded retries and backoff for Drive listing lag."""
+        service = self._get_service()
+        item_folder = self._ensure_item_transitions_folder(item_id)
+        filename = f"{deterministic_transition_id}.json"
+        query = f"name = '{filename}' and '{item_folder}' in parents and trashed = false"
+
+        for attempt in range(max_retries):
+            try:
+                res = service.files().list(q=query, fields="files(id, name)").execute()
+                files = res.get("files", [])
+                if files:
+                    raw = self._download_bytes(files[0]["id"])
+                    return TransitionRecord.from_json(raw.decode("utf-8"))
+                return None
+            except Exception as e:
+                backoff = (2 ** attempt) * 0.5
+                time.sleep(backoff)
+        return None
+
+    def rebuild_projection(self, item_id: str) -> Optional[JobManifest]:
+        """Folds all transitions for an item into an authoritative JobManifest and persists jobs/{item_id}.json."""
+        transitions = self.list_transitions(item_id)
+        if not transitions:
+            return self.get_job(item_id)
+
+        base = self.get_job(item_id)
+        folded, warnings = fold_transitions(item_id, transitions, base_manifest=base)
+        for w in warnings:
+            logger.warning("Projection rebuild warning for %s: %s", item_id, w)
+
+        self.update_job(folded)
+        return folded

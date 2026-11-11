@@ -32,6 +32,20 @@ class JobStatus(str, Enum):
     NEEDS_ATTENTION = "NEEDS_ATTENTION"
 
 
+class TransitionType(str, Enum):
+    PROMOTED = "PROMOTED"
+    CLAIM = "CLAIM"
+    ACQUIRE = "ACQUIRE"
+    AUDIO_EXTRACTED = "AUDIO_EXTRACTED"
+    TRANSCRIBED = "TRANSCRIBED"
+    OCR_EXTRACTED = "OCR_EXTRACTED"
+    ANALYZED = "ANALYZED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    FORK_FENCED = "FORK_FENCED"
+
+
 class StageStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -199,6 +213,87 @@ class JobResults:
 
 
 @dataclass
+class TransitionRecord:
+    item_id: str
+    generation: int
+    attempt_epoch: int
+    transition_seq: int
+    transition_type: TransitionType
+    attempt_id: str
+    operation_id: Optional[str] = None
+    previous_transition_id: Optional[str] = None
+    previous_hash: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    payload_integrity_hash: str = ""
+    created_at: int = 0
+    deterministic_transition_id: str = ""
+    pregenerated_file_id: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.deterministic_transition_id:
+            self.deterministic_transition_id = (
+                f"g{self.generation}_e{self.attempt_epoch}_s{self.transition_seq:02d}_{self.transition_type.value}"
+            )
+        if not self.payload_integrity_hash:
+            self.payload_integrity_hash = self.compute_payload_hash(self.payload)
+
+    @staticmethod
+    def compute_payload_hash(payload: Dict[str, Any]) -> str:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def compute_transition_hash(self) -> str:
+        prev = self.previous_hash or "ROOT"
+        content = f"{prev}:{self.deterministic_transition_id}:{self.payload_integrity_hash}"
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "item_id": self.item_id,
+            "generation": self.generation,
+            "attempt_epoch": self.attempt_epoch,
+            "transition_seq": self.transition_seq,
+            "transition_type": self.transition_type.value,
+            "attempt_id": self.attempt_id,
+            "operation_id": self.operation_id,
+            "previous_transition_id": self.previous_transition_id,
+            "previous_hash": self.previous_hash,
+            "payload": self.payload,
+            "payload_integrity_hash": self.payload_integrity_hash,
+            "created_at": self.created_at,
+            "deterministic_transition_id": self.deterministic_transition_id,
+            "pregenerated_file_id": self.pregenerated_file_id,
+        }
+
+    def to_json(self, indent: Optional[int] = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> TransitionRecord:
+        ttype = TransitionType(data["transition_type"])
+        return cls(
+            item_id=data["item_id"],
+            generation=data.get("generation", 1),
+            attempt_epoch=data.get("attempt_epoch", 1),
+            transition_seq=data.get("transition_seq", 1),
+            transition_type=ttype,
+            attempt_id=data.get("attempt_id", ""),
+            operation_id=data.get("operation_id"),
+            previous_transition_id=data.get("previous_transition_id"),
+            previous_hash=data.get("previous_hash"),
+            payload=data.get("payload", {}),
+            payload_integrity_hash=data.get("payload_integrity_hash", ""),
+            created_at=data.get("created_at", 0),
+            deterministic_transition_id=data.get("deterministic_transition_id", ""),
+            pregenerated_file_id=data.get("pregenerated_file_id"),
+        )
+
+    @classmethod
+    def from_json(cls, json_str: str) -> TransitionRecord:
+        return cls.from_dict(json.loads(json_str))
+
+
+@dataclass
 class JobManifest:
     item_id: str
     source: str
@@ -229,12 +324,20 @@ class JobManifest:
     stage_details: Dict[str, StageDetail] = field(default_factory=dict)
     artifacts: Dict[str, ArtifactRef] = field(default_factory=dict)
     results: JobResults = field(default_factory=JobResults)
+    active_generation: int = 1
+    active_attempt_epoch: int = 1
+    active_attempt_id: Optional[str] = None
+    projection_version: int = 1
+    last_transition_id: Optional[str] = None
+    last_transition_hash: Optional[str] = None
 
     def __post_init__(self):
         if not self.job_id:
             self.job_id = self.item_id
         if self.version != self.schema_version and self.schema_version != 1:
             self.version = self.schema_version
+        if self.active_generation != self.generation and self.generation != 1:
+            self.active_generation = self.generation
 
     def get_stage_detail(self, stage_name: str) -> StageDetail:
         if stage_name not in self.stage_details:
@@ -284,6 +387,12 @@ class JobManifest:
         }
         d["stage_details"] = {k: v.to_dict() for k, v in self.stage_details.items()}
         d["artifacts"] = {k: v.to_dict() for k, v in self.artifacts.items()}
+        d["active_generation"] = self.active_generation
+        d["active_attempt_epoch"] = self.active_attempt_epoch
+        d["active_attempt_id"] = self.active_attempt_id
+        d["projection_version"] = self.projection_version
+        d["last_transition_id"] = self.last_transition_id
+        d["last_transition_hash"] = self.last_transition_hash
         return d
 
     def to_json(self, indent: Optional[int] = 2) -> str:
@@ -349,8 +458,183 @@ class JobManifest:
             stage_details=stage_details,
             artifacts=artifacts,
             results=results,
+            active_generation=data.get("active_generation", generation),
+            active_attempt_epoch=data.get("active_attempt_epoch", 1),
+            active_attempt_id=data.get("active_attempt_id", data.get("claimed_by")),
+            projection_version=data.get("projection_version", data.get("version", 1)),
+            last_transition_id=data.get("last_transition_id"),
+            last_transition_hash=data.get("last_transition_hash"),
         )
 
     @classmethod
     def from_json(cls, json_str: str) -> JobManifest:
         return cls.from_dict(json.loads(json_str))
+
+
+def fold_transitions(
+    item_id: str,
+    transitions: List[TransitionRecord],
+    base_manifest: Optional[JobManifest] = None,
+) -> tuple[JobManifest, List[str]]:
+    """Deterministically reconstructs an authoritative JobManifest projection from an immutable transition log.
+
+    Handles:
+    - Deduplicating identical transition records (same gen, epoch, seq, and payload hash).
+    - Detecting integrity forks (same gen, epoch, seq with divergent payload hashes).
+    - Ignoring stale records from superseded generations and superseded attempt epochs.
+    - Stopping accumulation on missing sequence gaps or broken hash chains.
+    - Monotonically calculating projection_version.
+    """
+    warnings: List[str] = []
+
+    if not transitions:
+        if base_manifest is not None:
+            return base_manifest, warnings
+        now_ms = 0
+        return (
+            JobManifest(
+                item_id=item_id,
+                source="MEDIA_SHARE",
+                created_at=now_ms,
+                updated_at=now_ms,
+            ),
+            warnings,
+        )
+
+    # 1. Highest generation determines active generation
+    max_gen = max(t.generation for t in transitions)
+    gen_transitions = [t for t in transitions if t.generation == max_gen]
+
+    # 2. Highest attempt epoch within active generation
+    max_epoch = max(t.attempt_epoch for t in gen_transitions)
+    epoch_transitions = [t for t in gen_transitions if t.attempt_epoch == max_epoch]
+
+    # 3. Deduplication and Fork Detection by transition_seq
+    seq_groups: Dict[int, List[TransitionRecord]] = {}
+    for t in epoch_transitions:
+        seq_groups.setdefault(t.transition_seq, []).append(t)
+
+    deduplicated_records: List[TransitionRecord] = []
+    has_fork = False
+    for seq in sorted(seq_groups.keys()):
+        records = seq_groups[seq]
+        first = records[0]
+        # Check if all records in this sequence slot share identical payload hashes
+        divergent = any(r.payload_integrity_hash != first.payload_integrity_hash for r in records[1:])
+        if divergent:
+            msg = f"Integrity fork detected for item {item_id} at gen={max_gen}, epoch={max_epoch}, seq={seq}: multiple conflicting payloads"
+            warnings.append(msg)
+            has_fork = True
+            break
+        # Deduplicate identical records
+        deduplicated_records.append(first)
+
+    # 4. Hash Chain and Continuity Validation
+    valid_chain: List[TransitionRecord] = []
+    expected_seq = 1
+    expected_prev_hash: Optional[str] = None
+
+    for t in deduplicated_records:
+        if t.transition_seq != expected_seq:
+            warnings.append(
+                f"Sequence gap detected for item {item_id} at seq={t.transition_seq} (expected {expected_seq}); halting transition folding"
+            )
+            break
+        if expected_seq > 1 and t.previous_hash != expected_prev_hash:
+            warnings.append(
+                f"Broken hash chain for item {item_id} at seq={t.transition_seq}: expected prev_hash {expected_prev_hash}, found {t.previous_hash}; halting fold"
+            )
+            break
+
+        valid_chain.append(t)
+        expected_prev_hash = t.compute_transition_hash()
+        expected_seq += 1
+
+    # 5. Fold transitions into JobManifest projection
+    if base_manifest is not None:
+        manifest = JobManifest.from_dict(base_manifest.to_dict())
+    else:
+        manifest = JobManifest(
+            item_id=item_id,
+            source="MEDIA_SHARE",
+            created_at=valid_chain[0].created_at if valid_chain else 0,
+            updated_at=valid_chain[-1].created_at if valid_chain else 0,
+        )
+
+    manifest.generation = max_gen
+    manifest.active_generation = max_gen
+    manifest.active_attempt_epoch = max_epoch
+    manifest.projection_version = (manifest.projection_version or 1) + len(valid_chain)
+
+    for t in valid_chain:
+        manifest.active_attempt_id = t.attempt_id
+        manifest.last_transition_id = t.deterministic_transition_id
+        manifest.last_transition_hash = t.compute_transition_hash()
+        manifest.updated_at = max(manifest.updated_at, t.created_at)
+
+        if t.transition_type == TransitionType.PROMOTED:
+            manifest.status = JobStatus.QUEUED
+            manifest.claimed_by = None
+            manifest.claimed_at = None
+            manifest.stages = StageStates()
+            manifest.stage_details = {}
+            manifest.artifacts = {}
+            manifest.results = JobResults()
+        elif t.transition_type == TransitionType.CLAIM:
+            manifest.status = JobStatus.PROCESSING
+            manifest.claimed_by = t.attempt_id
+            manifest.claimed_at = t.created_at
+            manifest.lease_timeout_ms = t.payload.get("lease_timeout_ms", 900_000)
+        elif t.transition_type == TransitionType.ACQUIRE:
+            st = StageStatus(t.payload.get("status", StageStatus.SUCCEEDED.value))
+            if "media" in t.payload:
+                manifest.media = MediaInfo.from_dict(t.payload["media"])
+            manifest.stages.acquisition = st
+            manifest.record_stage_update("acquisition", st, now_ms=t.created_at)
+        elif t.transition_type == TransitionType.AUDIO_EXTRACTED:
+            st = StageStatus(t.payload.get("status", StageStatus.SUCCEEDED.value))
+            if "artifact" in t.payload:
+                art = ArtifactRef.from_dict(t.payload["artifact"])
+                manifest.artifacts["audio_extraction"] = art
+                manifest.results.audio_drive_file_id = art.drive_file_id
+                manifest.results.audio_size_bytes = art.size_bytes
+                manifest.results.audio_content_hash = art.content_hash
+            manifest.stages.audio_extraction = st
+            manifest.record_stage_update("audio_extraction", st, now_ms=t.created_at)
+        elif t.transition_type == TransitionType.TRANSCRIBED:
+            st = StageStatus(t.payload.get("status", StageStatus.SUCCEEDED.value))
+            if "transcript" in t.payload:
+                manifest.results.transcript = t.payload["transcript"]
+                manifest.results.transcript_model = t.payload.get("transcript_model", "base")
+            manifest.stages.transcription = st
+            manifest.record_stage_update("transcription", st, now_ms=t.created_at)
+        elif t.transition_type == TransitionType.OCR_EXTRACTED:
+            st = StageStatus(t.payload.get("status", StageStatus.SUCCEEDED.value))
+            if "ocr_text" in t.payload:
+                manifest.results.ocr_text = t.payload["ocr_text"]
+            manifest.stages.ocr = st
+            manifest.record_stage_update("ocr", st, now_ms=t.created_at)
+        elif t.transition_type == TransitionType.ANALYZED:
+            st = StageStatus(t.payload.get("status", StageStatus.SUCCEEDED.value))
+            if "analysis" in t.payload:
+                manifest.results.analysis = GeminiAnalysisResult.from_dict(t.payload["analysis"])
+            manifest.stages.gemini_analysis = st
+            manifest.record_stage_update("gemini_analysis", st, now_ms=t.created_at)
+        elif t.transition_type == TransitionType.COMPLETED:
+            manifest.status = JobStatus.COMPLETED
+        elif t.transition_type == TransitionType.FAILED:
+            manifest.status = JobStatus.FAILED
+            manifest.error_message = t.payload.get("error_message", "Job processing failed")
+        elif t.transition_type == TransitionType.CANCELLED:
+            manifest.status = JobStatus.NEEDS_ATTENTION
+            manifest.error_message = t.payload.get("error_message", "Cancelled by user")
+        elif t.transition_type == TransitionType.FORK_FENCED:
+            manifest.status = JobStatus.PROCESSING
+            manifest.claimed_by = t.attempt_id
+            manifest.claimed_at = t.created_at
+
+    if has_fork:
+        manifest.status = JobStatus.NEEDS_ATTENTION
+        manifest.error_message = f"Integrity fork detected in attempt epoch {max_epoch}; epoch advance required"
+
+    return manifest, warnings

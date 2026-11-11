@@ -70,6 +70,9 @@ data class SavedItemEntity(
     val nextAttemptAt: Long? = null,
     val lastError: String? = null,
     val retryCount: Int = 0,
+    val lastSyncedGeneration: Int = 1,
+    val lastSyncedAttemptEpoch: Int = 1,
+    val lastSyncedProjectionVersion: Long = 0L,
 )
 
 @Entity(

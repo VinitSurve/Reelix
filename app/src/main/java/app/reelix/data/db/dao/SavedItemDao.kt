@@ -268,6 +268,14 @@ interface SavedItemDao {
         now: Long,
     )
 
+    @Query(
+        """
+        UPDATE saved_items SET lastSyncedGeneration = :gen, lastSyncedAttemptEpoch = :epoch,
+            lastSyncedProjectionVersion = :ver, updatedAt = :now WHERE id = :id
+        """,
+    )
+    suspend fun updateSyncDimensions(id: String, gen: Int, epoch: Int, ver: Long, now: Long)
+
     @Query("SELECT id FROM saved_items WHERE analysisStatus = 'NOT_CONFIGURED' OR analysisStatus = 'FAILED'")
     suspend fun idsAwaitingAnalysisProvider(): List<String>
 }

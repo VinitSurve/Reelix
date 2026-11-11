@@ -7,9 +7,9 @@ import random
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .config import WorkerConfig
 from .models import (
@@ -18,7 +18,10 @@ from .models import (
     JobStatus,
     MediaInfo,
     StageStatus,
+    TransitionRecord,
+    TransitionType,
     compute_file_sha256,
+    fold_transitions,
 )
 from .stages.audio_extractor import FFmpegAudioExtractor
 from .stages.downloader import DownloadStatus, MediaDownloader, YtDlpDownloader
@@ -159,6 +162,14 @@ class CloudProcessingPipeline:
         self.downloader = downloader or YtDlpDownloader()
         self.ocr_extractor = ocr_extractor or VisualTextExtractor()
         self._current_heartbeat: Optional[ContinuousHeartbeatManager] = None
+        self._attempt_seq: Dict[str, int] = {}
+        self._last_transition_id: Dict[str, str] = {}
+        self._last_transition_hash: Dict[str, str] = {}
+
+    def _next_seq(self, item_id: str) -> int:
+        cur = self._attempt_seq.get(item_id, 0) + 1
+        self._attempt_seq[item_id] = cur
+        return cur
 
     def _is_cancelled(self, job: Optional[JobManifest] = None) -> bool:
         """Returns True if the active worker lease has been cancelled, lost, or expired."""
@@ -193,7 +204,7 @@ class CloudProcessingPipeline:
         artifact: Optional[ArtifactRef] = None,
         error: Optional[str] = None,
     ) -> bool:
-        """Atomically updates stage state in coordinator and persists manifest."""
+        """Atomically updates stage state in coordinator, logs transition, and persists manifest."""
         if self._is_cancelled(job):
             logger.warning("Rejecting stage update for %s on job %s: worker lease cancelled/lost", stage, job.item_id)
             return False
@@ -202,6 +213,51 @@ class CloudProcessingPipeline:
         if artifact:
             job.artifacts[stage] = artifact
         job.updated_at = int(time.time() * 1000)
+
+        # Append stage transition record if succeeded or skipped
+        stage_type_map = {
+            "acquisition": TransitionType.ACQUIRE,
+            "audio_extraction": TransitionType.AUDIO_EXTRACTED,
+            "transcription": TransitionType.TRANSCRIBED,
+            "ocr": TransitionType.OCR_EXTRACTED,
+            "gemini_analysis": TransitionType.ANALYZED,
+        }
+        if status in (StageStatus.SUCCEEDED, StageStatus.SKIPPED) and stage in stage_type_map:
+            ttype = stage_type_map[stage]
+            payload: Dict[str, Any] = {"status": status.value}
+            if artifact:
+                payload["artifact"] = artifact.to_dict()
+            if stage == "acquisition" and job.media:
+                payload["media"] = asdict(job.media) if hasattr(job.media, "__dataclass_fields__") else {}
+            elif stage == "transcription" and job.results.transcript:
+                payload["transcript"] = job.results.transcript
+                payload["transcript_model"] = job.results.transcript_model
+            elif stage == "ocr" and job.results.ocr_text:
+                payload["ocr_text"] = job.results.ocr_text
+            elif stage == "gemini_analysis" and job.results.analysis:
+                payload["analysis"] = asdict(job.results.analysis) if hasattr(job.results.analysis, "__dataclass_fields__") else {}
+
+            seq = self._next_seq(job.item_id)
+            prev_id = self._last_transition_id.get(job.item_id)
+            prev_hash = self._last_transition_hash.get(job.item_id)
+            trans = TransitionRecord(
+                item_id=job.item_id,
+                generation=job.generation,
+                attempt_epoch=job.active_attempt_epoch or 1,
+                transition_seq=seq,
+                transition_type=ttype,
+                attempt_id=self.config.runner_id,
+                previous_transition_id=prev_id,
+                previous_hash=prev_hash,
+                payload=payload,
+                created_at=job.updated_at,
+            )
+            self.storage.append_transition(trans)
+            self._last_transition_id[job.item_id] = trans.deterministic_transition_id
+            self._last_transition_hash[job.item_id] = trans.compute_transition_hash()
+            job.projection_version = (job.projection_version or 1) + 1
+            job.last_transition_id = trans.deterministic_transition_id
+            job.last_transition_hash = trans.compute_transition_hash()
 
         if self.coordinator:
             if not self.coordinator.update_stage_progress(
@@ -220,6 +276,28 @@ class CloudProcessingPipeline:
             return False
 
         return True
+
+    def _record_completion_transition(self, job: JobManifest) -> None:
+        """Appends a terminal COMPLETED transition record to immutable storage and updates projection fields."""
+        seq = self._next_seq(job.item_id)
+        comp_trans = TransitionRecord(
+            item_id=job.item_id,
+            generation=job.generation,
+            attempt_epoch=job.active_attempt_epoch or 1,
+            transition_seq=seq,
+            transition_type=TransitionType.COMPLETED,
+            attempt_id=self.config.runner_id,
+            previous_transition_id=self._last_transition_id.get(job.item_id),
+            previous_hash=self._last_transition_hash.get(job.item_id),
+            payload={"completed_at": job.updated_at},
+            created_at=job.updated_at,
+        )
+        self.storage.append_transition(comp_trans)
+        self._last_transition_id[job.item_id] = comp_trans.deterministic_transition_id
+        self._last_transition_hash[job.item_id] = comp_trans.compute_transition_hash()
+        job.projection_version = (job.projection_version or 1) + 1
+        job.last_transition_id = comp_trans.deterministic_transition_id
+        job.last_transition_hash = comp_trans.compute_transition_hash()
 
     def run_batch(self) -> BatchRunSummary:
         """Finds and executes up to max_jobs_per_run pending jobs."""
@@ -253,6 +331,29 @@ class CloudProcessingPipeline:
         logger.info("========================================")
         logger.info("Claiming and processing job %s (source=%s)", job.item_id, job.source)
         logger.info("========================================")
+
+        # 1. Fold existing transitions to reconstruct authoritative in-memory state before execution
+        existing_transitions = self.storage.list_transitions(job.item_id)
+        if existing_transitions:
+            folded, warnings = fold_transitions(job.item_id, existing_transitions, base_manifest=job)
+            for w in warnings:
+                logger.warning("Transition log warning for %s: %s", job.item_id, w)
+            if folded.status == JobStatus.COMPLETED:
+                logger.info("Job %s is already settled COMPLETED according to transition log; skipping", job.item_id)
+                self.storage.update_job(folded)
+                return False
+            for k, v in folded.__dict__.items():
+                setattr(job, k, v)
+
+        gen_transitions = [t for t in existing_transitions if t.generation == job.generation]
+        if gen_transitions:
+            highest_epoch = max(t.attempt_epoch for t in gen_transitions)
+            active_epoch = highest_epoch + 1
+        else:
+            active_epoch = getattr(job, "active_attempt_epoch", 1) or 1
+
+        job.active_attempt_epoch = active_epoch
+        job.active_generation = job.generation
 
         now_ms = int(time.time() * 1000)
         job.status = JobStatus.PROCESSING
@@ -288,6 +389,31 @@ class CloudProcessingPipeline:
                     job.item_id,
                 )
                 return False
+
+        # Emit CLAIM transition record
+        claim_seq = 1
+        self._attempt_seq[job.item_id] = claim_seq
+        prev_transition = existing_transitions[-1] if existing_transitions else None
+        prev_id = prev_transition.deterministic_transition_id if prev_transition else None
+        prev_hash = prev_transition.compute_transition_hash() if prev_transition else None
+        claim_trans = TransitionRecord(
+            item_id=job.item_id,
+            generation=job.generation,
+            attempt_epoch=active_epoch,
+            transition_seq=claim_seq,
+            transition_type=TransitionType.CLAIM,
+            attempt_id=self.config.runner_id,
+            previous_transition_id=prev_id,
+            previous_hash=prev_hash,
+            payload={"claimed_at": now_ms, "lease_timeout_ms": self.config.lease_timeout_ms},
+            created_at=now_ms,
+        )
+        self.storage.append_transition(claim_trans)
+        self._last_transition_id[job.item_id] = claim_trans.deterministic_transition_id
+        self._last_transition_hash[job.item_id] = claim_trans.compute_transition_hash()
+        job.projection_version = (job.projection_version or 1) + 1
+        job.last_transition_id = claim_trans.deterministic_transition_id
+        job.last_transition_hash = claim_trans.compute_transition_hash()
 
         job_dir = self.config.work_dir / f"{job.item_id}_gen{job.generation}"
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -637,6 +763,7 @@ class CloudProcessingPipeline:
                     job.status = JobStatus.COMPLETED
                     job.error_message = None
                     job.updated_at = int(time.time() * 1000)
+                    self._record_completion_transition(job)
                     if self.coordinator:
                         self.coordinator.complete_job(job.item_id, self.config.runner_id, job)
                     if not self.storage.update_job(job):
@@ -650,6 +777,7 @@ class CloudProcessingPipeline:
                     job.status = JobStatus.COMPLETED
                     job.error_message = None
                     job.updated_at = int(time.time() * 1000)
+                    self._record_completion_transition(job)
                     if self.coordinator:
                         self.coordinator.complete_job(job.item_id, self.config.runner_id, job)
                     if not self.storage.update_job(job):
@@ -698,6 +826,28 @@ class CloudProcessingPipeline:
                 if job_dir.exists():
                     shutil.rmtree(job_dir, ignore_errors=True)
 
+    def _record_failure_transition(self, job: JobManifest, error: str) -> None:
+        """Appends a terminal FAILED transition record to immutable storage and updates projection fields."""
+        seq = self._next_seq(job.item_id)
+        fail_trans = TransitionRecord(
+            item_id=job.item_id,
+            generation=job.generation,
+            attempt_epoch=job.active_attempt_epoch or 1,
+            transition_seq=seq,
+            transition_type=TransitionType.FAILED,
+            attempt_id=self.config.runner_id,
+            previous_transition_id=self._last_transition_id.get(job.item_id),
+            previous_hash=self._last_transition_hash.get(job.item_id),
+            payload={"error_message": error, "retry_count": job.retry_count},
+            created_at=job.updated_at,
+        )
+        self.storage.append_transition(fail_trans)
+        self._last_transition_id[job.item_id] = fail_trans.deterministic_transition_id
+        self._last_transition_hash[job.item_id] = fail_trans.compute_transition_hash()
+        job.projection_version = (job.projection_version or 1) + 1
+        job.last_transition_id = fail_trans.deterministic_transition_id
+        job.last_transition_hash = fail_trans.compute_transition_hash()
+
     def _handle_job_failure(
         self,
         job: JobManifest,
@@ -714,6 +864,7 @@ class CloudProcessingPipeline:
             # Permanent error: abort immediately without consuming retries
             job.status = JobStatus.FAILED
             job.next_retry_at = None
+            self._record_failure_transition(job, error)
             logger.error("Job %s failed with permanent error; marked FAILED immediately", job.item_id)
             if self.coordinator:
                 self.coordinator.fail_job(
@@ -738,6 +889,7 @@ class CloudProcessingPipeline:
                 )
             else:
                 job.status = JobStatus.FAILED
+                self._record_failure_transition(job, error)
                 logger.error("Job %s exceeded maximum retries (%d); marked FAILED", job.item_id, job.max_retries)
         else:
             job.status = JobStatus.WAITING_RETRY

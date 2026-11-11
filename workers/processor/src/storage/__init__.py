@@ -6,11 +6,30 @@ import abc
 from pathlib import Path
 from typing import List, Optional
 
-from ..models import JobManifest
+from ..models import JobManifest, TransitionRecord
 
 
 class StorageClient(abc.ABC):
-    """Abstract storage interface for persistent queue and media storage."""
+    """Abstract storage interface for persistent queue, immutable transitions, and media storage."""
+
+    def append_transition(self, transition: TransitionRecord) -> bool:
+        """Appends an immutable transition record to the item's transition log."""
+        return True
+
+    def list_transitions(self, item_id: str) -> List[TransitionRecord]:
+        """Lists all immutable transition records for a specific item ID."""
+        return []
+
+    def find_transition(self, item_id: str, deterministic_transition_id: str) -> Optional[TransitionRecord]:
+        """Finds an existing transition record by its deterministic identity if already present."""
+        for t in self.list_transitions(item_id):
+            if t.deterministic_transition_id == deterministic_transition_id:
+                return t
+        return None
+
+    def rebuild_projection(self, item_id: str) -> Optional[JobManifest]:
+        """Reconstructs and persists the materialized projection jobs/{item_id}.json from transitions."""
+        return None
 
     @abc.abstractmethod
     def list_queued_jobs(self, limit: int = 5) -> List[JobManifest]:

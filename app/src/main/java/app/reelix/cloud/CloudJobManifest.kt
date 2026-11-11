@@ -37,6 +37,12 @@ data class CloudJobManifest(
     val media: CloudMediaInfo? = null,
     val stages: CloudStageStates = CloudStageStates(),
     val results: CloudJobResults = CloudJobResults(),
+    val projectionVersion: Long = 1L,
+    val activeGeneration: Int = 1,
+    val activeAttemptEpoch: Int = 1,
+    val activeAttemptId: String? = null,
+    val lastTransitionId: String? = null,
+    val lastTransitionHash: String? = null,
 ) {
     fun toJson(): String {
         val root = JSONObject()
@@ -44,6 +50,12 @@ data class CloudJobManifest(
         root.put("record_revision", recordRevision)
         root.put("version", version)
         root.put("generation", generation)
+        root.put("projection_version", projectionVersion)
+        root.put("active_generation", activeGeneration)
+        root.put("active_attempt_epoch", activeAttemptEpoch)
+        if (activeAttemptId != null) root.put("active_attempt_id", activeAttemptId)
+        if (lastTransitionId != null) root.put("last_transition_id", lastTransitionId)
+        if (lastTransitionHash != null) root.put("last_transition_hash", lastTransitionHash)
         if (historicalGenerations.isNotEmpty()) root.put("historical_generations", JSONArray(historicalGenerations))
         root.put("job_id", itemId)
         root.put("item_id", itemId)
@@ -167,6 +179,12 @@ data class CloudJobManifest(
             val recRev = root.optLong("record_revision", root.optLong("version", 1L))
             val gen = root.optInt("generation", 1)
             val histGenerations = root.optJSONArray("historical_generations")?.toStringList() ?: emptyList()
+            val projVer = root.optLong("projection_version", root.optLong("version", 1L))
+            val actGen = root.optInt("active_generation", gen)
+            val actEpoch = root.optInt("active_attempt_epoch", 1)
+            val actId = root.optString("active_attempt_id").takeIf { it.isNotBlank() } ?: root.optString("claimed_by").takeIf { it.isNotBlank() }
+            val lastTransId = root.optString("last_transition_id").takeIf { it.isNotBlank() }
+            val lastTransHash = root.optString("last_transition_hash").takeIf { it.isNotBlank() }
 
             return CloudJobManifest(
                 schemaVersion = schemaVer,
@@ -195,6 +213,12 @@ data class CloudJobManifest(
                 media = media,
                 stages = stages,
                 results = results,
+                projectionVersion = projVer,
+                activeGeneration = actGen,
+                activeAttemptEpoch = actEpoch,
+                activeAttemptId = actId,
+                lastTransitionId = lastTransId,
+                lastTransitionHash = lastTransHash,
             )
         }
 
