@@ -1189,6 +1189,77 @@ class TestPipeline(unittest.TestCase):
         self.assertIsNotNone(updated.results.transcript)
         self.assertIsNone(updated.results.analysis)
 
+    def test_worker_loses_lease_before_artifact_publication_aborts_without_upload(self):
+        """If worker lease is cancelled/lost during extraction, pipeline aborts without uploading audio."""
+        job = JobManifest(
+            item_id="item-lease-lost-before-pub",
+            source="URL",
+            original_url="https://www.instagram.com/reel/LeaseLost/",
+            status=JobStatus.QUEUED,
+            generation=2,
+            created_at=1000,
+            updated_at=1000,
+        )
+        self.storage.update_job(job)
+
+        pipeline_ref = []
+
+        class LeasePreemptingExtractor(FakeExtractor):
+            def extract(self, input_media_path, output_wav_path, is_cancelled=None):
+                # Simulate background lease preemption/cancellation while extraction was executing
+                if pipeline_ref[0]._current_heartbeat:
+                    pipeline_ref[0]._current_heartbeat.cancelled_event.set()
+                return super().extract(input_media_path, output_wav_path, is_cancelled=is_cancelled)
+
+        preempting_extractor = LeasePreemptingExtractor()
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            downloader=FakeDownloader(),
+            audio_extractor=preempting_extractor,
+            transcriber=FakeTranscriber(),
+            gemini_analyzer=FakeAnalyzer(),
+        )
+        pipeline_ref.append(pipeline)
+
+        with patch.object(self.storage, "upload_audio", wraps=self.storage.upload_audio) as mock_upload_audio:
+            success = pipeline.process_job(job)
+            self.assertFalse(success, "Pipeline must abort when worker lease is cancelled")
+            mock_upload_audio.assert_not_called()
+
+    def test_legacy_manifest_without_generation_defaults_to_generation_1(self):
+        """Legacy manifests created before generation tracking was introduced default to generation 1."""
+        legacy_json = """{
+            "item_id": "item-legacy-manifest",
+            "source": "URL",
+            "original_url": "https://www.instagram.com/reel/LegacyManifest/",
+            "status": "QUEUED",
+            "created_at": 1000,
+            "updated_at": 1000
+        }"""
+        manifest = JobManifest.from_json(legacy_json)
+        self.assertEqual(1, manifest.generation)
+        self.assertEqual([], manifest.historical_generations)
+
+        self.storage.update_job(manifest)
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            downloader=FakeDownloader(),
+            audio_extractor=FakeExtractor(),
+            transcriber=FakeTranscriber(),
+            gemini_analyzer=FakeAnalyzer(),
+        )
+
+        success = pipeline.process_job(manifest)
+        self.assertTrue(success)
+
+        updated = self.storage.get_job("item-legacy-manifest")
+        self.assertEqual(1, updated.generation)
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+
 
 if __name__ == "__main__":
     unittest.main()

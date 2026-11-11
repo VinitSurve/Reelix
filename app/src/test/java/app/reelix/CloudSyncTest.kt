@@ -17,6 +17,9 @@ import app.reelix.domain.model.ProcessingStage
 import app.reelix.domain.model.ProcessingStatus
 import app.reelix.domain.model.SaveSource
 import app.reelix.domain.model.StageStatus
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.After
@@ -1663,6 +1666,139 @@ class CloudSyncTest {
         assertFalse(res.isSuccess)
 
         // Room must NOT be mutated to QUEUED
+        val item = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(ProcessingStatus.COMPLETED, item.processingStatus)
+    }
+
+    @Test
+    fun concurrentReprocessRequestsSerializedByMutex() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/concurrent/",
+            normalizedUrl = "https://www.instagram.com/p/concurrent",
+            shortcode = "concurrent",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        val gen1Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 1,
+            etag = "mock_etag_gen1",
+            stages = CloudStageStates(
+                acquisition = "SKIPPED",
+                audioExtraction = "SKIPPED",
+                transcription = "SKIPPED",
+                geminiAnalysis = "SKIPPED",
+            ),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = gen1Manifest
+        container.cloudSyncRepository.syncCompletedJobs()
+
+        // Launch concurrent reprocess calls simultaneously within a coroutine scope
+        val results = coroutineScope {
+            (1..5).map {
+                async {
+                    container.cloudSyncRepository.reprocessItemFromScratch(itemId)
+                }
+            }.awaitAll()
+        }
+
+        // All should succeed (first one performs reprocess, subsequent ones hit idempotent guard)
+        assertTrue(results.all { it.isSuccess })
+
+        // Generation must be exactly 2, not incremented repeatedly
+        val finalManifest = container.fakeCloudClient.jobs[itemId]!!
+        assertEquals(2, finalManifest.generation)
+        assertEquals("QUEUED", finalManifest.status)
+
+        // Room must be QUEUED
+        val item = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(ProcessingStatus.QUEUED, item.processingStatus)
+    }
+
+    @Test
+    fun processRecreationIdempotencyReconcilesRoomWhenManifestAlreadyQueued() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/process-recreate/",
+            normalizedUrl = "https://www.instagram.com/p/process-recreate",
+            shortcode = "process-recreate",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        // Simulate state where remote Drive already has Generation 2 QUEUED (from previous process),
+        // but local Room still shows previous COMPLETED state due to process recreation before Room update.
+        val gen2Queued = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "QUEUED",
+            generation = 2,
+            etag = "etag-gen2",
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = gen2Queued
+
+        val res = container.cloudSyncRepository.reprocessItemFromScratch(itemId)
+        assertTrue(res.isSuccess)
+
+        // Generation must remain 2
+        val manifest = container.fakeCloudClient.jobs[itemId]!!
+        assertEquals(2, manifest.generation)
+
+        // Room must be reconciled to QUEUED
+        val item = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(ProcessingStatus.QUEUED, item.processingStatus)
+    }
+
+    @Test
+    fun reprocessItemFailsSafelyWhenEtagMismatchOccurs() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/etag-mismatch/",
+            normalizedUrl = "https://www.instagram.com/p/etag-mismatch",
+            shortcode = "etag-mismatch",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        val gen1Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 1,
+            etag = "stale_etag_v1",
+            stages = CloudStageStates(
+                acquisition = "SKIPPED",
+                audioExtraction = "SKIPPED",
+                transcription = "SKIPPED",
+                geminiAnalysis = "SKIPPED",
+            ),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = gen1Manifest
+        container.cloudSyncRepository.syncCompletedJobs()
+
+        // Simulate another client concurrently updating the remote manifest's ETag right after Android fetched it
+        container.fakeCloudClient.onBeforeSubmit = {
+            val curr = container.fakeCloudClient.jobs[itemId]!!
+            container.fakeCloudClient.jobs[itemId] = curr.copy(etag = "newer_concurrent_etag_v2")
+        }
+
+        val res = container.cloudSyncRepository.reprocessItemFromScratch(itemId)
+        assertFalse("Must fail safely when remote ETag changed concurrently", res.isSuccess)
+
+        // Room must remain unchanged
         val item = container.savedItemRepository.getItem(itemId)!!
         assertEquals(ProcessingStatus.COMPLETED, item.processingStatus)
     }

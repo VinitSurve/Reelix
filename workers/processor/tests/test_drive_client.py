@@ -676,6 +676,242 @@ class TestDriveClient(unittest.TestCase):
         finally:
             local_wav.unlink(missing_ok=True)
 
+    def test_upload_audio_generation_isolation_prevents_gen2_reusing_gen1(self):
+        """Gen 2 extracting identical audio must create a separate {item_id}_gen2.wav and not reuse Gen 1."""
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["audio"] = "audio-folder-id"
+
+        mock_files = mock_service.files()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(b"identical wave audio content between gen 1 and gen 2")
+            f.flush()
+            local_wav = Path(f.name)
+
+        try:
+            # Query for gen 2 file (name = 'item-gen-iso_gen2.wav') returns empty
+            mock_files.list().execute.return_value = {"files": []}
+            mock_files.create().execute.return_value = {"id": "audio-gen2-id"}
+
+            file_id = self.client.upload_audio(local_wav, "item-gen-iso", generation=2)
+            self.assertEqual("audio-gen2-id", file_id)
+
+            # Verify list query was scoped to gen2 file name
+            list_call = mock_files.list.call_args[1]
+            self.assertIn("name = 'item-gen-iso_gen2.wav'", list_call["q"])
+
+            # Verify create file metadata contained generation 2
+            create_call = mock_files.create.call_args[1]
+            self.assertEqual("item-gen-iso_gen2.wav", create_call["body"]["name"])
+            self.assertEqual("2", create_call["body"]["appProperties"]["reelix_generation"])
+        finally:
+            local_wav.unlink(missing_ok=True)
+
+    def test_upload_audio_gen2_retry_reuses_gen2_artifact(self):
+        """A retry within Gen 2 reuses the already-uploaded Gen 2 audio artifact if hash matches."""
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["audio"] = "audio-folder-id"
+
+        mock_files = mock_service.files()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(b"retry wave audio content")
+            f.flush()
+            local_wav = Path(f.name)
+            local_size = local_wav.stat().st_size
+
+        from workers.processor.src.models import compute_file_sha256
+        sha256 = compute_file_sha256(local_wav)
+
+        try:
+            # Query returns existing Gen 2 file
+            mock_files.list().execute.return_value = {
+                "files": [{
+                    "id": "audio-gen2-existing-id",
+                    "name": "item-gen2-retry_gen2.wav",
+                    "size": str(local_size),
+                    "appProperties": {
+                        "reelix_item_id": "item-gen2-retry",
+                        "reelix_sha256": sha256,
+                        "reelix_generation": "2",
+                    }
+                }]
+            }
+
+            file_id = self.client.upload_audio(local_wav, "item-gen2-retry", generation=2)
+            self.assertEqual("audio-gen2-existing-id", file_id)
+            mock_files.create.assert_not_called()
+        finally:
+            local_wav.unlink(missing_ok=True)
+
+    def test_update_job_rejects_with_412_precondition_failed_stale_write(self):
+        """Worker with old ETag is rejected with HTTP 412 by Google Drive when remote manifest was updated."""
+        import httplib2
+        from googleapiclient.errors import HttpError
+
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "manifest-file-id", "name": "item-stale.json", "version": 2, "etag": "etag-v2-after-android"}]
+        }
+
+        # Simulated remote manifest at generation 1
+        remote_manifest = JobManifest(
+            item_id="item-stale",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="runner-1",
+            generation=1,
+            version=1,
+            etag="etag-v2-after-android",
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        # Worker still has older etag-v1
+        worker_job = JobManifest(
+            item_id="item-stale",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="runner-1",
+            generation=1,
+            version=1,
+            etag="etag-v1-old",
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            # Simulate Drive throwing 412 when If-Match header does not match server etag
+            mock_update_req = MagicMock()
+            mock_update_req.headers = {}
+            resp = httplib2.Response({"status": 412, "reason": "Precondition Failed"})
+            http_err = HttpError(resp, b"Precondition Failed: ConditionNotMet")
+            mock_update_req.execute.side_effect = http_err
+            mock_files.update.return_value = mock_update_req
+
+            updated = self.client.update_job(worker_job)
+            self.assertFalse(updated, "update_job must return False when Google Drive returns HTTP 412 Precondition Failed")
+            # Verify If-Match header was passed with worker's expected etag
+            self.assertEqual("etag-v1-old", mock_update_req.headers.get("If-Match"))
+
+    def test_update_job_rejects_stale_worker_with_older_generation(self):
+        """Worker running generation 1 is rejected if remote manifest has been bumped to generation 2."""
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "manifest-file-id", "name": "item-gen-stale.json", "version": 1, "etag": "etag-gen2"}]
+        }
+
+        remote_manifest = JobManifest(
+            item_id="item-gen-stale",
+            source="URL",
+            status=JobStatus.QUEUED,
+            generation=2,
+            version=1,
+            created_at=2000,
+            updated_at=2000,
+        )
+
+        worker_job = JobManifest(
+            item_id="item-gen-stale",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="runner-1",
+            generation=1,
+            version=1,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            updated = self.client.update_job(worker_job)
+            self.assertFalse(updated, "Stale worker with older generation must be rejected!")
+            mock_files.update.assert_not_called()
+
+    def test_claim_job_rejects_with_412_on_concurrent_modification(self):
+        """claim_job passes If-Match and aborts safely if Google Drive rejects with 412."""
+        import httplib2
+        from googleapiclient.errors import HttpError
+
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "claim-file-id", "name": "item-claim.json", "version": 1, "etag": "etag-claim-1"}]
+        }
+
+        remote_manifest = JobManifest(
+            item_id="item-claim",
+            source="URL",
+            status=JobStatus.QUEUED,
+            generation=1,
+            version=1,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        worker_job = JobManifest(
+            item_id="item-claim",
+            source="URL",
+            status=JobStatus.QUEUED,
+            generation=1,
+            version=1,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            resp = httplib2.Response({"status": 412, "reason": "Precondition Failed"})
+            mock_files.update.return_value.execute.side_effect = HttpError(resp, b"Precondition Failed")
+
+            claimed = self.client.claim_job(worker_job, runner_id="test-runner")
+            self.assertFalse(claimed)
+
+    def test_renew_lease_rejects_when_generation_mismatches(self):
+        """renew_lease aborts immediately if remote generation does not match worker generation."""
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "renew-file-id", "name": "item-renew.json", "version": 1, "etag": "etag-renew"}]
+        }
+
+        remote_manifest = JobManifest(
+            item_id="item-renew",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="runner-1",
+            generation=2,
+            claimed_at=int(time.time() * 1000),
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        worker_job = JobManifest(
+            item_id="item-renew",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="runner-1",
+            generation=1,
+            created_at=1000,
+            updated_at=1000,
+        )
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            renewed = self.client.renew_lease("item-renew", "runner-1", job=worker_job)
+            self.assertFalse(renewed, "renew_lease must return False when generation has diverged!")
+
 
 if __name__ == "__main__":
     unittest.main()

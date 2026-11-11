@@ -15,6 +15,8 @@ import app.reelix.domain.model.StageStatus
 import app.reelix.domain.model.TagSource
 import androidx.room.withTransaction
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -28,6 +30,7 @@ class CloudSyncRepository(
 ) {
     private val itemDao = db.savedItemDao()
     private val processingDao = db.processingDao()
+    private val reprocessMutex = Mutex()
 
     suspend fun createOrGetVaultFolder(): Result<String> {
         val result = cloudClient.createOrGetVaultFolder()
@@ -47,101 +50,136 @@ class CloudSyncRepository(
     suspend fun cleanupCrossClientTestProbe(folderId: String, fileId: String): Result<Boolean> =
         cloudClient.cleanupCrossClientTestProbe(folderId, fileId)
 
+    /**
+     * Triggers generation-based reprocessing from scratch for an existing Reelix item.
+     *
+     * Concurrency & Process Recreation Invariants:
+     * 1. Single-process serialization: An in-memory [reprocessMutex] serializes concurrent coroutine
+     *    invocations within the application process, preventing duplicate generation bumps.
+     * 2. Process recreation idempotency: Across Android process recreation, device rotation, or app restarts,
+     *    the remote Google Drive manifest status is checked first. If the remote manifest is already
+     *    `QUEUED` or `PROCESSING` in an active generation, the request safely completes with success
+     *    and reconciles Room state without incrementing the generation again.
+     * 3. Server-enforced conditional write (TOCTOU protection): The submitted [newManifest] carries
+     *    [remoteManifest.etag]. Google Drive and the client enforce `If-Match` conditional updates,
+     *    rejecting stale writes with HTTP 412 if the remote manifest changed concurrently.
+     * 4. Safe Room transactional alignment: Room is only mutated after Google Drive submission succeeds.
+     */
     suspend fun reprocessItemFromScratch(itemId: String): Result<Boolean> = withContext(Dispatchers.IO) {
-        if (!cloudClient.isConfigured()) {
-            return@withContext Result.failure(IllegalStateException("Google Drive cloud client is not configured"))
-        }
-        val item = itemDao.getById(itemId)
-            ?: return@withContext Result.failure(IllegalArgumentException("Item $itemId not found in local database"))
+        reprocessMutex.withLock {
+            if (!cloudClient.isConfigured()) {
+                return@withLock Result.failure(IllegalStateException("Google Drive cloud client is not configured"))
+            }
+            val item = itemDao.getById(itemId)
+                ?: return@withLock Result.failure(IllegalArgumentException("Item $itemId not found in local database"))
 
-        val remoteManifest = cloudClient.fetchJobManifest(itemId)
-            ?: return@withContext Result.failure(IllegalStateException("Authoritative manifest for $itemId not found on Google Drive"))
+            val remoteManifest = cloudClient.fetchJobManifest(itemId)
+                ?: return@withLock Result.failure(IllegalStateException("Authoritative manifest for $itemId not found on Google Drive"))
 
-        // Idempotent guard: if already QUEUED or PROCESSING in active generation, do not duplicate
-        if (remoteManifest.status == "QUEUED" || remoteManifest.status == "PROCESSING") {
-            ReelixLog.d("Item $itemId is already ${remoteManifest.status} in generation ${remoteManifest.generation}; duplicate reprocess ignored")
-            return@withContext Result.success(true)
-        }
+            // Idempotent guard: if already QUEUED or PROCESSING in active generation, do not duplicate
+            if (remoteManifest.status == "QUEUED" || remoteManifest.status == "PROCESSING") {
+                ReelixLog.d("Item $itemId is already ${remoteManifest.status} in generation ${remoteManifest.generation}; duplicate reprocess ignored")
+                if (item.processingStatus != ProcessingStatus.QUEUED && item.processingStatus != ProcessingStatus.PROCESSING) {
+                    val now = clock.now()
+                    db.withTransaction {
+                        processingDao.deleteResultsFor(itemId)
+                        processingDao.resetJobs(itemId, ProcessingStage.entries, now)
+                        itemDao.updateProcessingStatus(
+                            id = itemId,
+                            status = ProcessingStatus.QUEUED,
+                            nextAttemptAt = null,
+                            lastError = null,
+                            now = now,
+                        )
+                        itemDao.setAudioExtractionStatus(itemId, StageStatus.PENDING, now)
+                        itemDao.setTranscriptionStatus(itemId, StageStatus.PENDING, now)
+                        itemDao.setAnalysisStatus(itemId, StageStatus.PENDING, now)
+                        indexer.reindex(itemId)
+                    }
+                }
+                return@withLock Result.success(true)
+            }
 
-        val currentGen = remoteManifest.generation
-        val nextGen = currentGen + 1
-        val now = clock.now()
+            val currentGen = remoteManifest.generation
+            val nextGen = currentGen + 1
+            val now = clock.now()
 
-        // Archive current generation snapshot into historicalGenerations
-        val historicalList = remoteManifest.historicalGenerations.toMutableList()
-        historicalList.add(remoteManifest.toJson())
+            // Archive current generation snapshot into historicalGenerations
+            val historicalList = remoteManifest.historicalGenerations.toMutableList()
+            historicalList.add(remoteManifest.toJson())
 
-        val userTags = db.tagDao().tagsForItem(itemId).map { it.name }
+            val userTags = db.tagDao().tagsForItem(itemId).map { it.name }
 
-        val newManifest = CloudJobManifest(
-            schemaVersion = 1,
-            recordRevision = remoteManifest.recordRevision + 1L,
-            version = 1,
-            generation = nextGen,
-            historicalGenerations = historicalList,
-            itemId = itemId,
-            source = item.source.name,
-            originalUrl = item.originalUrl,
-            caption = item.caption ?: item.userCaption,
-            userNotes = item.userNotes,
-            category = item.category,
-            userTags = userTags,
-            status = "QUEUED",
-            claimedBy = null,
-            claimedAt = null,
-            leaseTimeoutMs = 900_000L,
-            etag = null,
-            createdAt = item.createdAt,
-            updatedAt = now,
-            retryCount = 0,
-            maxRetries = 3,
-            nextRetryAt = null,
-            errorMessage = null,
-            media = null, // Ensure fresh acquisition from scratch
-            stages = CloudStageStates(
-                acquisition = if (!item.originalUrl.isNullOrBlank()) "PENDING" else "SKIPPED",
-                audioExtraction = "PENDING",
-                transcription = "PENDING",
-                ocr = "PENDING",
-                geminiAnalysis = "PENDING",
-            ),
-            results = CloudJobResults(),
-        )
-
-        val submitted = cloudClient.submitJobManifest(newManifest)
-        if (!submitted) {
-            return@withContext Result.failure(IllegalStateException("Failed to submit generation $nextGen manifest to Google Drive"))
-        }
-
-        // Only mutate Room AFTER Google Drive submission succeeds
-        db.withTransaction {
-            processingDao.deleteResultsFor(itemId)
-            processingDao.resetJobs(itemId, ProcessingStage.entries, now)
-
-            itemDao.updateProcessingStatus(
-                id = itemId,
-                status = ProcessingStatus.QUEUED,
-                nextAttemptAt = null,
-                lastError = null,
-                now = now,
-            )
-            itemDao.setAudioExtractionStatus(itemId, StageStatus.PENDING, now)
-            itemDao.setTranscriptionStatus(itemId, StageStatus.PENDING, now)
-            itemDao.setAnalysisStatus(itemId, StageStatus.PENDING, now)
-
-            processingDao.insertEvent(
-                ProcessingEventEntity(
-                    savedItemId = itemId,
-                    stage = null,
-                    status = "REPROCESS_GENERATION_STARTED",
-                    message = "Reprocessing started for generation $nextGen from scratch",
-                    createdAt = now,
+            val newManifest = CloudJobManifest(
+                schemaVersion = 1,
+                recordRevision = remoteManifest.recordRevision + 1L,
+                version = 1,
+                generation = nextGen,
+                historicalGenerations = historicalList,
+                itemId = itemId,
+                source = item.source.name,
+                originalUrl = item.originalUrl,
+                caption = item.caption ?: item.userCaption,
+                userNotes = item.userNotes,
+                category = item.category,
+                userTags = userTags,
+                status = "QUEUED",
+                claimedBy = null,
+                claimedAt = null,
+                leaseTimeoutMs = 900_000L,
+                etag = remoteManifest.etag,
+                createdAt = item.createdAt,
+                updatedAt = now,
+                retryCount = 0,
+                maxRetries = 3,
+                nextRetryAt = null,
+                errorMessage = null,
+                media = null, // Ensure fresh acquisition from scratch
+                stages = CloudStageStates(
+                    acquisition = if (!item.originalUrl.isNullOrBlank()) "PENDING" else "SKIPPED",
+                    audioExtraction = "PENDING",
+                    transcription = "PENDING",
+                    ocr = "PENDING",
+                    geminiAnalysis = "PENDING",
                 ),
+                results = CloudJobResults(),
             )
-            indexer.reindex(itemId)
-        }
 
-        Result.success(true)
+            val submitted = cloudClient.submitJobManifest(newManifest)
+            if (!submitted) {
+                return@withLock Result.failure(IllegalStateException("Failed to submit generation $nextGen manifest to Google Drive"))
+            }
+
+            // Only mutate Room AFTER Google Drive submission succeeds
+            db.withTransaction {
+                processingDao.deleteResultsFor(itemId)
+                processingDao.resetJobs(itemId, ProcessingStage.entries, now)
+
+                itemDao.updateProcessingStatus(
+                    id = itemId,
+                    status = ProcessingStatus.QUEUED,
+                    nextAttemptAt = null,
+                    lastError = null,
+                    now = now,
+                )
+                itemDao.setAudioExtractionStatus(itemId, StageStatus.PENDING, now)
+                itemDao.setTranscriptionStatus(itemId, StageStatus.PENDING, now)
+                itemDao.setAnalysisStatus(itemId, StageStatus.PENDING, now)
+
+                processingDao.insertEvent(
+                    ProcessingEventEntity(
+                        savedItemId = itemId,
+                        stage = null,
+                        status = "REPROCESS_GENERATION_STARTED",
+                        message = "Reprocessing started for generation $nextGen from scratch",
+                        createdAt = now,
+                    ),
+                )
+                indexer.reindex(itemId)
+            }
+
+            Result.success(true)
+        }
     }
 
     suspend fun uploadPendingItem(itemId: String): Boolean = withContext(Dispatchers.IO) {

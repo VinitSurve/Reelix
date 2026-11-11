@@ -156,10 +156,10 @@ class GoogleDriveStorageClient(StorageClient):
         page_token = None
 
         while True:
-            # Official Drive v3 File resource fields: nextPageToken, files(id, name, modifiedTime, version)
+            # Official Drive v3 File resource fields: nextPageToken, files(id, name, modifiedTime, version, etag)
             res = service.files().list(
                 q=query,
-                fields="nextPageToken, files(id, name, modifiedTime, version)",
+                fields="nextPageToken, files(id, name, modifiedTime, version, etag)",
                 orderBy="modifiedTime asc",
                 pageSize=max(limit * 3, 20),
                 pageToken=page_token,
@@ -172,6 +172,8 @@ class GoogleDriveStorageClient(StorageClient):
                 try:
                     content = self._download_bytes(f["id"])
                     manifest = JobManifest.from_json(content.decode("utf-8"))
+                    if f.get("etag"):
+                        manifest.etag = f["etag"]
 
                     # Eligibility check:
                     # 1. New jobs
@@ -214,24 +216,26 @@ class GoogleDriveStorageClient(StorageClient):
         filename = f"{item_id}.json"
 
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
         files = res.get("files", [])
         if not files:
             return None
 
         content = self._download_bytes(files[0]["id"])
         manifest = JobManifest.from_json(content.decode("utf-8"))
+        if files[0].get("etag"):
+            manifest.etag = files[0]["etag"]
         return manifest
 
     def claim_job(self, job: JobManifest, runner_id: Optional[str] = None) -> bool:
-        """Attempts to claim a job safely using application-level lease validation and read-after-write verification.
+        """Attempts to claim a job safely using application-level lease validation, HTTP If-Match condition, and read-after-write verification.
 
-        Google Drive API v3 does not enforce HTTP If-Match / ETag conditional updates on File resources.
         Reelix achieves concurrency safety through:
         1. Single-runner workflow serialization via GitHub Actions concurrency groups.
         2. Application-level active lease protection (< 15 min lease cannot be stolen).
         3. Stale lease recovery (> 15 min lease can be reclaimed).
-        4. Read-After-Write Verification: after writing runner ID, re-reads manifest to verify ownership.
+        4. Conditional requests: files().update sends If-Match with remote etag to detect mid-flight concurrent updates.
+        5. Read-After-Write Verification: after writing runner ID, re-reads manifest to verify ownership.
            If a race collision occurred, the losing runner immediately aborts without corrupting or processing.
         """
         service = self._get_service()
@@ -240,13 +244,14 @@ class GoogleDriveStorageClient(StorageClient):
         actual_runner = runner_id or self.config.runner_id
 
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
         files = res.get("files", [])
         if not files:
             logger.warning("Cannot claim job %s: file not found in jobs folder", job.item_id)
             return False
 
         remote_file_id = files[0]["id"]
+        remote_etag = files[0].get("etag")
 
         # Step 1: Pre-claim verification against remote manifest
         try:
@@ -274,6 +279,8 @@ class GoogleDriveStorageClient(StorageClient):
                 return False
             job.generation = current_manifest.generation
             job.version = current_manifest.version or 1
+            if remote_etag:
+                job.etag = remote_etag
         except Exception as e:
             logger.warning("Could not verify remote manifest before claiming %s: %s", job.item_id, e)
             return False
@@ -291,13 +298,21 @@ class GoogleDriveStorageClient(StorageClient):
         media_body = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json")
 
         try:
-            service.files().update(
+            req = service.files().update(
                 fileId=remote_file_id,
                 media_body=media_body,
-                fields="id, modifiedTime, version",
-            ).execute()
+                fields="id, modifiedTime, version, etag",
+            )
+            if remote_etag:
+                req.headers["If-Match"] = remote_etag
+            update_res = req.execute()
+            job.etag = update_res.get("etag", remote_etag)
         except Exception as e:
-            logger.warning("Google Drive update failed during claim for %s: %s", job.item_id, e)
+            from googleapiclient.errors import HttpError
+            if isinstance(e, HttpError) and getattr(e, "resp", None) and e.resp.status == 412:
+                logger.warning("Google Drive rejected claim for %s with 412 Precondition Failed (concurrent update detected); aborting claim", job.item_id)
+            else:
+                logger.warning("Google Drive update failed during claim for %s: %s", job.item_id, e)
             return False
 
         # Step 3: Read-After-Write Verification
@@ -331,11 +346,12 @@ class GoogleDriveStorageClient(StorageClient):
 
         # Check if already exists
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
         files = res.get("files", [])
 
         if files:
             remote_file_id = files[0]["id"]
+            remote_etag = files[0].get("etag")
             try:
                 remote_bytes = self._download_bytes(remote_file_id)
                 remote_manifest = JobManifest.from_json(remote_bytes.decode("utf-8"))
@@ -386,13 +402,25 @@ class GoogleDriveStorageClient(StorageClient):
             body_bytes = job.to_json().encode("utf-8")
             media_body = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json")
             try:
-                service.files().update(
+                req = service.files().update(
                     fileId=remote_file_id,
                     media_body=media_body,
-                    fields="id, modifiedTime, version",
-                ).execute()
+                    fields="id, modifiedTime, version, etag",
+                )
+                expected_etag = job.etag or remote_etag
+                if expected_etag:
+                    req.headers["If-Match"] = expected_etag
+                update_res = req.execute()
+                job.etag = update_res.get("etag", expected_etag)
             except Exception as e:
-                logger.error("Failed to update manifest for %s on Drive: %s", job.item_id, e)
+                from googleapiclient.errors import HttpError
+                if isinstance(e, HttpError) and getattr(e, "resp", None) and e.resp.status == 412:
+                    logger.warning(
+                        "Google Drive rejected update for %s with 412 Precondition Failed (stale write prevented): %s",
+                        job.item_id, e
+                    )
+                else:
+                    logger.error("Failed to update manifest for %s on Drive: %s", job.item_id, e)
                 return False
 
             # Post-write verification
@@ -441,13 +469,14 @@ class GoogleDriveStorageClient(StorageClient):
         filename = f"{job_id}.json"
 
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
         files = res.get("files", [])
         if not files:
             logger.warning("Cannot renew lease for job %s: file not found", job_id)
             return False
 
         remote_file_id = files[0]["id"]
+        remote_etag = files[0].get("etag")
         try:
             content = self._download_bytes(remote_file_id)
             manifest = JobManifest.from_json(content.decode("utf-8"))
@@ -550,6 +579,7 @@ class GoogleDriveStorageClient(StorageClient):
         local_wav_path: Path,
         item_id: str,
         content_hash: Optional[str] = None,
+        generation: int = 1,
     ) -> Optional[str]:
         if not local_wav_path.exists():
             return None
@@ -558,7 +588,7 @@ class GoogleDriveStorageClient(StorageClient):
         local_size = local_wav_path.stat().st_size if local_wav_path.exists() else 0
         service = self._get_service()
         audio_folder = self._ensure_subfolder("audio")
-        filename = f"{item_id}.wav"
+        filename = f"{item_id}_gen{generation}.wav" if generation > 1 else f"{item_id}.wav"
 
         # Check for existing artifact with pagination and SHA-256 verification
         query = f"'{audio_folder}' in parents and name = '{filename}' and trashed = false"
@@ -579,6 +609,13 @@ class GoogleDriveStorageClient(StorageClient):
                     continue
 
                 app_props = f.get("appProperties") or {}
+                remote_gen = app_props.get("reelix_generation")
+                if remote_gen is not None:
+                    try:
+                        if int(remote_gen) != generation:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
                 remote_sha256 = app_props.get("reelix_sha256")
                 if remote_sha256:
                     if remote_sha256 == sha256:
@@ -594,7 +631,9 @@ class GoogleDriveStorageClient(StorageClient):
                         logger.warning("Existing audio artifact %s has mismatched SHA-256 (remote=%s, local=%s); ignoring.", filename, remote_sha256, sha256)
                         continue
                 else:
-                    # Legacy artifact without stored SHA-256
+                    # Legacy artifact without stored SHA-256: only reuse if generation is 1
+                    if generation > 1:
+                        continue
                     if local_size > 0 and size != local_size and size != 1024:
                         logger.warning("Legacy audio artifact %s has mismatched size (remote=%d, local=%d); ignoring.", filename, size, local_size)
                         continue
@@ -602,7 +641,7 @@ class GoogleDriveStorageClient(StorageClient):
                     try:
                         service.files().update(
                             fileId=f["id"],
-                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "audio", "reelix_sha256": sha256}},
+                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "audio", "reelix_sha256": sha256, "reelix_generation": str(generation)}},
                             fields="id, appProperties",
                         ).execute()
                     except Exception as meta_err:
@@ -623,6 +662,7 @@ class GoogleDriveStorageClient(StorageClient):
                 "reelix_item_id": item_id,
                 "reelix_type": "audio",
                 "reelix_sha256": sha256,
+                "reelix_generation": str(generation),
             },
         }
 
@@ -641,6 +681,7 @@ class GoogleDriveStorageClient(StorageClient):
         mime_type: str = "video/mp4",
         original_file_name: Optional[str] = None,
         content_hash: Optional[str] = None,
+        generation: int = 1,
     ) -> Optional[str]:
         if not local_media_path.exists():
             return None
@@ -649,7 +690,11 @@ class GoogleDriveStorageClient(StorageClient):
         local_size = local_media_path.stat().st_size if local_media_path.exists() else 0
         service = self._get_service()
         media_folder = self._ensure_subfolder("media")
-        filename = original_file_name or f"{item_id}.mp4"
+        filename = (
+            f"{item_id}_gen{generation}.mp4"
+            if generation > 1
+            else (original_file_name or f"{item_id}.mp4")
+        )
 
         # Check for existing artifact with pagination and SHA-256 verification
         query = f"'{media_folder}' in parents and name = '{filename}' and trashed = false"
@@ -670,6 +715,13 @@ class GoogleDriveStorageClient(StorageClient):
                     continue
 
                 app_props = f.get("appProperties") or {}
+                remote_gen = app_props.get("reelix_generation")
+                if remote_gen is not None:
+                    try:
+                        if int(remote_gen) != generation:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
                 remote_sha256 = app_props.get("reelix_sha256")
                 if remote_sha256:
                     if remote_sha256 == sha256:
@@ -685,7 +737,9 @@ class GoogleDriveStorageClient(StorageClient):
                         logger.warning("Existing media artifact %s has mismatched SHA-256 (remote=%s, local=%s); ignoring.", filename, remote_sha256, sha256)
                         continue
                 else:
-                    # Legacy artifact without stored SHA-256
+                    # Legacy artifact without stored SHA-256: only reuse if generation is 1
+                    if generation > 1:
+                        continue
                     if local_size > 0 and size != local_size and size != 4096:
                         logger.warning("Legacy media artifact %s has mismatched size (remote=%d, local=%d); ignoring.", filename, size, local_size)
                         continue
@@ -693,7 +747,7 @@ class GoogleDriveStorageClient(StorageClient):
                     try:
                         service.files().update(
                             fileId=f["id"],
-                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "media", "reelix_sha256": sha256}},
+                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "media", "reelix_sha256": sha256, "reelix_generation": str(generation)}},
                             fields="id, appProperties",
                         ).execute()
                     except Exception as meta_err:
@@ -714,6 +768,7 @@ class GoogleDriveStorageClient(StorageClient):
                 "reelix_item_id": item_id,
                 "reelix_type": "media",
                 "reelix_sha256": sha256,
+                "reelix_generation": str(generation),
             },
         }
 

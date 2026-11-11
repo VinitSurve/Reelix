@@ -384,12 +384,22 @@ class GoogleDriveCloudClient(
             if (existingId != null) {
                 // Update
                 val updateUrl = "https://www.googleapis.com/upload/drive/v3/files/$existingId?uploadType=media"
-                val request = Request.Builder()
+                val reqBuilder = Request.Builder()
                     .url(updateUrl)
                     .addHeader("Authorization", "Bearer $token")
+                if (!manifest.etag.isNullOrBlank()) {
+                    reqBuilder.addHeader("If-Match", manifest.etag)
+                }
+                val request = reqBuilder
                     .patch(jsonContent.toRequestBody("application/json".toMediaType()))
                     .build()
-                client.newCall(request).execute().use { it.isSuccessful }
+                client.newCall(request).execute().use { resp ->
+                    if (resp.code == 412) {
+                        ReelixLog.w("Manifest update rejected with HTTP 412 Precondition Failed for ${manifest.itemId}; remote file was modified")
+                        return@withContext false
+                    }
+                    resp.isSuccessful
+                }
             } else {
                 // Create
                 val createMeta = JSONObject().apply {
@@ -432,7 +442,13 @@ class GoogleDriveCloudClient(
             client.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext null
                 val body = resp.body?.string() ?: return@withContext null
-                CloudJobManifest.fromJson(body)
+                val parsed = CloudJobManifest.fromJson(body)
+                val headerEtag = resp.header("ETag")?.trim('"', ' ')?.takeIf { it.isNotBlank() }
+                if (parsed.etag == null && headerEtag != null) {
+                    parsed.copy(etag = headerEtag)
+                } else {
+                    parsed
+                }
             }
         } catch (e: Exception) {
             ReelixLog.w("Failed to fetch job manifest for $itemId", e)
@@ -1036,10 +1052,21 @@ class MockCloudSyncClient(
     }
 
     var submitResult: Boolean = true
+    var checkEtag: Boolean = true
+    var onBeforeSubmit: (() -> Unit)? = null
+    private var etagCounter = 0
 
     override suspend fun submitJobManifest(manifest: CloudJobManifest): Boolean {
+        onBeforeSubmit?.invoke()
         if (!submitResult) return false
-        jobs[manifest.itemId] = manifest
+        val existing = jobs[manifest.itemId]
+        if (checkEtag && existing != null && !manifest.etag.isNullOrBlank() && !existing.etag.isNullOrBlank() && manifest.etag != existing.etag) {
+            // Simulated HTTP 412 Precondition Failed
+            return false
+        }
+        etagCounter++
+        val newEtag = "mock_etag_${manifest.itemId}_$etagCounter"
+        jobs[manifest.itemId] = manifest.copy(etag = newEtag)
         return true
     }
 

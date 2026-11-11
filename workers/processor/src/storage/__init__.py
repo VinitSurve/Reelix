@@ -58,8 +58,9 @@ class StorageClient(abc.ABC):
         local_wav_path: Path,
         item_id: str,
         content_hash: Optional[str] = None,
+        generation: int = 1,
     ) -> Optional[str]:
-        """Uploads an extracted audio WAV file with content hash deduplication."""
+        """Uploads an extracted audio WAV file with generation isolation and content hash deduplication."""
         pass
 
     @abc.abstractmethod
@@ -70,6 +71,7 @@ class StorageClient(abc.ABC):
         mime_type: str = "video/mp4",
         original_file_name: Optional[str] = None,
         content_hash: Optional[str] = None,
+        generation: int = 1,
     ) -> Optional[str]:
-        """Uploads acquired media file to cloud storage with content hash deduplication."""
+        """Uploads acquired media file to cloud storage with generation isolation and content hash deduplication."""
         pass

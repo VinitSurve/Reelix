@@ -323,6 +323,9 @@ class CloudProcessingPipeline:
                             return False
 
                         if dl_res.is_success and dl_res.media_path is not None:
+                            if self._is_cancelled(job):
+                                logger.warning("Aborting job %s: worker lease lost before media upload", job.item_id)
+                                return False
                             media_hash = compute_file_sha256(dl_res.media_path)
                             logger.info("Uploading acquired media to persistent storage (sha256=%s)...", media_hash)
                             drive_file_id = self.storage.upload_media(
@@ -331,6 +334,7 @@ class CloudProcessingPipeline:
                                 mime_type=dl_res.mime_type,
                                 original_file_name=dl_res.file_name,
                                 content_hash=media_hash,
+                                generation=job.generation,
                             )
                             if not drive_file_id:
                                 self._update_stage(job, "acquisition", StageStatus.FAILED, error="Failed to upload acquired media")
@@ -445,12 +449,16 @@ class CloudProcessingPipeline:
                         self._update_stage(job, "audio_extraction", StageStatus.FAILED, error=extract_res.error)
                         return self._handle_job_failure(job, f"Audio extraction failed: {extract_res.error}")
                     else:
+                        if self._is_cancelled(job):
+                            logger.warning("Aborting job %s: worker lease lost before audio upload", job.item_id)
+                            return False
                         audio_hash = compute_file_sha256(local_wav_path)
                         logger.info("Uploading extracted WAV to persistent cloud storage (sha256=%s)...", audio_hash)
                         audio_drive_id = self.storage.upload_audio(
                             local_wav_path,
                             job.item_id,
                             content_hash=audio_hash,
+                            generation=job.generation,
                         )
                         job.results.audio_drive_file_id = audio_drive_id
                         job.results.audio_size_bytes = extract_res.size_bytes
