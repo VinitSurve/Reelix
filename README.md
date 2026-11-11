@@ -2,7 +2,73 @@
 
 Reelix is a single-user, local-first Android knowledge vault for capturing, organizing, enriching, transcribing, and searching informative Instagram Reels, posts, and shared media files.
 
-**100% free to operate**: no subscriptions, no payment cards, no billing accounts, no third-party cloud lock-in, and zero scraping of unofficial Instagram private APIs.
+Designed for personal operation using standard platform tiers (Google Drive, GitHub Actions, and Google AI Studio) without paid server infrastructure or scraping unofficial private APIs.
+
+---
+
+## Architecture Hardening: Distributed Reliability & Single Production Worker Engine
+
+Phase 3 delivers production-grade distributed reliability, robust crash recovery, and content-addressable storage integrity:
+
+- **Single Production Worker Guarantee:**
+  - **GitHub Actions is the Sole Authorized Production Worker:** All production job processing runs in GitHub Actions, serialized via concurrency group `reelix-processing` (`cancel-in-progress: false`). This guarantees exactly one active worker executes at any point in time.
+  - **Local Mac Production Job Claiming Disabled:** Running the worker locally against a live Google Drive production queue without GitHub Actions environment variables fails fast with exit code `1`. This eliminates split-brain manifest corruption and competing runner collisions.
+- **Continuous Background Heartbeat Renewal:**
+  - **Active Lease Extension:** A background daemon thread (`ContinuousHeartbeatManager`) continuously renews the 15-minute manifest lease every 30 seconds during long-running tasks (yt-dlp acquisition, FFmpeg extraction, Whisper transcription, visual OCR, Gemini analysis, and large file uploads).
+  - **Cancellation Propagation:** If a lease renewal fails or the lease is preempted, a cancellation event is signaled immediately. Long-running subprocesses (FFmpeg, OCR) are terminated/killed, and any subsequent stage writes or completion marking are blocked.
+- **SHA-256 Content-Addressable Artifact Integrity:**
+  - **Streaming SHA-256 Verification:** Media and audio files compute streaming SHA-256 digests. Hashes are persisted in Google Drive metadata (`appProperties: {"reelix_sha256": ...}`) and recorded in manifest `ArtifactRef.content_hash`.
+  - **Deduplication & Tamper Detection:** Before uploading, the worker verifies if an artifact with matching SHA-256 already exists in Drive and reuses it without re-uploading. Downloads verify file integrity against expected hashes; mismatched or corrupted downloads are immediately unlinked.
+  - **Legacy Compatibility:** Pre-existing Drive artifacts uploaded without hash metadata are seamlessly verified and upgraded with `reelix_sha256` on first encounter.
+- **9-Point Idempotent Crash Recovery:**
+  - Complete stage-level durable recovery tested across all failure injection points:
+    1. Post-acquisition crash -> reuses downloaded media without re-downloading.
+    2. Post-inspection crash -> preserves duration and resolution metadata.
+    3. Post-audio-extraction crash -> reuses existing WAV artifact without re-running FFmpeg.
+    4. Post-transcription crash -> reuses stored speech transcript without re-running Whisper.
+    5. Post-OCR crash -> reuses on-screen visual text without re-extracting frames.
+    6. Post-Gemini crash -> reuses structured AI knowledge.
+    7. Post-upload crash -> preserves artifact references without duplicate uploads.
+    8. Pre-completion crash -> safely finalizes `COMPLETED` state without data loss.
+    9. Transient Gemini HTTP 503 recovery -> retries analysis with backoff while preserving media and transcripts.
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    REELIX PRODUCTION HYBRID ARCHITECTURE                     │
+│                        Durable Cloud Processing Flow                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+   [ Instagram / Share Sheet ]
+                │
+                ▼
+   [ Android Reelix App ]
+    - User shares post URL or media
+    - Room SQLite stores author data locally (never overwritten)
+    - Submits JobManifest to Google Drive 'Reelix_Vault/jobs/<item_id>.json'
+                │
+                ▼
+   [ Google Drive Queue & Storage ]
+    ├── jobs/<item_id>.json   (Authoritative queue, atomic read-after-write lease)
+    ├── media/<item_id>_*     (Raw media tagged with SHA-256 appProperties)
+    └── audio/<item_id>.wav   (16kHz mono audio tagged with SHA-256 appProperties)
+                │
+                ▼
+   [ GitHub Actions Runner (Sole Production Worker) ]
+    - Concurrency lock: group: reelix-processing, cancel-in-progress: false
+    - ContinuousHeartbeatManager: 30s background lease renewal
+    - yt-dlp media downloader / SHA-256 upload
+    - FFmpeg 16kHz audio extraction + cancellation listener
+    - OpenAI Whisper base transcription + cache
+    - Tesseract OCR frame analysis + cancellation listener
+    - Google Gemini AI (gemini-3.6-flash / gemini-3.8-flash)
+    - Updates JobManifest to COMPLETED or WAITING_RETRY
+                │
+                ▼
+   [ Android Reelix Sync ]
+    - WorkManager CloudSyncWorker / User Manual Sync
+    - Pulls completed JobManifest from Google Drive
+    - Updates Room database (transcript, AI summary, topics, tags)
+    - Reindexes SQLite FTS4 for full-text offline search
+```
 
 ---
 
@@ -34,10 +100,11 @@ Phase 3.5 delivers complete upload identity isolation in Google Drive and robust
   - `gemini-3.8-flash` (Allowed Alternative)
   Live integration verification is strictly restricted to `gemini-3.6-flash`. Automatic fallback to other models is forbidden and fails fast before any API call.
 - **Single-Writer Concurrency Architecture:**
-  Google Drive API v3 does not offer native atomic CAS or server-side file locking. Concurrency is guaranteed via:
-  1. *Workflow Serialization:* GitHub Actions enforces `concurrency: group: reelix-processing, cancel-in-progress: false`, ensuring exactly one cloud worker runs at any time.
-  2. *Local Execution Safeguard:* Local CLI worker runs require explicit `--confirm-local` flag or `ALLOW_LOCAL_WORKER=1` environment variable to prevent accidental concurrent writes against active cloud queues.
+  Google Drive API v3 does not offer native atomic CAS or server-side file locking across independent machines. Concurrency is guaranteed via:
+  1. *Workflow Serialization:* GitHub Actions enforces `concurrency: group: reelix-processing, cancel-in-progress: false, queue: max`, ensuring exactly one cloud worker runs at any time and queues pending triggers up to 100 runs without dropping.
+  2. *Local Execution Safeguard:* Local Mac worker claiming against live production Google Drive is strictly disabled. Running `python -m workers.processor.src.main` outside GitHub Actions against production credentials exits with a fatal error (`exit code 1`). For local testing, `REELIX_MOCK_MODE=1` must be used.
   3. *TOCTOU Guardrails:* Workers verify remote lease ownership, settled statuses (`COMPLETED`, `FAILED`, `PARTIAL`), and version monotonicity before committing stage updates.
+  4. *Distributed Locking Boundary:* GitHub Actions concurrency serializes GitHub runners only; distributed mutual exclusion across nodes is maintained via atomic Drive manifest lease claims and continuous heartbeats.
 - **URL-Only / Manual-Input-Required Processing:**
   When a link is shared from Instagram without public media or caption text:
   1. Reelix detects URL-only jobs before calling Gemini, avoiding empty-text API failures and infinite retry loops.
@@ -117,15 +184,28 @@ Phase 3.5 delivers complete upload identity isolation in Google Drive and robust
 
 ---
 
-## 100% Free-Tier Architecture Verification
+## Service Boundaries, Storage Quotas & Platform Limits
 
-Reelix strictly adheres to the zero-cost principle:
-1. **Google Drive API (v3):** Standard Google accounts provide 15GB of persistent storage. Enabling Google Drive API in a personal GCP project requires **no billing account and no payment card**.
-2. **Google AI Studio (Gemini 3.6 Flash & Gemini 3.8 Flash):** `gemini-3.6-flash` is available on Google AI Studio's **Standard Free Tier** with free input and output tokens, 1M token context windows, rate limits sufficient for personal usage, and **$0 cost** with no billing account required.
-3. **GitHub Actions:** GitHub provides free runner minutes monthly for workflows.
-4. **Whisper:** Open-source OpenAI Whisper runs on GitHub Actions CPU runners with weight caching (`actions/cache@v4`).
+Reelix is designed for personal use leveraging standard platform tiers without requiring custom server infrastructure. However, each integrated service operates under distinct boundaries, storage allowances, and usage quotas:
 
-**Total Operating Cost: $0.00 / month forever.**
+1. **User's Google Drive Account Storage:**
+   - Saved videos, audio extractions, and job manifests are stored directly in your personal Google Drive (`Reelix_Vault/`).
+   - Storage consumption counts against your Google Account quota (15 GB standard free allowance shared across Google Drive, Gmail, and Google Photos, or your paid Google One storage subscription).
+   - If your Google Drive storage becomes full, uploads will fail until storage is freed or expanded.
+2. **Google Drive API Quotas (v3):**
+   - Personal Google Cloud projects are subject to Google Drive API query rate limits: typically 12,000 requests per minute per project and 20,000 queries per 100 seconds per user.
+   - Operations stay well within these limits during typical single-user usage, but rapid loops or massive concurrent requests will trigger HTTP 403/429 rate limit errors.
+3. **GitHub Actions Runner Limits:**
+   - Standard personal GitHub accounts receive free runner minutes (e.g. 2,000 minutes/month for private repositories; public repositories receive standard hosted runner minutes subject to GitHub's Acceptable Use Policy).
+   - Workflows are subject to GitHub runner job timeouts (max 360 minutes per job, configured to 45 minutes in Reelix) and concurrency limits (max 20 concurrent jobs on free tiers).
+   - Reelix serializes queue processing (`concurrency: group: reelix-processing, queue: max`) to eliminate overlapping runner executions.
+4. **Google Gemini API Limits (Google AI Studio):**
+   - Free-tier API keys for `gemini-3.6-flash` and `gemini-3.8-flash` operate under Google AI Studio rate limits:
+     - 15 Requests Per Minute (RPM)
+     - 1,500 Requests Per Day (RPD)
+     - 1,000,000 Tokens Per Minute (TPM)
+   - Heavy usage or sudden bursts of requests will return HTTP 429 (Rate Limit Exceeded) or HTTP 503 (Temporary High Demand). Reelix handles these gracefully via exponential backoff with jitter and stage preservation.
+   - Platform free tiers, quotas, and terms of service are controlled by Google and GitHub and may evolve over time. Reelix treats AI analysis as an optional enrichment layer so the vault remains functional even when Gemini is temporarily unavailable.
 
 ---
 
@@ -190,13 +270,14 @@ In your GitHub repository (`https://github.com/VinitSurve/Reelix`), navigate to 
 ### 1. Run Cloud Worker Python Tests
 ```bash
 python3 -m unittest discover -s workers/processor/tests -v
+# or via pytest:
+PYTHONPATH=. pytest workers/processor/tests
 ```
 Output:
 ```text
-Ran 48 tests in 0.373s
-OK (skipped=5)
+163 passed, 5 skipped in 13.18s
 ```
-*(43 unit & mock integration tests passed; 5 live external tests explicitly skipped when live credentials are not set)*
+*(163 unit & mock integration tests passed; 5 live external tests explicitly skipped when live credentials are not set)*
 
 ### 2. Run Android Unit Tests
 ```bash
@@ -205,7 +286,7 @@ OK (skipped=5)
 Output:
 ```text
 BUILD SUCCESSFUL
-59 tests completed, 0 failed, 0 skipped
+93 tests completed, 0 failed, 0 skipped
 ```
 
 ### 3. Build Android Debug APK
