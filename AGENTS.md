@@ -55,3 +55,4 @@ Before pushing any commit, the agent MUST verify:
 4. **Content-Addressable Artifact Verification:** Streaming chunked SHA-256 digests verify media and audio files before upload and after download. Corrupt files are unlinked immediately.
 5. **Durable Crash Recovery:** All 9 durable pipeline stages recover without repeating completed expensive work.
 6. **Honest Completion States:** Jobs without optional Gemini AI analysis complete honestly as `COMPLETED` ("Processed without AI analysis").
+
