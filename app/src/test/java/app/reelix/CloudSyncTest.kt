@@ -1518,4 +1518,152 @@ class CloudSyncTest {
         val itemClaimed = container.savedItemRepository.getItem(itemId)
         assertEquals(ProcessingStatus.PROCESSING, itemClaimed!!.processingStatus)
     }
+
+    @Test
+    fun reprocessItemFromScratchIncrementsGenerationAndResetsRoomStages() = runTest {
+        // 1. Create a link item
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/DfgFcSzlTae/",
+            normalizedUrl = "https://www.instagram.com/p/DfgFcSzlTae",
+            shortcode = "DfgFcSzlTae",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        // 2. Put generation 1 COMPLETED manifest in fakeCloudClient
+        val gen1Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 1,
+            recordRevision = 3L,
+            createdAt = container.clock.now() - 50_000L,
+            updatedAt = container.clock.now() - 10_000L,
+            stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "SUCCEEDED",
+            ),
+            results = CloudJobResults(
+                transcript = "Gen 1 transcript",
+                analysis = CloudAnalysisResult(
+                    summary = "Gen 1 summary",
+                    detailedSummary = "Gen 1 details",
+                    mainTopic = "Gen 1 topic",
+                    category = "Tech",
+                    keywords = listOf("vulnerability"),
+                    tags = listOf("security"),
+                    keyTakeaways = listOf("Takeaway 1"),
+                    importantConcepts = listOf("Concept 1"),
+                    actionableSteps = listOf("Step 1"),
+                    modelName = "gemini-3.6-flash",
+                    generatedAt = container.clock.now(),
+                ),
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = gen1Manifest
+
+        // 3. Sync completed to Room
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+        var item = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(ProcessingStatus.COMPLETED, item.processingStatus)
+        assertEquals(StageStatus.SUCCEEDED, item.analysisStatus)
+        assertTrue(container.database.processingDao().resultsFor(itemId).isNotEmpty())
+
+        // 4. Request full reprocessing from scratch
+        val reprocessResult = container.cloudSyncRepository.reprocessItemFromScratch(itemId)
+        assertTrue(reprocessResult.isSuccess)
+
+        // 5. Verify remote Drive manifest in fakeCloudClient
+        val gen2Manifest = container.fakeCloudClient.jobs[itemId]!!
+        assertEquals(2, gen2Manifest.generation)
+        assertEquals("QUEUED", gen2Manifest.status)
+        assertNull(gen2Manifest.media) // Fresh acquisition from scratch
+        assertEquals("PENDING", gen2Manifest.stages.acquisition)
+        assertEquals("PENDING", gen2Manifest.stages.audioExtraction)
+        assertEquals("PENDING", gen2Manifest.stages.transcription)
+        assertEquals("PENDING", gen2Manifest.stages.geminiAnalysis)
+        assertEquals(1, gen2Manifest.historicalGenerations.size)
+
+        // 6. Verify Android Room state reset
+        item = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(ProcessingStatus.QUEUED, item.processingStatus)
+        assertEquals(StageStatus.PENDING, item.audioExtractionStatus)
+        assertEquals(StageStatus.PENDING, item.transcriptionStatus)
+        assertEquals(StageStatus.PENDING, item.analysisStatus)
+        assertTrue("Previous generation results must be cleared in Room", container.database.processingDao().resultsFor(itemId).isEmpty())
+    }
+
+    @Test
+    fun reprocessItemFromScratchIsIdempotentWhenAlreadyQueuedOrProcessing() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/Dfe1veLx4OP/",
+            normalizedUrl = "https://www.instagram.com/p/Dfe1veLx4OP",
+            shortcode = "Dfe1veLx4OP",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        // Already QUEUED in generation 2
+        val gen2Queued = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "QUEUED",
+            generation = 2,
+            recordRevision = 4L,
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = gen2Queued
+
+        val res = container.cloudSyncRepository.reprocessItemFromScratch(itemId)
+        assertTrue(res.isSuccess)
+        // Generation must remain 2, not incremented to 3
+        assertEquals(2, container.fakeCloudClient.jobs[itemId]!!.generation)
+    }
+
+    @Test
+    fun reprocessItemFromScratchPreservesRoomWhenDriveSubmissionFails() = runTest {
+        val link = InstagramLink(
+            originalUrl = "https://www.instagram.com/p/fail/",
+            normalizedUrl = "https://www.instagram.com/p/fail",
+            shortcode = "fail",
+            contentType = ContentType.REEL,
+        )
+        val outcome = container.savedItemRepository.saveLink(link, source = SaveSource.SHARE)
+        val itemId = (outcome as LinkSaveOutcome.Saved).itemId
+
+        val gen1Manifest = CloudJobManifest(
+            itemId = itemId,
+            source = "SHARE",
+            originalUrl = link.originalUrl,
+            status = "COMPLETED",
+            generation = 1,
+            stages = CloudStageStates(
+                acquisition = "SKIPPED",
+                audioExtraction = "SKIPPED",
+                transcription = "SKIPPED",
+                geminiAnalysis = "SKIPPED",
+            ),
+            createdAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+        )
+        container.fakeCloudClient.jobs[itemId] = gen1Manifest
+        container.cloudSyncRepository.syncCompletedJobs()
+
+        // Simulate submission failure
+        container.fakeCloudClient.submitResult = false
+        val res = container.cloudSyncRepository.reprocessItemFromScratch(itemId)
+        assertFalse(res.isSuccess)
+
+        // Room must NOT be mutated to QUEUED
+        val item = container.savedItemRepository.getItem(itemId)!!
+        assertEquals(ProcessingStatus.COMPLETED, item.processingStatus)
+    }
 }

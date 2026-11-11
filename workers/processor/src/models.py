@@ -78,6 +78,7 @@ class ArtifactRef:
     size_bytes: int = 0
     content_hash: Optional[str] = None
     name: Optional[str] = None
+    generation: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -86,6 +87,7 @@ class ArtifactRef:
             "size_bytes": self.size_bytes,
             "content_hash": self.content_hash,
             "name": self.name,
+            "generation": self.generation,
         }
 
     @classmethod
@@ -96,6 +98,7 @@ class ArtifactRef:
             size_bytes=data.get("size_bytes", 0),
             content_hash=data.get("content_hash"),
             name=data.get("name"),
+            generation=data.get("generation", 1),
         )
 
 
@@ -204,6 +207,8 @@ class JobManifest:
     schema_version: int = 1
     record_revision: int = 1
     version: int = 1
+    generation: int = 1
+    historical_generations: List[Dict[str, Any]] = field(default_factory=list)
     job_id: str = ""
     original_url: Optional[str] = None
     caption: Optional[str] = None
@@ -267,6 +272,8 @@ class JobManifest:
         d["schema_version"] = self.schema_version
         d["record_revision"] = self.record_revision
         d["version"] = self.version
+        d["generation"] = self.generation
+        d["historical_generations"] = self.historical_generations
         d["job_id"] = self.job_id
         d["stages"] = {
             "acquisition": self.stages.acquisition.value,
@@ -309,11 +316,15 @@ class JobManifest:
 
         schema_version = data.get("schema_version", data.get("version", 1))
         record_revision = data.get("record_revision", data.get("version", 1))
+        generation = data.get("generation", 1)
+        historical_generations = data.get("historical_generations", [])
 
         return cls(
             schema_version=schema_version,
             record_revision=record_revision,
             version=data.get("version", schema_version),
+            generation=generation,
+            historical_generations=historical_generations,
             job_id=data.get("job_id", data["item_id"]),
             item_id=data["item_id"],
             source=data.get("source", "MEDIA_SHARE"),

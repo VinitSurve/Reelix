@@ -95,6 +95,8 @@ class ItemDetailViewModel(
     private val itemId: String,
     private val repository: SavedItemRepository,
     private val scheduler: ProcessingScheduler,
+    private val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository? = null,
+    private val settingsRepository: app.reelix.data.settings.SettingsRepository? = null,
 ) : ViewModel() {
 
     val state: StateFlow<DetailUiState> = repository.observeDetails(itemId)
@@ -106,6 +108,9 @@ class ItemDetailViewModel(
 
     private val _feedback = MutableStateFlow<String?>(null)
     val feedback: StateFlow<String?> = _feedback.asStateFlow()
+
+    private val _isReprocessing = MutableStateFlow(false)
+    val isReprocessing: StateFlow<Boolean> = _isReprocessing.asStateFlow()
 
     fun saveUserMetadata(metadata: UserMetadata) {
         viewModelScope.launch {
@@ -133,6 +138,31 @@ class ItemDetailViewModel(
         }
     }
 
+    fun reprocessFromScratch() {
+        if (_isReprocessing.value) return
+        viewModelScope.launch {
+            _isReprocessing.value = true
+            try {
+                val cloudEnabled = settingsRepository?.current()?.cloudProcessingEnabled ?: false
+                if (cloudSyncRepository != null && cloudEnabled) {
+                    val res = cloudSyncRepository.reprocessItemFromScratch(itemId)
+                    if (res.isSuccess) {
+                        _feedback.value = "Scheduled full cloud reprocessing from scratch."
+                    } else {
+                        _feedback.value = res.exceptionOrNull()?.message ?: "Reprocessing failed to schedule."
+                    }
+                } else {
+                    if (repository.reprocess(itemId, app.reelix.domain.model.ProcessingStage.entries)) {
+                        scheduler.scheduleImmediate(forceRunNow = true)
+                        _feedback.value = "Queued full reprocessing from scratch."
+                    }
+                }
+            } finally {
+                _isReprocessing.value = false
+            }
+        }
+    }
+
     fun deleteItem() {
         viewModelScope.launch {
             if (repository.delete(itemId)) {
@@ -150,10 +180,18 @@ class ItemDetailViewModel(
             itemId: String,
             repository: SavedItemRepository,
             scheduler: ProcessingScheduler,
+            cloudSyncRepository: app.reelix.cloud.CloudSyncRepository? = null,
+            settingsRepository: app.reelix.data.settings.SettingsRepository? = null,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                ItemDetailViewModel(itemId, repository, scheduler) as T
+                ItemDetailViewModel(
+                    itemId = itemId,
+                    repository = repository,
+                    scheduler = scheduler,
+                    cloudSyncRepository = cloudSyncRepository,
+                    settingsRepository = settingsRepository,
+                ) as T
         }
     }
 }
@@ -168,10 +206,12 @@ fun ItemDetailScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val deleted by viewModel.deleted.collectAsStateWithLifecycle()
     val feedback by viewModel.feedback.collectAsStateWithLifecycle()
+    val isReprocessing by viewModel.isReprocessing.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     var showEditDialog by rememberSaveable { mutableStateOf(false) }
     var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
+    var showReprocessConfirm by rememberSaveable { mutableStateOf(false) }
     var showAllStages by rememberSaveable { mutableStateOf(false) }
 
     val context = LocalContext.current
@@ -709,6 +749,27 @@ fun ItemDetailScreen(
                                     }
                                 }
                             }
+
+                            Spacer(Modifier.height(12.dp))
+                            HorizontalDivider()
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedButton(
+                                onClick = { showReprocessConfirm = true },
+                                enabled = !isReprocessing,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("reprocess_from_scratch_button"),
+                            ) {
+                                if (isReprocessing) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Scheduling fresh run...")
+                                } else {
+                                    Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Reprocess from scratch")
+                                }
+                            }
                         }
                     }
                 }
@@ -741,6 +802,33 @@ fun ItemDetailScreen(
                 viewModel.deleteItem()
             },
             onDismiss = { showDeleteConfirm = false },
+        )
+    }
+
+    if (showReprocessConfirm) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showReprocessConfirm = false },
+            title = { Text("Reprocess Reel from scratch?") },
+            text = {
+                Text(
+                    "This will schedule a fresh processing run from scratch in the cloud (fresh acquisition, audio extraction, Whisper transcription, and Gemini AI analysis). Previous generation results are retained in history."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showReprocessConfirm = false
+                        viewModel.reprocessFromScratch()
+                    },
+                ) {
+                    Text("Reprocess")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showReprocessConfirm = false }) {
+                    Text("Cancel")
+                }
+            },
         )
     }
     }

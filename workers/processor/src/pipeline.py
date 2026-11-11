@@ -289,11 +289,11 @@ class CloudProcessingPipeline:
                 )
                 return False
 
-        job_dir = self.config.work_dir / job.item_id
+        job_dir = self.config.work_dir / f"{job.item_id}_gen{job.generation}"
         job_dir.mkdir(parents=True, exist_ok=True)
 
         local_media_path: Optional[Path] = None
-        local_wav_path = job_dir / f"{job.item_id}_audio.wav"
+        local_wav_path = job_dir / f"{job.item_id}_gen{job.generation}_audio.wav"
 
         with ContinuousHeartbeatManager(
             storage=self.storage,
@@ -353,6 +353,7 @@ class CloudProcessingPipeline:
                                 size_bytes=dl_res.size_bytes or 0,
                                 content_hash=media_hash,
                                 name=job.media.file_name,
+                                generation=job.generation,
                             )
                             if not self._update_stage(job, "acquisition", StageStatus.SUCCEEDED, artifact=media_artifact):
                                 logger.warning("Aborting job %s: lost lease during acquisition update", job.item_id)
@@ -459,7 +460,8 @@ class CloudProcessingPipeline:
                             mime_type="audio/wav",
                             size_bytes=extract_res.size_bytes or 0,
                             content_hash=audio_hash,
-                            name=f"{job.item_id}.wav",
+                            name=f"{job.item_id}_gen{job.generation}.wav",
+                            generation=job.generation,
                         )
                         if not self._update_stage(job, "audio_extraction", StageStatus.SUCCEEDED, artifact=audio_artifact):
                             logger.warning("Aborting job %s: lost lease during audio extraction update", job.item_id)

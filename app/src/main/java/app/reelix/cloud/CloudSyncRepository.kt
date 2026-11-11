@@ -47,6 +47,103 @@ class CloudSyncRepository(
     suspend fun cleanupCrossClientTestProbe(folderId: String, fileId: String): Result<Boolean> =
         cloudClient.cleanupCrossClientTestProbe(folderId, fileId)
 
+    suspend fun reprocessItemFromScratch(itemId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        if (!cloudClient.isConfigured()) {
+            return@withContext Result.failure(IllegalStateException("Google Drive cloud client is not configured"))
+        }
+        val item = itemDao.getById(itemId)
+            ?: return@withContext Result.failure(IllegalArgumentException("Item $itemId not found in local database"))
+
+        val remoteManifest = cloudClient.fetchJobManifest(itemId)
+            ?: return@withContext Result.failure(IllegalStateException("Authoritative manifest for $itemId not found on Google Drive"))
+
+        // Idempotent guard: if already QUEUED or PROCESSING in active generation, do not duplicate
+        if (remoteManifest.status == "QUEUED" || remoteManifest.status == "PROCESSING") {
+            ReelixLog.d("Item $itemId is already ${remoteManifest.status} in generation ${remoteManifest.generation}; duplicate reprocess ignored")
+            return@withContext Result.success(true)
+        }
+
+        val currentGen = remoteManifest.generation
+        val nextGen = currentGen + 1
+        val now = clock.now()
+
+        // Archive current generation snapshot into historicalGenerations
+        val historicalList = remoteManifest.historicalGenerations.toMutableList()
+        historicalList.add(remoteManifest.toJson())
+
+        val userTags = db.tagDao().tagsForItem(itemId).map { it.name }
+
+        val newManifest = CloudJobManifest(
+            schemaVersion = 1,
+            recordRevision = remoteManifest.recordRevision + 1L,
+            version = 1,
+            generation = nextGen,
+            historicalGenerations = historicalList,
+            itemId = itemId,
+            source = item.source.name,
+            originalUrl = item.originalUrl,
+            caption = item.caption ?: item.userCaption,
+            userNotes = item.userNotes,
+            category = item.category,
+            userTags = userTags,
+            status = "QUEUED",
+            claimedBy = null,
+            claimedAt = null,
+            leaseTimeoutMs = 900_000L,
+            etag = null,
+            createdAt = item.createdAt,
+            updatedAt = now,
+            retryCount = 0,
+            maxRetries = 3,
+            nextRetryAt = null,
+            errorMessage = null,
+            media = null, // Ensure fresh acquisition from scratch
+            stages = CloudStageStates(
+                acquisition = if (!item.originalUrl.isNullOrBlank()) "PENDING" else "SKIPPED",
+                audioExtraction = "PENDING",
+                transcription = "PENDING",
+                ocr = "PENDING",
+                geminiAnalysis = "PENDING",
+            ),
+            results = CloudJobResults(),
+        )
+
+        val submitted = cloudClient.submitJobManifest(newManifest)
+        if (!submitted) {
+            return@withContext Result.failure(IllegalStateException("Failed to submit generation $nextGen manifest to Google Drive"))
+        }
+
+        // Only mutate Room AFTER Google Drive submission succeeds
+        db.withTransaction {
+            processingDao.deleteResultsFor(itemId)
+            processingDao.resetJobs(itemId, ProcessingStage.entries, now)
+
+            itemDao.updateProcessingStatus(
+                id = itemId,
+                status = ProcessingStatus.QUEUED,
+                nextAttemptAt = null,
+                lastError = null,
+                now = now,
+            )
+            itemDao.setAudioExtractionStatus(itemId, StageStatus.PENDING, now)
+            itemDao.setTranscriptionStatus(itemId, StageStatus.PENDING, now)
+            itemDao.setAnalysisStatus(itemId, StageStatus.PENDING, now)
+
+            processingDao.insertEvent(
+                ProcessingEventEntity(
+                    savedItemId = itemId,
+                    stage = null,
+                    status = "REPROCESS_GENERATION_STARTED",
+                    message = "Reprocessing started for generation $nextGen from scratch",
+                    createdAt = now,
+                ),
+            )
+            indexer.reindex(itemId)
+        }
+
+        Result.success(true)
+    }
+
     suspend fun uploadPendingItem(itemId: String): Boolean = withContext(Dispatchers.IO) {
         val item = itemDao.getById(itemId) ?: return@withContext false
         if (!cloudClient.isConfigured()) {
@@ -201,6 +298,14 @@ class CloudSyncRepository(
                 val now = clock.now()
                 val existingResults = processingDao.resultsFor(manifest.itemId)
 
+                // Clean up previous generation results when a freshly completed generation arrives
+                val activeResults = if (item.processingStatus != ProcessingStatus.COMPLETED && existingResults.isNotEmpty()) {
+                    processingDao.deleteResultsFor(manifest.itemId)
+                    emptyList()
+                } else {
+                    existingResults
+                }
+
                 // 0. Cloud-acquired media synchronization (idempotent; preserves existing valid local device media)
                 val hasValidLocalMedia = item.mediaPath?.let { File(it).exists() } == true
                 if (!hasValidLocalMedia && manifest.media != null && manifest.stages.acquisition == "SUCCEEDED") {
@@ -219,7 +324,7 @@ class CloudSyncRepository(
                 }
 
                 // 1. Audio and Transcription (idempotent: avoid duplicate result inserts)
-                val hasExistingTranscript = existingResults.any { it.stage == ProcessingStage.TRANSCRIPTION }
+                val hasExistingTranscript = activeResults.any { it.stage == ProcessingStage.TRANSCRIPTION }
                 if (!hasExistingTranscript && manifest.results.transcript != null) {
                     processingDao.insertResult(
                         ProcessingResultEntity(
@@ -247,7 +352,7 @@ class CloudSyncRepository(
                 }
 
                 // 1b. On-screen Visual Text (OCR) Result (idempotent: avoid duplicate result inserts)
-                val hasExistingOcr = existingResults.any { it.stage == ProcessingStage.VISUAL_ANALYSIS }
+                val hasExistingOcr = activeResults.any { it.stage == ProcessingStage.VISUAL_ANALYSIS }
                 if (!hasExistingOcr && !manifest.results.ocrText.isNullOrBlank()) {
                     processingDao.insertResult(
                         ProcessingResultEntity(
@@ -263,7 +368,7 @@ class CloudSyncRepository(
 
                 // 2. Gemini Analysis (idempotent: avoid duplicate result inserts)
                 val analysis = manifest.results.analysis
-                val hasExistingAnalysis = existingResults.any { it.stage == ProcessingStage.ANALYSIS }
+                val hasExistingAnalysis = activeResults.any { it.stage == ProcessingStage.ANALYSIS }
                 if (!hasExistingAnalysis && analysis != null) {
                     processingDao.insertResult(
                         ProcessingResultEntity(

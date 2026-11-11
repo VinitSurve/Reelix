@@ -66,6 +66,7 @@ class ManifestContractTest {
         assertEquals(1, json.getInt("schema_version"))
         assertEquals(3L, json.getLong("record_revision"))
         assertEquals(1, json.getInt("version"))
+        assertEquals(1, json.getInt("generation"))
         assertEquals("item_uuid_999", json.getString("job_id"))
         assertEquals("item_uuid_999", json.getString("item_id"))
         assertEquals("URL", json.getString("source"))
@@ -169,5 +170,41 @@ class ManifestContractTest {
         assertEquals("Summary by Python worker", parsed.results.analysis?.summary)
         assertEquals("Transcribed by Python Whisper worker", parsed.results.transcript)
         assertEquals("drive_audio_py_555", parsed.results.audioDriveFileId)
+        assertEquals(1, parsed.generation)
+        assertTrue(parsed.historicalGenerations.isEmpty())
+    }
+
+    @Test
+    fun testGenerationContractAndBackwardCompatibility() {
+        // 1. Generation 2 with historical generations
+        val gen2Manifest = CloudJobManifest(
+            itemId = "item_gen2",
+            source = "URL",
+            generation = 2,
+            historicalGenerations = listOf("""{"generation":1,"status":"COMPLETED"}"""),
+            createdAt = 1000L,
+            updatedAt = 2000L,
+        )
+        val jsonStr = gen2Manifest.toJson()
+        val json = JSONObject(jsonStr)
+        assertEquals(2, json.getInt("generation"))
+        assertEquals(1, json.getJSONArray("historical_generations").length())
+
+        val parsed = CloudJobManifest.fromJson(jsonStr)
+        assertEquals(2, parsed.generation)
+        assertEquals(1, parsed.historicalGenerations.size)
+
+        // 2. Legacy JSON without generation defaults to 1
+        val legacyJson = """
+            {
+              "schema_version": 1,
+              "item_id": "legacy_item",
+              "source": "URL",
+              "status": "QUEUED"
+            }
+        """.trimIndent()
+        val legacyParsed = CloudJobManifest.fromJson(legacyJson)
+        assertEquals(1, legacyParsed.generation)
+        assertTrue(legacyParsed.historicalGenerations.isEmpty())
     }
 }

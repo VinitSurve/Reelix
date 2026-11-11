@@ -265,6 +265,14 @@ class GoogleDriveStorageClient(StorageClient):
             elif current_manifest.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL):
                 logger.info("Job %s is already settled (%s); aborting claim", job.item_id, current_manifest.status.value)
                 return False
+
+            if current_manifest.generation > job.generation:
+                logger.warning(
+                    "Job %s remote generation (%d) is newer than worker job generation (%d); aborting claim",
+                    job.item_id, current_manifest.generation, job.generation
+                )
+                return False
+            job.generation = current_manifest.generation
             job.version = current_manifest.version or 1
         except Exception as e:
             logger.warning("Could not verify remote manifest before claiming %s: %s", job.item_id, e)
@@ -332,6 +340,14 @@ class GoogleDriveStorageClient(StorageClient):
                 remote_bytes = self._download_bytes(remote_file_id)
                 remote_manifest = JobManifest.from_json(remote_bytes.decode("utf-8"))
 
+                # Concurrency check 0: Generation ordering (stale worker protection)
+                if remote_manifest.generation > job.generation:
+                    logger.warning(
+                        "Cannot update job %s: remote manifest generation (%d) is newer than worker generation (%d). Worker is stale! Aborting update.",
+                        job.item_id, remote_manifest.generation, job.generation
+                    )
+                    return False
+
                 # Concurrency check 1: Lease ownership check
                 if (
                     remote_manifest.claimed_by
@@ -352,15 +368,17 @@ class GoogleDriveStorageClient(StorageClient):
                     )
                     return False
 
-                # Concurrency check 3: Version ordering
-                if (remote_manifest.version or 1) > (job.version or 1):
-                    logger.warning(
-                        "Cannot update job %s: remote manifest version (%d) is newer than local (%d). Aborting update.",
-                        job.item_id, remote_manifest.version, job.version
-                    )
-                    return False
-
-                job.version = (remote_manifest.version or 1) + 1
+                # Concurrency check 3: Version ordering within same generation
+                if remote_manifest.generation == job.generation:
+                    if (remote_manifest.version or 1) > (job.version or 1):
+                        logger.warning(
+                            "Cannot update job %s: remote manifest version (%d) is newer than local (%d). Aborting update.",
+                            job.item_id, remote_manifest.version, job.version
+                        )
+                        return False
+                    job.version = (remote_manifest.version or 1) + 1
+                else:
+                    job.version = 1
             except Exception as e:
                 logger.warning("Could not verify remote lease before update for %s: %s", job.item_id, e)
                 return False
@@ -443,6 +461,12 @@ class GoogleDriveStorageClient(StorageClient):
                 logger.warning(
                     "Cannot renew lease for job %s: claimed by %s, not caller %s",
                     job_id, manifest.claimed_by, worker_id
+                )
+                return False
+            if job is not None and manifest.generation != job.generation:
+                logger.warning(
+                    "Cannot renew lease for job %s: remote manifest generation (%d) != worker generation (%d)",
+                    job_id, manifest.generation, job.generation
                 )
                 return False
 

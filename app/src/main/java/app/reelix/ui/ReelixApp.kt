@@ -276,6 +276,8 @@ private fun ReelixNavHost(
                     itemId = itemId,
                     repository = container.savedItemRepository,
                     scheduler = container.processingScheduler,
+                    cloudSyncRepository = container.cloudSyncRepository,
+                    settingsRepository = container.settingsRepository,
                 ),
             )
             ItemDetailScreen(

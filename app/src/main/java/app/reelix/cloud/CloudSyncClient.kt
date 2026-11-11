@@ -1035,7 +1035,10 @@ class MockCloudSyncClient(
         return nextCleanupProbeResult ?: Result.success(true)
     }
 
+    var submitResult: Boolean = true
+
     override suspend fun submitJobManifest(manifest: CloudJobManifest): Boolean {
+        if (!submitResult) return false
         jobs[manifest.itemId] = manifest
         return true
     }

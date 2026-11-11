@@ -80,6 +80,9 @@ interface ProcessingDao {
 
     @Query("SELECT * FROM processing_results WHERE savedItemId = :itemId ORDER BY generatedAt DESC, id DESC")
     fun observeResultsFor(itemId: String): Flow<List<ProcessingResultEntity>>
+
+    @Query("DELETE FROM processing_results WHERE savedItemId = :itemId")
+    suspend fun deleteResultsFor(itemId: String)
 }
 
 @Dao

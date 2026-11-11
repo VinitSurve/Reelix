@@ -107,6 +107,10 @@ class TestManifestContract(unittest.TestCase):
         self.assertEqual(1730000060000, manifest.next_retry_at)
         self.assertEqual("Transient network timeout", manifest.error_message)
 
+        # Generation defaults to 1 for legacy manifests without explicit generation
+        self.assertEqual(1, manifest.generation)
+        self.assertEqual([], manifest.historical_generations)
+
         # Media
         self.assertIsNotNone(manifest.media)
         self.assertEqual("video_1234.mp4", manifest.media.file_name)
@@ -154,6 +158,30 @@ class TestManifestContract(unittest.TestCase):
         self.assertEqual("drive_media_file_id_5678", round_tripped["media"]["drive_file_id"])
         self.assertEqual("drive_audio_file_id_9999", round_tripped["results"]["audio_drive_file_id"])
         self.assertEqual("Short productivity reel", round_tripped["results"]["analysis"]["summary"])
+        self.assertEqual(1, round_tripped["generation"])
+        self.assertEqual([], round_tripped["historical_generations"])
+
+    def test_generation_reprocessing_contract(self):
+        gen2_json = json.dumps({
+            "schema_version": 1,
+            "record_revision": 5,
+            "version": 1,
+            "generation": 2,
+            "historical_generations": [
+                {"generation": 1, "status": "COMPLETED", "summary": "Old summary"}
+            ],
+            "item_id": "test-item-gen2",
+            "source": "URL",
+            "status": "QUEUED",
+        })
+        manifest = JobManifest.from_json(gen2_json)
+        self.assertEqual(2, manifest.generation)
+        self.assertEqual(1, len(manifest.historical_generations))
+        self.assertEqual("Old summary", manifest.historical_generations[0]["summary"])
+
+        serialized = manifest.to_dict()
+        self.assertEqual(2, serialized["generation"])
+        self.assertEqual(1, len(serialized["historical_generations"]))
 
 
 if __name__ == "__main__":

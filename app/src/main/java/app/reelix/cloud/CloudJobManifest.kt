@@ -14,6 +14,8 @@ data class CloudJobManifest(
     val schemaVersion: Int = 1,
     val recordRevision: Long = 1L,
     val version: Int = 1,
+    val generation: Int = 1,
+    val historicalGenerations: List<String> = emptyList(),
     val itemId: String,
     val source: String,
     val originalUrl: String? = null,
@@ -41,6 +43,8 @@ data class CloudJobManifest(
         root.put("schema_version", schemaVersion)
         root.put("record_revision", recordRevision)
         root.put("version", version)
+        root.put("generation", generation)
+        if (historicalGenerations.isNotEmpty()) root.put("historical_generations", JSONArray(historicalGenerations))
         root.put("job_id", itemId)
         root.put("item_id", itemId)
         root.put("source", source)
@@ -161,11 +165,15 @@ data class CloudJobManifest(
 
             val schemaVer = root.optInt("schema_version", root.optInt("version", 1))
             val recRev = root.optLong("record_revision", root.optLong("version", 1L))
+            val gen = root.optInt("generation", 1)
+            val histGenerations = root.optJSONArray("historical_generations")?.toStringList() ?: emptyList()
 
             return CloudJobManifest(
                 schemaVersion = schemaVer,
                 recordRevision = recRev,
                 version = root.optInt("version", schemaVer),
+                generation = gen,
+                historicalGenerations = histGenerations,
                 itemId = root.getString("item_id"),
                 source = root.optString("source", "MEDIA_SHARE"),
                 originalUrl = root.optString("original_url").takeIf { it.isNotBlank() },
