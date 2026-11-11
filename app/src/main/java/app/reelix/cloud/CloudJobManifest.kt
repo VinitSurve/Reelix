@@ -11,12 +11,16 @@ import org.json.JSONObject
  * Stored persistently in Google Drive under `jobs/<item_id>.json`.
  */
 data class CloudJobManifest(
+    val schemaVersion: Int = 1,
+    val recordRevision: Long = 1L,
     val version: Int = 1,
     val itemId: String,
     val source: String,
     val originalUrl: String? = null,
     val caption: String? = null,
     val userNotes: String? = null,
+    val category: String? = null,
+    val userTags: List<String> = emptyList(),
     val status: String = "QUEUED",
     val claimedBy: String? = null,
     val claimedAt: Long? = null,
@@ -26,6 +30,7 @@ data class CloudJobManifest(
     val updatedAt: Long,
     val retryCount: Int = 0,
     val maxRetries: Int = 3,
+    val nextRetryAt: Long? = null,
     val errorMessage: String? = null,
     val media: CloudMediaInfo? = null,
     val stages: CloudStageStates = CloudStageStates(),
@@ -33,12 +38,17 @@ data class CloudJobManifest(
 ) {
     fun toJson(): String {
         val root = JSONObject()
+        root.put("schema_version", schemaVersion)
+        root.put("record_revision", recordRevision)
         root.put("version", version)
+        root.put("job_id", itemId)
         root.put("item_id", itemId)
         root.put("source", source)
         if (originalUrl != null) root.put("original_url", originalUrl)
         if (caption != null) root.put("caption", caption)
         if (userNotes != null) root.put("user_notes", userNotes)
+        if (category != null) root.put("category", category)
+        if (userTags.isNotEmpty()) root.put("user_tags", JSONArray(userTags))
         root.put("status", status)
         if (claimedBy != null) root.put("claimed_by", claimedBy)
         if (claimedAt != null) root.put("claimed_at", claimedAt)
@@ -48,6 +58,7 @@ data class CloudJobManifest(
         root.put("updated_at", updatedAt)
         root.put("retry_count", retryCount)
         root.put("max_retries", maxRetries)
+        if (nextRetryAt != null) root.put("next_retry_at", nextRetryAt)
         if (errorMessage != null) root.put("error_message", errorMessage)
 
         if (media != null) {
@@ -64,6 +75,7 @@ data class CloudJobManifest(
         st.put("acquisition", stages.acquisition)
         st.put("audio_extraction", stages.audioExtraction)
         st.put("transcription", stages.transcription)
+        st.put("ocr", stages.ocr)
         st.put("gemini_analysis", stages.geminiAnalysis)
         root.put("stages", st)
 
@@ -72,6 +84,7 @@ data class CloudJobManifest(
         if (results.audioSizeBytes != null) res.put("audio_size_bytes", results.audioSizeBytes)
         if (results.transcript != null) res.put("transcript", results.transcript)
         if (results.transcriptModel != null) res.put("transcript_model", results.transcriptModel)
+        if (results.ocrText != null) res.put("ocr_text", results.ocrText)
 
         if (results.analysis != null) {
             val a = JSONObject()
@@ -115,6 +128,7 @@ data class CloudJobManifest(
                 acquisition = acquisition,
                 audioExtraction = stagesObj?.optString("audio_extraction", "PENDING") ?: "PENDING",
                 transcription = stagesObj?.optString("transcription", "PENDING") ?: "PENDING",
+                ocr = stagesObj?.optString("ocr", "PENDING") ?: "PENDING",
                 geminiAnalysis = stagesObj?.optString("gemini_analysis", "PENDING") ?: "PENDING",
             )
 
@@ -141,16 +155,24 @@ data class CloudJobManifest(
                 audioSizeBytes = if (resObj?.has("audio_size_bytes") == true) resObj.optLong("audio_size_bytes") else null,
                 transcript = resObj?.optString("transcript")?.takeIf { it.isNotBlank() },
                 transcriptModel = resObj?.optString("transcript_model")?.takeIf { it.isNotBlank() },
+                ocrText = resObj?.optString("ocr_text")?.takeIf { it.isNotBlank() },
                 analysis = analysis,
             )
 
+            val schemaVer = root.optInt("schema_version", root.optInt("version", 1))
+            val recRev = root.optLong("record_revision", root.optLong("version", 1L))
+
             return CloudJobManifest(
-                version = root.optInt("version", 1),
+                schemaVersion = schemaVer,
+                recordRevision = recRev,
+                version = root.optInt("version", schemaVer),
                 itemId = root.getString("item_id"),
                 source = root.optString("source", "MEDIA_SHARE"),
                 originalUrl = root.optString("original_url").takeIf { it.isNotBlank() },
                 caption = root.optString("caption").takeIf { it.isNotBlank() },
                 userNotes = root.optString("user_notes").takeIf { it.isNotBlank() },
+                category = root.optString("category").takeIf { it.isNotBlank() },
+                userTags = root.optJSONArray("user_tags")?.toStringList() ?: emptyList(),
                 status = root.optString("status", "QUEUED"),
                 claimedBy = root.optString("claimed_by").takeIf { it.isNotBlank() },
                 claimedAt = if (root.has("claimed_at")) root.optLong("claimed_at") else null,
@@ -160,6 +182,7 @@ data class CloudJobManifest(
                 updatedAt = root.optLong("updated_at", 0L),
                 retryCount = root.optInt("retry_count", 0),
                 maxRetries = root.optInt("max_retries", 3),
+                nextRetryAt = if (root.has("next_retry_at")) root.optLong("next_retry_at") else null,
                 errorMessage = root.optString("error_message").takeIf { it.isNotBlank() },
                 media = media,
                 stages = stages,
@@ -190,6 +213,7 @@ data class CloudStageStates(
     val acquisition: String = "PENDING",
     val audioExtraction: String = "PENDING",
     val transcription: String = "PENDING",
+    val ocr: String = "PENDING",
     val geminiAnalysis: String = "PENDING",
 )
 
@@ -212,5 +236,6 @@ data class CloudJobResults(
     val audioSizeBytes: Long? = null,
     val transcript: String? = null,
     val transcriptModel: String? = null,
+    val ocrText: String? = null,
     val analysis: CloudAnalysisResult? = null,
 )

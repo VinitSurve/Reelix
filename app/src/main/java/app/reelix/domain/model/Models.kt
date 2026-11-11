@@ -177,6 +177,7 @@ data class ItemDetails(
     // AI-generated
     val aiResult: AiResultInfo?,
     val generatedTranscript: String?,
+    val ocrText: String? = null,
     val tags: List<TagInfo>,
     val stages: List<StageInfo>,
     val events: List<ProcessingEventInfo>,

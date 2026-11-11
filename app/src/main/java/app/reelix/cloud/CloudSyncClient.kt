@@ -22,6 +22,19 @@ sealed interface CloudUploadResult {
     data class Failure(val error: String) : CloudUploadResult
 }
 
+data class CrossClientProbeResult(
+    val folderId: String,
+    val fileId: String,
+    val folderName: String,
+)
+
+data class CrossClientProbeVerification(
+    val version: Int,
+    val updatedBy: String?,
+    val isVerified: Boolean,
+    val message: String,
+)
+
 interface ResumableUploadStore {
     fun getSessionUri(key: String): String?
     fun saveSessionUri(key: String, uri: String)
@@ -129,6 +142,9 @@ interface CloudSyncClient {
     suspend fun fetchJobManifest(itemId: String): CloudJobManifest?
     suspend fun listCompletedJobs(): List<CloudJobManifest>
     suspend fun createOrGetVaultFolder(): Result<String>
+    suspend fun createCrossClientTestProbe(): Result<CrossClientProbeResult>
+    suspend fun verifyCrossClientTestProbe(fileId: String): Result<CrossClientProbeVerification>
+    suspend fun cleanupCrossClientTestProbe(folderId: String, fileId: String): Result<Boolean>
 }
 
 data class MockUploadedFile(
@@ -431,24 +447,31 @@ class GoogleDriveCloudClient(
 
         try {
             val jobsFolderId = ensureSubfolder("jobs", rootFolderId, token)
-            val listUrl = "https://www.googleapis.com/drive/v3/files?q='${jobsFolderId}'+in+parents+and+trashed=false&fields=files(id,name)&pageSize=50"
-            val request = Request.Builder()
-                .url(listUrl)
-                .addHeader("Authorization", "Bearer $token")
-                .get()
-                .build()
+            val files = mutableListOf<Pair<String, String>>()
+            var pageToken: String? = null
+            do {
+                val pageQuery = if (pageToken != null) "&pageToken=$pageToken" else ""
+                val listUrl = "https://www.googleapis.com/drive/v3/files?q='${jobsFolderId}'+in+parents+and+trashed=false&fields=nextPageToken,files(id,name)&pageSize=50$pageQuery"
+                val request = Request.Builder()
+                    .url(listUrl)
+                    .addHeader("Authorization", "Bearer $token")
+                    .get()
+                    .build()
 
-            val files = client.newCall(request).execute().use { resp ->
-                if (!resp.isSuccessful) return@withContext emptyList()
-                val json = JSONObject(resp.body?.string().orEmpty())
-                val arr = json.optJSONArray("files") ?: return@withContext emptyList()
-                val result = mutableListOf<Pair<String, String>>()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
-                    result.add(obj.getString("id") to obj.getString("name"))
+                pageToken = client.newCall(request).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val json = JSONObject(resp.body?.string().orEmpty())
+                    val arr = json.optJSONArray("files")
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val obj = arr.getJSONObject(i)
+                            files.add(obj.getString("id") to obj.getString("name"))
+                        }
+                    }
+                    val next = json.optString("nextPageToken")
+                    if (next.isNotBlank()) next else null
                 }
-                result
-            }
+            } while (pageToken != null)
 
             val settled = mutableListOf<CloudJobManifest>()
             for ((id, name) in files) {
@@ -459,8 +482,8 @@ class GoogleDriveCloudClient(
                     if (resp.isSuccessful) {
                         val body = resp.body?.string().orEmpty()
                         val manifest = CloudJobManifest.fromJson(body)
-                        // Return settled manifests (COMPLETED, PARTIAL, FAILED) for honest synchronization
-                        if (manifest.status in listOf("COMPLETED", "PARTIAL", "FAILED")) {
+                        // Return settled manifests (COMPLETED, PARTIAL, FAILED, WAITING_RETRY) for honest synchronization
+                        if (manifest.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY")) {
                             settled.add(manifest)
                         }
                     }
@@ -507,6 +530,245 @@ class GoogleDriveCloudClient(
             Result.failure(java.io.IOException("Network error while connecting to Google Drive: ${e.message}", e))
         } catch (e: Exception) {
             ReelixLog.w("Unexpected error while creating Reelix_Vault folder: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun createCrossClientTestProbe(): Result<CrossClientProbeResult> = withContext(Dispatchers.IO) {
+        var token = tokenProvider()
+        if (token.isNullOrBlank()) {
+            val refreshed = tokenRefresher?.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+            } else {
+                return@withContext Result.failure(
+                    IllegalStateException("Google Drive authentication token missing. Please connect Google Drive in Settings.")
+                )
+            }
+        }
+
+        try {
+            val runId = "${System.currentTimeMillis() / 1000}_${java.util.UUID.randomUUID().toString().take(6)}"
+            val folderName = "Reelix_CrossClient_Test_$runId"
+
+            // 1. Create isolated test folder directly under root with required shared properties
+            val folderProps = JSONObject().apply {
+                put("reelix_type", "cross_client_test")
+                put("reelix_test_id", runId)
+            }
+            val folderMeta = JSONObject().apply {
+                put("name", folderName)
+                put("mimeType", "application/vnd.google-apps.folder")
+                put("parents", org.json.JSONArray().put("root"))
+                put("properties", folderProps)
+            }
+
+            fun buildFolderRequest(tok: String) = Request.Builder()
+                .url("https://www.googleapis.com/drive/v3/files")
+                .addHeader("Authorization", "Bearer $tok")
+                .post(folderMeta.toString().toByteArray().toRequestBody("application/json; charset=UTF-8".toMediaType()))
+                .build()
+
+            var folderResp = client.newCall(buildFolderRequest(token)).execute()
+            if (folderResp.code == 401 && tokenRefresher != null) {
+                folderResp.close()
+                val refreshed = tokenRefresher.invoke()
+                if (!refreshed.isNullOrBlank()) {
+                    token = refreshed
+                    folderResp = client.newCall(buildFolderRequest(token)).execute()
+                }
+            }
+
+            val folderId = folderResp.use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    val errorMsg = parseDriveErrorMessage(response.code, body)
+                    throw java.io.IOException("Google Drive folder creation failed ($errorMsg)")
+                }
+                val json = JSONObject(body)
+                val id = json.optString("id")
+                if (id.isNullOrBlank()) {
+                    throw java.io.IOException("Google Drive returned invalid or empty folder ID")
+                }
+                id
+            }
+
+            // 2. Create probe file inside the new isolated folder
+            val fileProps = JSONObject().apply {
+                put("reelix_test_id", runId)
+            }
+            val fileMeta = JSONObject().apply {
+                put("name", "manifest_probe.json")
+                put("mimeType", "application/json")
+                put("parents", org.json.JSONArray().put(folderId))
+                put("properties", fileProps)
+            }
+
+            val probePayload = JSONObject().apply {
+                put("version", 1)
+                put("test_id", runId)
+                put("created_by", "android_client_a")
+                put("timestamp", System.currentTimeMillis())
+                put("message", "Harmless controlled test probe payload")
+            }
+            val jsonContent = probePayload.toString(2)
+
+            val boundary = "ReelixProbeBoundary${System.currentTimeMillis()}"
+            val multipartBody = "--$boundary\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n$fileMeta\r\n" +
+                "--$boundary\r\nContent-Type: application/json\r\n\r\n$jsonContent\r\n--$boundary--"
+
+            fun buildFileRequest(tok: String) = Request.Builder()
+                .url("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
+                .addHeader("Authorization", "Bearer $tok")
+                .post(multipartBody.toByteArray().toRequestBody("multipart/related; boundary=$boundary".toMediaType()))
+                .build()
+
+            var fileResp = client.newCall(buildFileRequest(token)).execute()
+            if (fileResp.code == 401 && tokenRefresher != null) {
+                fileResp.close()
+                val refreshed = tokenRefresher.invoke()
+                if (!refreshed.isNullOrBlank()) {
+                    token = refreshed
+                    fileResp = client.newCall(buildFileRequest(token)).execute()
+                }
+            }
+
+            val fileId = fileResp.use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    val errorMsg = parseDriveErrorMessage(response.code, body)
+                    throw java.io.IOException("Google Drive probe file creation failed ($errorMsg)")
+                }
+                val json = JSONObject(body)
+                val id = json.optString("id")
+                if (id.isNullOrBlank()) {
+                    throw java.io.IOException("Google Drive returned invalid or empty file ID")
+                }
+                id
+            }
+
+            ReelixLog.d("Created cross-client test probe: folder=$folderId, file=$fileId")
+            Result.success(
+                CrossClientProbeResult(
+                    folderId = folderId,
+                    fileId = fileId,
+                    folderName = folderName,
+                )
+            )
+        } catch (e: java.io.IOException) {
+            ReelixLog.w("Network failure while creating cross-client test probe: ${e.message}")
+            Result.failure(java.io.IOException("Network error while creating test probe: ${e.message}", e))
+        } catch (e: Exception) {
+            ReelixLog.w("Unexpected error while creating cross-client test probe: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun verifyCrossClientTestProbe(fileId: String): Result<CrossClientProbeVerification> = withContext(Dispatchers.IO) {
+        var token = tokenProvider()
+        if (token.isNullOrBlank()) {
+            val refreshed = tokenRefresher?.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+            } else {
+                return@withContext Result.failure(
+                    IllegalStateException("Google Drive authentication token missing. Please connect Google Drive in Settings.")
+                )
+            }
+        }
+
+        try {
+            val cleanFileId = fileId.trim()
+            fun buildGetRequest(tok: String) = Request.Builder()
+                .url("https://www.googleapis.com/drive/v3/files/$cleanFileId?alt=media")
+                .addHeader("Authorization", "Bearer $tok")
+                .addHeader("Cache-Control", "no-cache, no-store")
+                .addHeader("Pragma", "no-cache")
+                .get()
+                .build()
+
+            var resp = client.newCall(buildGetRequest(token)).execute()
+            if (resp.code == 401 && tokenRefresher != null) {
+                resp.close()
+                val refreshed = tokenRefresher.invoke()
+                if (!refreshed.isNullOrBlank()) {
+                    token = refreshed
+                    resp = client.newCall(buildGetRequest(token)).execute()
+                }
+            }
+
+            val statusCode = resp.code
+            val body = resp.use { response ->
+                if (!response.isSuccessful) {
+                    val err = parseDriveErrorMessage(response.code, response.body?.string().orEmpty())
+                    throw java.io.IOException("Failed to read probe file (HTTP ${response.code}: $err)")
+                }
+                response.body?.string().orEmpty()
+            }
+
+            val byteCount = body.toByteArray(Charsets.UTF_8).size
+            val json = JSONObject(body)
+            val version = json.optInt("version", -1)
+            val updatedBy = if (json.has("updated_by") && !json.isNull("updated_by")) json.optString("updated_by") else null
+            val isVerified = version == 2 && updatedBy == "worker_client_b"
+            val message = if (isVerified) {
+                "✓ Cross-client verification SUCCESS: Manifest version=2, updated_by=worker_client_b [File ID: $cleanFileId, HTTP $statusCode, $byteCount bytes]"
+            } else {
+                "Manifest version $version (updated_by: $updatedBy). Expected version 2 from worker_client_b. [File ID: $cleanFileId, HTTP $statusCode, $byteCount bytes]"
+            }
+
+            ReelixLog.d(
+                "Cross-client probe verification diagnostic: fileId=$cleanFileId, http=$statusCode, bytes=$byteCount, version=$version, updatedBy=$updatedBy, verified=$isVerified"
+            )
+            Result.success(
+                CrossClientProbeVerification(
+                    version = version,
+                    updatedBy = updatedBy,
+                    isVerified = isVerified,
+                    message = message,
+                )
+            )
+        } catch (e: Exception) {
+            ReelixLog.w("Error verifying cross-client test probe: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    override suspend fun cleanupCrossClientTestProbe(folderId: String, fileId: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        var token = tokenProvider()
+        if (token.isNullOrBlank()) {
+            val refreshed = tokenRefresher?.invoke()
+            if (!refreshed.isNullOrBlank()) token = refreshed
+            else return@withContext Result.failure(IllegalStateException("Google Drive authentication token missing."))
+        }
+
+        try {
+            fun buildDeleteRequest(tok: String, id: String) = Request.Builder()
+                .url("https://www.googleapis.com/drive/v3/files/$id")
+                .addHeader("Authorization", "Bearer $tok")
+                .delete()
+                .build()
+
+            // 1. Delete probe file
+            var fileResp = client.newCall(buildDeleteRequest(token, fileId)).execute()
+            if (fileResp.code == 401 && tokenRefresher != null) {
+                fileResp.close()
+                val refreshed = tokenRefresher.invoke()
+                if (!refreshed.isNullOrBlank()) {
+                    token = refreshed
+                    fileResp = client.newCall(buildDeleteRequest(token, fileId)).execute()
+                }
+            }
+            fileResp.close()
+
+            // 2. Delete test folder
+            var folderResp = client.newCall(buildDeleteRequest(token, folderId)).execute()
+            folderResp.close()
+
+            ReelixLog.d("Successfully cleaned up test probe from Drive (folder=$folderId, file=$fileId)")
+            Result.success(true)
+        } catch (e: Exception) {
+            ReelixLog.w("Error cleaning up cross-client test probe: ${e.message}")
             Result.failure(e)
         }
     }
@@ -736,6 +998,43 @@ class MockCloudSyncClient(
         return createVaultResult ?: Result.success(nextVaultFolderId)
     }
 
+    var nextCrossClientProbeResult: Result<CrossClientProbeResult>? = null
+    var createProbeCallCount = 0
+
+    override suspend fun createCrossClientTestProbe(): Result<CrossClientProbeResult> {
+        createProbeCallCount++
+        return nextCrossClientProbeResult ?: Result.success(
+            CrossClientProbeResult(
+                folderId = "mock_cross_client_folder_id_123",
+                fileId = "mock_cross_client_file_id_456",
+                folderName = "Reelix_CrossClient_Test_mock",
+            )
+        )
+    }
+
+    var nextCrossClientProbeVerification: Result<CrossClientProbeVerification>? = null
+    var verifyProbeCallCount = 0
+
+    override suspend fun verifyCrossClientTestProbe(fileId: String): Result<CrossClientProbeVerification> {
+        verifyProbeCallCount++
+        return nextCrossClientProbeVerification ?: Result.success(
+            CrossClientProbeVerification(
+                version = 2,
+                updatedBy = "worker_client_b",
+                isVerified = true,
+                message = "✓ Cross-client verification SUCCESS: Manifest version=2, updated_by=worker_client_b",
+            )
+        )
+    }
+
+    var nextCleanupProbeResult: Result<Boolean>? = null
+    var cleanupProbeCallCount = 0
+
+    override suspend fun cleanupCrossClientTestProbe(folderId: String, fileId: String): Result<Boolean> {
+        cleanupProbeCallCount++
+        return nextCleanupProbeResult ?: Result.success(true)
+    }
+
     override suspend fun submitJobManifest(manifest: CloudJobManifest): Boolean {
         jobs[manifest.itemId] = manifest
         return true
@@ -744,5 +1043,5 @@ class MockCloudSyncClient(
     override suspend fun fetchJobManifest(itemId: String): CloudJobManifest? = jobs[itemId]
 
     override suspend fun listCompletedJobs(): List<CloudJobManifest> =
-        jobs.values.filter { it.status in listOf("COMPLETED", "PARTIAL", "FAILED") }
+        jobs.values.filter { it.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY") }
 }

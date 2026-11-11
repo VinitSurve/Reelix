@@ -582,11 +582,15 @@ fun EditUserMetadataDialog(
 
 @Composable
 fun SaveLinkDialog(
-    onSaveText: (String) -> Unit,
+    onSave: (url: String, notes: String?, category: String?) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val focusManager = LocalFocusManager.current
     var input by rememberSaveable { mutableStateOf("") }
+    var notes by rememberSaveable { mutableStateOf("") }
+    var category by rememberSaveable { mutableStateOf("") }
+    var showDetails by rememberSaveable { mutableStateOf(false) }
+
     ReelixModalDialog(
         title = "Save Instagram link",
         onDismissRequest = {
@@ -598,7 +602,11 @@ fun SaveLinkDialog(
                 enabled = input.isNotBlank(),
                 onClick = {
                     focusManager.clearFocus(force = true)
-                    onSaveText(input)
+                    onSave(
+                        input,
+                        notes.trim().takeIf { it.isNotBlank() },
+                        category.trim().takeIf { it.isNotBlank() },
+                    )
                 },
             ) {
                 Text("Save to queue")
@@ -615,7 +623,7 @@ fun SaveLinkDialog(
         content = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = "Tip: While browsing Instagram, tap Share → Save to Reelix for instant one-tap saving. You can also paste one or more Instagram links here.",
+                    text = "Tip: While browsing Instagram, tap Share → Save to Reelix for instant one-tap saving. You can also paste an Instagram link here.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -630,8 +638,47 @@ fun SaveLinkDialog(
                         .fillMaxWidth()
                         .testTag("manual_url_input"),
                 )
+
+                if (!showDetails) {
+                    TextButton(onClick = { showDetails = true }) {
+                        Text("+ Add optional notes or category")
+                    }
+                } else {
+                    OutlinedTextField(
+                        value = category,
+                        onValueChange = { category = it },
+                        label = { Text("Category (optional)") },
+                        placeholder = { Text("e.g., Coding, Fitness, Recipe") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("manual_category_input"),
+                    )
+                    OutlinedTextField(
+                        value = notes,
+                        onValueChange = { notes = it },
+                        label = { Text("Personal notes (optional)") },
+                        placeholder = { Text("Why are you saving this? Key ideas...") },
+                        minLines = 2,
+                        maxLines = 3,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("manual_notes_input"),
+                    )
+                }
             }
         },
+    )
+}
+
+@Composable
+fun SaveLinkDialog(
+    onSaveText: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    SaveLinkDialog(
+        onSave = { text, _, _ -> onSaveText(text) },
+        onDismiss = onDismiss,
     )
 }
 

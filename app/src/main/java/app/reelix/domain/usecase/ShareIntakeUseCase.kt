@@ -111,15 +111,26 @@ class ShareIntakeUseCase(
         }
     }
 
-    suspend fun handleManualText(rawText: String, allowCopy: Boolean = false): ShareSaveResult {
+    suspend fun handleManualText(
+        rawText: String,
+        allowCopy: Boolean = false,
+        notes: String? = null,
+        category: String? = null,
+    ): ShareSaveResult {
         if (rawText.isBlank()) return ShareSaveResult.NothingShared
-        return handleSharedTexts(listOf(rawText), source = SaveSource.MANUAL, allowCopy = allowCopy)
+        return handleSharedTexts(
+            listOf(rawText),
+            source = SaveSource.MANUAL,
+            allowCopy = allowCopy,
+            initialNotes = notes,
+            initialCategory = category,
+        )
     }
 
     suspend fun saveAnotherCopy(link: InstagramLink, source: SaveSource = SaveSource.SHARE): LinkSaveOutcome {
         val outcome = repository.saveLink(link, source = source, allowCopy = true)
         if (outcome is LinkSaveOutcome.Saved) {
-            runCatching { scheduler.scheduleImmediate() }
+            runCatching { scheduler.scheduleImmediate(forceRunNow = true) }
                 .onFailure { ReelixLog.w("Scheduling failed after saving copy", it) }
         }
         return outcome
@@ -129,6 +140,8 @@ class ShareIntakeUseCase(
         texts: List<String>,
         source: SaveSource = SaveSource.SHARE,
         allowCopy: Boolean = false,
+        initialNotes: String? = null,
+        initialCategory: String? = null,
     ): ShareSaveResult {
         if (texts.all { it.isBlank() }) return ShareSaveResult.NothingShared
 
@@ -140,10 +153,19 @@ class ShareIntakeUseCase(
 
         return try {
             val outcomes = links.map { link ->
-                repository.saveLink(link, source = source, allowCopy = allowCopy)
+                val matchingText = texts.firstOrNull { it.contains(link.originalUrl) } ?: texts.firstOrNull()
+                val extraText = matchingText?.replace(link.originalUrl, "")?.trim()?.takeIf { it.isNotBlank() }
+                repository.saveLink(
+                    link = link,
+                    source = source,
+                    allowCopy = allowCopy,
+                    initialCaption = extraText,
+                    initialNotes = initialNotes,
+                    initialCategory = initialCategory,
+                )
             }
             if (outcomes.any { it is LinkSaveOutcome.Saved }) {
-                runCatching { scheduler.scheduleImmediate() }
+                runCatching { scheduler.scheduleImmediate(forceRunNow = true) }
                     .onFailure { ReelixLog.w("Background scheduling deferred", it) }
             }
             ShareSaveResult.Handled(outcomes)

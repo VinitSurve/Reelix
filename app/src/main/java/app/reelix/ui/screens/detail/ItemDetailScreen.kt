@@ -544,6 +544,22 @@ fun ItemDetailScreen(
                         }
                     }
 
+                    // 6b. On-screen Visual Text (OCR)
+                    if (!item.ocrText.isNullOrBlank()) {
+                        item(key = "ocr_section") {
+                            SectionCard {
+                                SectionHeader(
+                                    title = "On-screen visual text (OCR)",
+                                    provenance = ProvenanceKind.EXTRACTED,
+                                )
+                                Text(
+                                    text = item.ocrText,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                        }
+                    }
+
                     // 7. AI-generated Enrichment
                     item(key = "ai_section") {
                         SectionCard {

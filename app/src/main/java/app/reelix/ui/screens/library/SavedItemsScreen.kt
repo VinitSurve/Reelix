@@ -18,9 +18,11 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.SwapVert
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -148,6 +150,13 @@ class SavedItemsViewModel(
         }
     }
 
+    fun syncNow() {
+        viewModelScope.launch {
+            scheduler.scheduleImmediate(forceRunNow = true)
+            _feedback.value = "Syncing vault with Google Drive..."
+        }
+    }
+
     fun consumeFeedback() {
         _feedback.value = null
     }
@@ -201,6 +210,12 @@ fun SavedItemsScreen(
             TopAppBar(
                 title = { Text("Saved items") },
                 actions = {
+                    IconButton(
+                        onClick = viewModel::syncNow,
+                        modifier = Modifier.testTag("library_sync_button"),
+                    ) {
+                        Icon(Icons.Outlined.Sync, contentDescription = "Sync vault")
+                    }
                     TextButton(
                         onClick = viewModel::toggleSortOrder,
                         modifier = Modifier.testTag("sort_toggle_button"),

@@ -60,6 +60,10 @@ class CloudSyncTest {
             itemId = "item_cloud_test_123",
             source = "MEDIA_SHARE",
             originalUrl = "https://www.instagram.com/reel/C8xyz123/",
+            caption = "Amazing pasta tutorial",
+            userNotes = "Make this tonight",
+            category = "Cooking",
+            userTags = listOf("food", "dinner"),
             status = "COMPLETED",
             claimedBy = "github-runner-1",
             claimedAt = 1730000000000L,
@@ -86,6 +90,7 @@ class CloudSyncTest {
                 audioSizeBytes = 1_200_000L,
                 transcript = "This is a transcribed tutorial on Kotlin coroutines and structured concurrency.",
                 transcriptModel = "base",
+                ocrText = "Step 1: Ingredients\nStep 2: Method",
                 analysis = CloudAnalysisResult(
                     summary = "Overview of coroutines",
                     detailedSummary = "Deep dive into structured concurrency, coroutine scopes, and cancellation.",
@@ -109,6 +114,10 @@ class CloudSyncTest {
         assertEquals(original.itemId, parsed.itemId)
         assertEquals(original.source, parsed.source)
         assertEquals(original.originalUrl, parsed.originalUrl)
+        assertEquals("Amazing pasta tutorial", parsed.caption)
+        assertEquals("Make this tonight", parsed.userNotes)
+        assertEquals("Cooking", parsed.category)
+        assertEquals(listOf("food", "dinner"), parsed.userTags)
         assertEquals(original.status, parsed.status)
         assertEquals(original.claimedBy, parsed.claimedBy)
         assertEquals(original.claimedAt, parsed.claimedAt)
@@ -129,6 +138,7 @@ class CloudSyncTest {
         assertEquals("SUCCEEDED", parsed.stages.transcription)
         assertEquals("SUCCEEDED", parsed.stages.geminiAnalysis)
 
+        assertEquals("Step 1: Ingredients\nStep 2: Method", parsed.results.ocrText)
         assertNotNull(parsed.results.analysis)
         assertEquals("Overview of coroutines", parsed.results.analysis!!.summary)
         assertEquals("Kotlin Coroutines", parsed.results.analysis!!.mainTopic)
@@ -1062,5 +1072,403 @@ class CloudSyncTest {
         assertEquals("device_original.mp4", updatedItem.mediaFileName)
         assertEquals(localFile.length(), updatedItem.mediaSizeBytes)
         assertEquals(ProcessingStatus.COMPLETED, updatedItem.processingStatus)
+    }
+
+    @Test
+    fun endToEnd_saveReelWithCaptionAndNotes_cloudOffload_syncBackWithOcrAndGemini_ftsSearchable() = runTest {
+        // 1. User shares or enters an Instagram Reel URL with caption and notes
+        val sharedText = "Authentic Roman Carbonara recipe https://www.instagram.com/reel/C8carbonara123/"
+        val saveResult = container.shareIntakeUseCase.handleSharedTexts(
+            texts = listOf(sharedText),
+            source = SaveSource.SHARE,
+            initialNotes = "Remember: strictly guanciale, never bacon",
+            initialCategory = "Culinary",
+        )
+        assertTrue(saveResult is app.reelix.domain.model.ShareSaveResult.Handled)
+        val handled = saveResult as app.reelix.domain.model.ShareSaveResult.Handled
+        assertEquals(1, handled.saved.size)
+        val itemId = handled.saved.first().itemId
+
+        // Verify initial state in Room database
+        val item = container.savedItemRepository.getItem(itemId)
+        assertNotNull(item)
+        assertEquals("https://www.instagram.com/reel/C8carbonara123/", item!!.originalUrl)
+        assertEquals("https://www.instagram.com/reel/C8carbonara123/", item.normalizedUrl)
+        assertEquals("Authentic Roman Carbonara recipe", item.caption)
+        assertEquals("Remember: strictly guanciale, never bacon", item.userNotes)
+        assertEquals("Culinary", item.category)
+        assertEquals(ProcessingStatus.QUEUED, item.processingStatus)
+
+        // 2. Offload to Cloud Queue (Google Drive)
+        container.fakeCloudClient.isEnabled = true
+        val uploaded = container.cloudSyncRepository.uploadPendingItem(itemId)
+        assertTrue(uploaded)
+
+        // Verify manifest registered in Drive queue
+        val queuedManifest = container.fakeCloudClient.jobs[itemId]
+        assertNotNull(queuedManifest)
+        assertEquals(itemId, queuedManifest!!.itemId)
+        assertEquals("Authentic Roman Carbonara recipe", queuedManifest.caption)
+        assertEquals("Remember: strictly guanciale, never bacon", queuedManifest.userNotes)
+        assertEquals("Culinary", queuedManifest.category)
+        assertEquals("QUEUED", queuedManifest.status)
+
+        // 3. Worker completes all stages in cloud (including Whisper transcription, Visual Text OCR, and Gemini)
+        val completedManifest = queuedManifest.copy(
+            status = "COMPLETED",
+            claimedBy = "worker_client_b",
+            claimedAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+            stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "SUCCEEDED",
+            ),
+            results = CloudJobResults(
+                audioDriveFileId = "audio_carbonara_drive_id",
+                audioSizeBytes = 850_000L,
+                transcript = "Whisk eggs with grated pecorino cheese and coarse black pepper until creamy",
+                transcriptModel = "base",
+                ocrText = "Step 1: Crisp guanciale in pan\nStep 2: No heavy cream ever!",
+                analysis = CloudAnalysisResult(
+                    summary = "Traditional Roman carbonara technique",
+                    detailedSummary = "Step by step guide to creating an authentic egg and pecorino emulsion with pasta water.",
+                    mainTopic = "Italian Cooking",
+                    category = "Culinary",
+                    keywords = listOf("carbonara", "pecorino", "guanciale", "emulsion"),
+                    tags = listOf("pasta", "roman", "dinner"),
+                    keyTakeaways = listOf("Never add heavy cream", "Stir egg mixture off heat"),
+                    importantConcepts = listOf("Emulsification", "Guanciale Rendered Fat"),
+                    actionableSteps = listOf("Crisp guanciale", "Toss pasta in fat", "Mix egg off heat"),
+                    modelName = "gemini-3.6-flash",
+                    generatedAt = container.clock.now(),
+                ),
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = completedManifest
+
+        // 4. Synchronize completed jobs back into local Room database
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+
+        // Verify updated database state
+        val syncedItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(syncedItem)
+        assertEquals(ProcessingStatus.COMPLETED, syncedItem!!.processingStatus)
+        assertEquals(StageStatus.SUCCEEDED, syncedItem.transcriptionStatus)
+        assertEquals(StageStatus.SUCCEEDED, syncedItem.audioExtractionStatus)
+        assertEquals(StageStatus.SUCCEEDED, syncedItem.analysisStatus)
+
+        // 5. Verify ItemDetails contains all enriched knowledge
+        val details = container.savedItemRepository.observeDetails(itemId).first()
+        assertNotNull(details)
+        assertEquals("Traditional Roman carbonara technique", details!!.aiResult?.summary)
+        assertEquals("Whisk eggs with grated pecorino cheese and coarse black pepper until creamy", details.generatedTranscript)
+        assertEquals("Step 1: Crisp guanciale in pan\nStep 2: No heavy cream ever!", details.ocrText)
+        assertEquals("https://www.instagram.com/reel/C8carbonara123/", details.originalUrl)
+        assertTrue(details.tags.any { it.name == "pasta" })
+
+        // 6. Verify Room FTS4 Search matches all aspects of knowledge
+        // Keyword from caption:
+        val searchByCaption = container.savedItemRepository.search("recipe", ItemQuery()).first()
+        assertEquals(1, searchByCaption.size)
+        assertEquals(itemId, searchByCaption.first().id)
+
+        // Keyword from user notes:
+        val searchByNotes = container.savedItemRepository.search("guanciale", ItemQuery()).first()
+        assertEquals(1, searchByNotes.size)
+        assertEquals(itemId, searchByNotes.first().id)
+
+        // Keyword from Whisper transcript:
+        val searchByTranscript = container.savedItemRepository.search("pecorino", ItemQuery()).first()
+        assertEquals(1, searchByTranscript.size)
+        assertEquals(itemId, searchByTranscript.first().id)
+
+        // Keyword from on-screen OCR visual text:
+        val searchByOcr = container.savedItemRepository.search("cream", ItemQuery()).first()
+        assertEquals(1, searchByOcr.size)
+        assertEquals(itemId, searchByOcr.first().id)
+
+        // Keyword from Gemini concept:
+        val searchByConcept = container.savedItemRepository.search("emulsification", ItemQuery()).first()
+        assertEquals(1, searchByConcept.size)
+        assertEquals(itemId, searchByConcept.first().id)
+
+        // Search by tag:
+        val searchByTag = container.savedItemRepository.search("roman", ItemQuery()).first()
+        assertEquals(1, searchByTag.size)
+        assertEquals(itemId, searchByTag.first().id)
+    }
+
+    @Test
+    fun resubmissionPreservesRemoteProcessingStatusAndStages() = runTest {
+        // Save initial item
+        val linkOutcome = container.savedItemRepository.saveLink(
+            InstagramLink(
+                originalUrl = "https://www.instagram.com/reel/ResubmitTest123/",
+                normalizedUrl = "https://www.instagram.com/reel/ResubmitTest123/",
+                contentType = ContentType.REEL,
+                shortcode = "ResubmitTest123",
+            ),
+            source = SaveSource.SHARE,
+            initialNotes = "Initial Notes",
+        )
+        assertTrue(linkOutcome is LinkSaveOutcome.Saved)
+        val itemId = (linkOutcome as LinkSaveOutcome.Saved).itemId
+
+        // Enable cloud
+        container.settingsRepository.update {
+            it.copy(
+                cloudProcessingEnabled = true,
+                cloudDriveFolderId = "folder_root_123",
+            )
+        }
+        container.settingsRepository.setCloudDriveCredentials(accessToken = "token_abc")
+
+        // First upload submits as QUEUED
+        val uploaded = container.cloudSyncRepository.uploadPendingItem(itemId)
+        assertTrue(uploaded)
+
+        val firstManifest = container.fakeCloudClient.fetchJobManifest(itemId)
+        assertNotNull(firstManifest)
+        assertEquals("QUEUED", firstManifest!!.status)
+        assertEquals(1L, firstManifest.recordRevision)
+
+        // Simulate cloud worker actively claiming and running stages
+        val activeManifest = firstManifest.copy(
+            status = "PROCESSING",
+            claimedBy = "worker-alpha",
+            claimedAt = container.clock.now(),
+            recordRevision = 2L,
+            stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "PENDING",
+                ocr = "PENDING",
+                geminiAnalysis = "PENDING",
+            ),
+        )
+        container.fakeCloudClient.submitJobManifest(activeManifest)
+
+        // User updates local notes and triggers resubmit
+        container.savedItemRepository.updateUserMetadata(
+            id = itemId,
+            metadata = app.reelix.domain.model.UserMetadata(
+                title = null,
+                caption = null,
+                transcript = null,
+                notes = "Updated Notes While Processing",
+                category = null,
+                tags = emptyList(),
+            ),
+        )
+        val resubmitted = container.cloudSyncRepository.uploadPendingItem(itemId)
+        assertTrue(resubmitted)
+
+        // Authoritative cloud manifest must PRESERVE active status and stages!
+        val afterResubmit = container.fakeCloudClient.fetchJobManifest(itemId)
+        assertNotNull(afterResubmit)
+        assertEquals("PROCESSING", afterResubmit!!.status)
+        assertEquals("worker-alpha", afterResubmit.claimedBy)
+        assertEquals("SUCCEEDED", afterResubmit.stages.audioExtraction)
+        assertEquals("Updated Notes While Processing", afterResubmit.userNotes)
+        assertEquals(3L, afterResubmit.recordRevision)
+    }
+
+    @Test
+    fun schemaVersionAndRecordRevisionDecoupling() {
+        val manifest = CloudJobManifest(
+            schemaVersion = 1,
+            recordRevision = 42L,
+            itemId = "item_rev_test",
+            source = "SHARE",
+            createdAt = 1000L,
+            updatedAt = 2000L,
+        )
+        val json = manifest.toJson()
+        val parsed = CloudJobManifest.fromJson(json)
+
+        assertEquals(1, parsed.schemaVersion)
+        assertEquals(42L, parsed.recordRevision)
+        assertEquals("item_rev_test", parsed.itemId)
+    }
+
+    @Test
+    fun testSyncManifestProcessedWithoutAiAnalysisMarksCompleted() = runTest {
+        // 1. Create initial item
+        val linkOutcome = container.savedItemRepository.saveLink(
+            InstagramLink(
+                originalUrl = "https://www.instagram.com/reel/PhotoTip123/",
+                normalizedUrl = "https://www.instagram.com/reel/PhotoTip123/",
+                contentType = ContentType.REEL,
+                shortcode = "PhotoTip123",
+            ),
+            source = SaveSource.SHARE,
+            initialNotes = "Rule of thirds explanation",
+        )
+        assertTrue(linkOutcome is LinkSaveOutcome.Saved)
+        val itemId = (linkOutcome as LinkSaveOutcome.Saved).itemId
+
+        // 2. Enable cloud sync and upload
+        container.fakeCloudClient.isEnabled = true
+        val uploaded = container.cloudSyncRepository.uploadPendingItem(itemId)
+        assertTrue(uploaded)
+
+        val queuedManifest = container.fakeCloudClient.jobs[itemId]
+        assertNotNull(queuedManifest)
+
+        // 3. Worker completes media + Whisper transcription, but skips Gemini analysis (unconfigured or skipped)
+        val completedManifest = queuedManifest!!.copy(
+            status = "COMPLETED",
+            claimedBy = "worker_gha_no_ai",
+            claimedAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+            stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "SKIPPED",
+            ),
+            results = CloudJobResults(
+                audioDriveFileId = "audio_photo_drive_id",
+                audioSizeBytes = 450_000L,
+                transcript = "Mastering photography composition requires balancing light and shadows across the frame",
+                transcriptModel = "base",
+                ocrText = "Tip 1: Leading lines",
+                analysis = null,
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = completedManifest
+
+        // 4. Synchronize from cloud
+        val synced = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, synced)
+
+        // 5. Verify local database marks item COMPLETED, transcription SUCCEEDED, and analysis SKIPPED
+        val syncedItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(syncedItem)
+        assertEquals(ProcessingStatus.COMPLETED, syncedItem!!.processingStatus)
+        assertEquals(StageStatus.SUCCEEDED, syncedItem.transcriptionStatus)
+        assertEquals(StageStatus.SKIPPED, syncedItem.analysisStatus)
+
+        // 6. Verify item details has transcript and OCR
+        val details = container.savedItemRepository.observeDetails(itemId).first()
+        assertNotNull(details)
+        assertNull(details!!.aiResult)
+        assertEquals("Mastering photography composition requires balancing light and shadows across the frame", details.generatedTranscript)
+        assertEquals("Tip 1: Leading lines", details.ocrText)
+
+        // 7. Verify FTS4 search finds the item via transcript
+        val searchResults = container.savedItemRepository.search("photography", ItemQuery()).first()
+        assertEquals(1, searchResults.size)
+        assertEquals(itemId, searchResults.first().id)
+    }
+
+    @Test
+    fun testSyncManifestWaitingRetrySetsLocalStatusAndRecovers() = runTest {
+        // 1. Create initial item
+        val linkOutcome = container.savedItemRepository.saveLink(
+            InstagramLink(
+                originalUrl = "https://www.instagram.com/reel/RetryTest123/",
+                normalizedUrl = "https://www.instagram.com/reel/RetryTest123/",
+                contentType = ContentType.REEL,
+                shortcode = "RetryTest123",
+            ),
+            source = SaveSource.SHARE,
+            initialNotes = "Distributed queue resilience test",
+        )
+        assertTrue(linkOutcome is LinkSaveOutcome.Saved)
+        val itemId = (linkOutcome as LinkSaveOutcome.Saved).itemId
+
+        // 2. Enable cloud sync and upload
+        container.fakeCloudClient.isEnabled = true
+        val uploaded = container.cloudSyncRepository.uploadPendingItem(itemId)
+        assertTrue(uploaded)
+
+        val queuedManifest = container.fakeCloudClient.jobs[itemId]
+        assertNotNull(queuedManifest)
+
+        // 3. Worker experiences transient Gemini 503 failure: marks WAITING_RETRY
+        val retryTime = container.clock.now() + 60_000L
+        val retryManifest = queuedManifest!!.copy(
+            status = "WAITING_RETRY",
+            claimedBy = null,
+            claimedAt = null,
+            updatedAt = container.clock.now(),
+            retryCount = 1,
+            nextRetryAt = retryTime,
+            errorMessage = "HTTP 503: The model is overloaded. Please try again later.",
+            stages = CloudStageStates(
+                acquisition = "SUCCEEDED",
+                audioExtraction = "SUCCEEDED",
+                transcription = "SUCCEEDED",
+                geminiAnalysis = "FAILED",
+            ),
+            results = CloudJobResults(
+                audioDriveFileId = "audio_resilience_id",
+                audioSizeBytes = 320_000L,
+                transcript = "Architecting resilient distributed systems requires exponential backoff with jitter",
+                transcriptModel = "base",
+                ocrText = "Reliability pattern: Backoff",
+                analysis = null,
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = retryManifest
+
+        // 4. Synchronize WAITING_RETRY state to Android
+        val syncedRetry = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, syncedRetry)
+
+        val itemDuringRetry = container.savedItemRepository.getItem(itemId)
+        assertNotNull(itemDuringRetry)
+        assertEquals(ProcessingStatus.WAITING_RETRY, itemDuringRetry!!.processingStatus)
+        assertEquals("HTTP 503: The model is overloaded. Please try again later.", itemDuringRetry.lastError)
+        assertEquals(retryTime, itemDuringRetry.nextAttemptAt)
+        assertEquals(StageStatus.SUCCEEDED, itemDuringRetry.transcriptionStatus)
+
+        // 5. Cloud worker resumes after timer matures and successfully completes Gemini analysis
+        val recoveredManifest = retryManifest.copy(
+            status = "COMPLETED",
+            claimedBy = "worker_recovered",
+            claimedAt = container.clock.now(),
+            updatedAt = container.clock.now(),
+            stages = retryManifest.stages.copy(geminiAnalysis = "SUCCEEDED"),
+            results = retryManifest.results.copy(
+                analysis = CloudAnalysisResult(
+                    summary = "Distributed resilience with jittered backoff",
+                    detailedSummary = "Detailed guide on preventing thundering herd problems with randomized exponential backoff.",
+                    mainTopic = "Distributed Systems",
+                    category = "Engineering",
+                    keywords = listOf("backoff", "jitter", "resilience"),
+                    tags = listOf("architecture", "systems"),
+                    keyTakeaways = listOf("Avoid synchronous retries", "Add full jitter"),
+                    importantConcepts = listOf("Thundering Herd"),
+                    actionableSteps = listOf("Implement truncated binary backoff"),
+                    modelName = "gemini-3.6-flash",
+                    generatedAt = container.clock.now(),
+                ),
+            ),
+        )
+        container.fakeCloudClient.jobs[itemId] = recoveredManifest
+
+        // 6. Synchronize COMPLETED recovery state to Android
+        val syncedRecovery = container.cloudSyncRepository.syncCompletedJobs()
+        assertEquals(1, syncedRecovery)
+
+        val finalItem = container.savedItemRepository.getItem(itemId)
+        assertNotNull(finalItem)
+        assertEquals(ProcessingStatus.COMPLETED, finalItem!!.processingStatus)
+        assertEquals(StageStatus.SUCCEEDED, finalItem.transcriptionStatus)
+        assertEquals(StageStatus.SUCCEEDED, finalItem.analysisStatus)
+
+        // 7. Verify FTS4 search indexes both transcript and recovered AI takeaways
+        val searchTranscript = container.savedItemRepository.search("jitter", ItemQuery()).first()
+        assertEquals(1, searchTranscript.size)
+        assertEquals(itemId, searchTranscript.first().id)
+
+        val searchTakeaway = container.savedItemRepository.search("thundering", ItemQuery()).first()
+        assertEquals(1, searchTakeaway.size)
+        assertEquals(itemId, searchTakeaway.first().id)
     }
 }

@@ -22,8 +22,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.ErrorOutline
@@ -32,11 +34,14 @@ import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
@@ -58,8 +63,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -139,8 +146,43 @@ class SettingsViewModel(
     private val _isCreatingVault = MutableStateFlow(false)
     val isCreatingVault: StateFlow<Boolean> = _isCreatingVault.asStateFlow()
 
+    private val _isCreatingProbe = MutableStateFlow(false)
+    val isCreatingProbe: StateFlow<Boolean> = _isCreatingProbe.asStateFlow()
+
+    private val _crossClientProbeResult = MutableStateFlow<app.reelix.cloud.CrossClientProbeResult?>(null)
+    val crossClientProbeResult: StateFlow<app.reelix.cloud.CrossClientProbeResult?> = _crossClientProbeResult.asStateFlow()
+
+    private val _isVerifyingProbe = MutableStateFlow(false)
+    val isVerifyingProbe: StateFlow<Boolean> = _isVerifyingProbe.asStateFlow()
+
+    private val _crossClientProbeVerification = MutableStateFlow<app.reelix.cloud.CrossClientProbeVerification?>(null)
+    val crossClientProbeVerification: StateFlow<app.reelix.cloud.CrossClientProbeVerification?> = _crossClientProbeVerification.asStateFlow()
+
+    private val _isCleaningUpProbe = MutableStateFlow(false)
+    val isCleaningUpProbe: StateFlow<Boolean> = _isCleaningUpProbe.asStateFlow()
+
+    private val _probeError = MutableStateFlow<String?>(null)
+    val probeError: StateFlow<String?> = _probeError.asStateFlow()
+
     init {
         refreshStorage()
+        viewModelScope.launch {
+            settingsRepository.settings.collect { current ->
+                if (current.lastTestProbeFileId.isNotBlank()) {
+                    if (_crossClientProbeResult.value?.fileId != current.lastTestProbeFileId ||
+                        _crossClientProbeResult.value?.folderId != current.lastTestProbeFolderId
+                    ) {
+                        _crossClientProbeResult.value = app.reelix.cloud.CrossClientProbeResult(
+                            folderId = current.lastTestProbeFolderId,
+                            fileId = current.lastTestProbeFileId,
+                            folderName = current.lastTestProbeFolderName,
+                        )
+                    }
+                } else {
+                    _crossClientProbeResult.value = null
+                }
+            }
+        }
     }
 
     fun refreshStorage() {
@@ -376,6 +418,10 @@ class SettingsViewModel(
         }
     }
 
+    fun setFeedback(message: String) {
+        _feedback.value = message
+    }
+
     fun consumeFeedback() {
         _feedback.value = null
     }
@@ -457,9 +503,7 @@ class SettingsViewModel(
             }
             _isCreatingVault.value = true
             try {
-                val result = withContext(Dispatchers.IO) {
-                    client?.createOrGetVaultFolder() ?: repo!!.createOrGetVaultFolder()
-                }
+                val result = client?.createOrGetVaultFolder() ?: repo!!.createOrGetVaultFolder()
                 result.fold(
                     onSuccess = { folderId ->
                         settingsRepository.update { current ->
@@ -480,6 +524,136 @@ class SettingsViewModel(
                 _isCreatingVault.value = false
             }
         }
+    }
+
+    fun createCrossClientTestProbe() {
+        viewModelScope.launch {
+            val client = cloudSyncClient
+            val repo = cloudSyncRepository
+            if (client == null && repo == null) {
+                val err = "Google Drive client is unavailable."
+                _probeError.value = err
+                _feedback.value = err
+                return@launch
+            }
+            _isCreatingProbe.value = true
+            _probeError.value = null
+            try {
+                val result = client?.createCrossClientTestProbe() ?: repo!!.createCrossClientTestProbe()
+                result.fold(
+                    onSuccess = { probe ->
+                        _crossClientProbeResult.value = probe
+                        _probeError.value = null
+                        settingsRepository.saveTestProbe(probe.folderId, probe.fileId, probe.folderName)
+                        _feedback.value = "Cross-client test probe created successfully!"
+                    },
+                    onFailure = { error ->
+                        val msg = "Failed to create test probe: ${error.message}"
+                        _probeError.value = msg
+                        _feedback.value = msg
+                    }
+                )
+            } catch (e: Exception) {
+                val msg = "Failed to create test probe: ${e.message}"
+                _probeError.value = msg
+                _feedback.value = msg
+            } finally {
+                _isCreatingProbe.value = false
+            }
+        }
+    }
+
+    fun verifyCrossClientTestProbe(customFileId: String? = null) {
+        val targetFileId = customFileId?.trim()?.takeIf { it.isNotEmpty() }
+            ?: _crossClientProbeResult.value?.fileId
+            ?: return
+        viewModelScope.launch {
+            val client = cloudSyncClient
+            val repo = cloudSyncRepository
+            if (client == null && repo == null) {
+                val err = "Google Drive client is unavailable."
+                _probeError.value = err
+                _feedback.value = err
+                return@launch
+            }
+            _isVerifyingProbe.value = true
+            try {
+                val result = client?.verifyCrossClientTestProbe(targetFileId) ?: repo!!.verifyCrossClientTestProbe(targetFileId)
+                result.fold(
+                    onSuccess = { verification ->
+                        _crossClientProbeVerification.value = verification
+                        _probeError.value = null
+                        _feedback.value = verification.message
+                    },
+                    onFailure = { error ->
+                        val msg = "Probe verification failed: ${error.message}"
+                        _probeError.value = msg
+                        _feedback.value = msg
+                    }
+                )
+            } catch (e: Exception) {
+                val msg = "Error verifying test probe: ${e.message}"
+                _probeError.value = msg
+                _feedback.value = msg
+            } finally {
+                _isVerifyingProbe.value = false
+            }
+        }
+    }
+
+    fun cleanupCrossClientTestProbe() {
+        val probe = _crossClientProbeResult.value ?: return
+        viewModelScope.launch {
+            val client = cloudSyncClient
+            val repo = cloudSyncRepository
+            if (client == null && repo == null) {
+                val err = "Google Drive client is unavailable."
+                _probeError.value = err
+                _feedback.value = err
+                return@launch
+            }
+            _isCleaningUpProbe.value = true
+            try {
+                val result = client?.cleanupCrossClientTestProbe(probe.folderId, probe.fileId) ?: repo!!.cleanupCrossClientTestProbe(probe.folderId, probe.fileId)
+                result.fold(
+                    onSuccess = {
+                        _crossClientProbeResult.value = null
+                        _crossClientProbeVerification.value = null
+                        _probeError.value = null
+                        settingsRepository.clearTestProbe()
+                        _feedback.value = "Test probe cleaned up successfully from Drive."
+                    },
+                    onFailure = { error ->
+                        val msg = "Failed to clean up test probe: ${error.message}"
+                        _probeError.value = msg
+                        _feedback.value = msg
+                    }
+                )
+            } catch (e: Exception) {
+                val msg = "Error cleaning up probe: ${e.message}"
+                _probeError.value = msg
+                _feedback.value = msg
+            } finally {
+                _isCleaningUpProbe.value = false
+            }
+        }
+    }
+
+    fun restoreKnownProbe() {
+        _crossClientProbeResult.value = app.reelix.cloud.CrossClientProbeResult(
+            folderId = AppSettings.KNOWN_TEST_PROBE_FOLDER_ID,
+            fileId = AppSettings.KNOWN_TEST_PROBE_FILE_ID,
+            folderName = AppSettings.KNOWN_TEST_PROBE_FOLDER_NAME,
+        )
+        _probeError.value = null
+        viewModelScope.launch {
+            settingsRepository.restoreKnownProbe()
+            _feedback.value = "Restored existing cross-client test probe."
+        }
+    }
+
+    fun clearProbeError() {
+        _probeError.value = null
     }
 
     companion object {
@@ -541,6 +715,13 @@ fun SettingsScreen(
     val isSyncingCloud by viewModel.isSyncingCloud.collectAsStateWithLifecycle()
     val isConnectingDrive by viewModel.isConnectingDrive.collectAsStateWithLifecycle()
     val isCreatingVault by viewModel.isCreatingVault.collectAsStateWithLifecycle()
+    val isCreatingProbe by viewModel.isCreatingProbe.collectAsStateWithLifecycle()
+    val crossClientProbeResult by viewModel.crossClientProbeResult.collectAsStateWithLifecycle()
+    val isVerifyingProbe by viewModel.isVerifyingProbe.collectAsStateWithLifecycle()
+    val crossClientProbeVerification by viewModel.crossClientProbeVerification.collectAsStateWithLifecycle()
+    val isCleaningUpProbe by viewModel.isCleaningUpProbe.collectAsStateWithLifecycle()
+    val probeError by viewModel.probeError.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
 
     val authorizationLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult(),
@@ -683,6 +864,333 @@ fun SettingsScreen(
                                 }
                                 Spacer(Modifier.height(6.dp))
                             }
+
+                            // Cross-Client Verification Test Probe
+                            Spacer(Modifier.height(4.dp))
+                            HorizontalDivider()
+                            Spacer(Modifier.height(8.dp))
+
+                            Text(
+                                text = "Cross-Client Verification",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                text = "Create an isolated test folder and probe file in Drive to verify GitHub Actions worker access without touching your Reelix Vault.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.height(6.dp))
+
+                            // State 3: Error Banner (shown if probeError != null, without hiding other controls)
+                            probeError?.let { err ->
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("probe_error_card"),
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(10.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Outlined.ErrorOutline,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(20.dp),
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            text = err,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onErrorContainer,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("probe_error_text"),
+                                        )
+                                        IconButton(
+                                            onClick = viewModel::clearProbeError,
+                                            modifier = Modifier
+                                                .size(24.dp)
+                                                .testTag("dismiss_probe_error_button"),
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Outlined.Delete,
+                                                contentDescription = "Dismiss error",
+                                                tint = MaterialTheme.colorScheme.error,
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(Modifier.height(8.dp))
+                            }
+
+                            val activeProbe = crossClientProbeResult
+                            if (activeProbe == null) {
+                                // State 1: No saved probe
+                                Text(
+                                    text = "No active test probe. Create a probe or restore the existing probe.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.testTag("no_probe_status_text"),
+                                )
+                                Spacer(Modifier.height(8.dp))
+
+                                Button(
+                                    onClick = viewModel::createCrossClientTestProbe,
+                                    enabled = !isCreatingProbe,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("create_cross_client_probe_button"),
+                                ) {
+                                    if (isCreatingProbe) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                            color = MaterialTheme.colorScheme.onPrimary,
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("Creating Test Probe...")
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Outlined.CheckCircle,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("Create Cross-Client Test Probe")
+                                    }
+                                }
+
+                                Spacer(Modifier.height(6.dp))
+                                OutlinedButton(
+                                    onClick = viewModel::restoreKnownProbe,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("restore_known_probe_button"),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Refresh,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Restore Existing Test Probe")
+                                }
+                            } else {
+                                // State 2: Probe exists
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("cross_client_probe_result_card"),
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Outlined.CheckCircle,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                            Spacer(Modifier.width(6.dp))
+                                            Text(
+                                                text = "Active Test Probe in Drive",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.testTag("active_probe_title"),
+                                            )
+                                        }
+                                        Spacer(Modifier.height(6.dp))
+
+                                        Text(
+                                            text = "TEST_FOLDER_ID",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) {
+                                            SelectionContainer(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = activeProbe.folderId,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    modifier = Modifier.testTag("probe_folder_id_text"),
+                                                )
+                                            }
+                                            IconButton(
+                                                onClick = {
+                                                    clipboard.setText(AnnotatedString(activeProbe.folderId))
+                                                    viewModel.setFeedback("Copied TEST_FOLDER_ID to clipboard")
+                                                },
+                                                modifier = Modifier.testTag("copy_probe_folder_id_button"),
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.ContentCopy,
+                                                    contentDescription = "Copy Folder ID",
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                            }
+                                        }
+
+                                        Spacer(Modifier.height(4.dp))
+                                        Text(
+                                            text = "TEST_FILE_ID",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) {
+                                            SelectionContainer(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = activeProbe.fileId,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    modifier = Modifier.testTag("probe_file_id_text"),
+                                                )
+                                            }
+                                            IconButton(
+                                                onClick = {
+                                                    clipboard.setText(AnnotatedString(activeProbe.fileId))
+                                                    viewModel.setFeedback("Copied TEST_FILE_ID to clipboard")
+                                                },
+                                                modifier = Modifier.testTag("copy_probe_file_id_button"),
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.ContentCopy,
+                                                    contentDescription = "Copy File ID",
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                            }
+                                        }
+
+                                        Spacer(Modifier.height(6.dp))
+                                        OutlinedButton(
+                                            onClick = {
+                                                val formatted = "folder_id: ${activeProbe.folderId}\nfile_id: ${activeProbe.fileId}"
+                                                clipboard.setText(AnnotatedString(formatted))
+                                                viewModel.setFeedback("Copied both probe IDs to clipboard")
+                                            },
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("copy_both_probe_ids_button"),
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Outlined.ContentCopy,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Copy Both IDs")
+                                        }
+
+                                        // Verification Result Banner
+                                        crossClientProbeVerification?.let { verification ->
+                                            Spacer(Modifier.height(8.dp))
+                                            Card(
+                                                colors = CardDefaults.cardColors(
+                                                    containerColor = if (verification.isVerified) {
+                                                        MaterialTheme.colorScheme.primaryContainer
+                                                    } else {
+                                                        MaterialTheme.colorScheme.errorContainer
+                                                    },
+                                                ),
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .testTag("probe_verification_result_card"),
+                                            ) {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    modifier = Modifier.padding(10.dp),
+                                                ) {
+                                                    Icon(
+                                                        imageVector = if (verification.isVerified) Icons.Outlined.CheckCircle else Icons.Outlined.ErrorOutline,
+                                                        contentDescription = null,
+                                                        tint = if (verification.isVerified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                                        modifier = Modifier.size(20.dp),
+                                                    )
+                                                    Spacer(Modifier.width(8.dp))
+                                                    Text(
+                                                        text = verification.message,
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = if (verification.isVerified) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer,
+                                                        modifier = Modifier.testTag("probe_verification_result_text"),
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        Spacer(Modifier.height(8.dp))
+
+                                        // Verify Probe Update Button
+                                        Button(
+                                            onClick = { viewModel.verifyCrossClientTestProbe() },
+                                            enabled = !isVerifyingProbe && !isCleaningUpProbe,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("verify_probe_update_button"),
+                                        ) {
+                                            if (isVerifyingProbe) {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.size(16.dp),
+                                                    strokeWidth = 2.dp,
+                                                    color = MaterialTheme.colorScheme.onPrimary,
+                                                )
+                                                Spacer(Modifier.width(8.dp))
+                                                Text("Verifying Update...")
+                                            } else {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.CheckCircle,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                                Spacer(Modifier.width(8.dp))
+                                                Text("Verify Probe Update (Read Version 2)")
+                                            }
+                                        }
+
+                                        Spacer(Modifier.height(6.dp))
+
+                                        // Cleanup Probe Button
+                                        OutlinedButton(
+                                            onClick = viewModel::cleanupCrossClientTestProbe,
+                                            enabled = !isVerifyingProbe && !isCleaningUpProbe,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("cleanup_probe_button"),
+                                        ) {
+                                            if (isCleaningUpProbe) {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.size(16.dp),
+                                                    strokeWidth = 2.dp,
+                                                )
+                                                Spacer(Modifier.width(8.dp))
+                                                Text("Cleaning Up...")
+                                            } else {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.Delete,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                                Spacer(Modifier.width(8.dp))
+                                                Text("Clean Up Test Probe")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(6.dp))
                         }
 
                         Button(

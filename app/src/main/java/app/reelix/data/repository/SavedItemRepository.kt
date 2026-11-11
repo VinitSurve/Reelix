@@ -64,16 +64,26 @@ class SavedItemRepository(
         link: InstagramLink,
         source: SaveSource = SaveSource.SHARE,
         allowCopy: Boolean = false,
+        initialCaption: String? = null,
+        initialNotes: String? = null,
+        initialCategory: String? = null,
     ): LinkSaveOutcome = saveMutex.withLock {
         try {
-            db.withTransaction { insertLinkLocked(link, source, allowCopy) }
+            db.withTransaction { insertLinkLocked(link, source, allowCopy, initialCaption, initialNotes, initialCategory) }
         } catch (e: SQLiteConstraintException) {
             val existing = itemDao.findByNormalizedUrl(link.normalizedUrl) ?: throw e
             LinkSaveOutcome.Duplicate(link, existing.id)
         }
     }
 
-    private suspend fun insertLinkLocked(link: InstagramLink, source: SaveSource, allowCopy: Boolean): LinkSaveOutcome {
+    private suspend fun insertLinkLocked(
+        link: InstagramLink,
+        source: SaveSource,
+        allowCopy: Boolean,
+        initialCaption: String? = null,
+        initialNotes: String? = null,
+        initialCategory: String? = null,
+    ): LinkSaveOutcome {
         val existing = itemDao.findByNormalizedUrl(link.normalizedUrl)
         if (existing != null && !allowCopy) return LinkSaveOutcome.Duplicate(link, existing.id)
 
@@ -89,6 +99,9 @@ class SavedItemRepository(
                 contentType = link.contentType,
                 copyIndex = copyIndex,
                 source = source,
+                caption = initialCaption,
+                userNotes = initialNotes,
+                category = initialCategory,
                 processingStatus = ProcessingStatus.QUEUED,
                 createdAt = now,
                 updatedAt = now,
@@ -215,7 +228,9 @@ class SavedItemRepository(
     ) { item, tags, jobs, results, events ->
         item ?: return@combine null
         val analysis = results.firstOrNull { it.stage == ProcessingStage.ANALYSIS }
-        val transcript = results.firstOrNull { !it.transcript.isNullOrBlank() }?.transcript
+        val transcript = results.firstOrNull { it.stage == ProcessingStage.TRANSCRIPTION && !it.transcript.isNullOrBlank() }?.transcript
+            ?: results.firstOrNull { it.stage != ProcessingStage.VISUAL_ANALYSIS && !it.transcript.isNullOrBlank() }?.transcript
+        val ocrText = results.firstOrNull { it.stage == ProcessingStage.VISUAL_ANALYSIS && !it.transcript.isNullOrBlank() }?.transcript
 
         val mediaInfo = item.mediaPath?.let { path ->
             MediaFileInfo(
@@ -257,6 +272,7 @@ class SavedItemRepository(
             thumbnailPath = item.thumbnailPath,
             aiResult = analysis?.toInfo(),
             generatedTranscript = transcript,
+            ocrText = ocrText,
             tags = tags.map { TagInfo(it.id, it.name, it.source) },
             stages = jobs.sortedBy { it.stage.ordinal }.map {
                 StageInfo(it.stage, it.status, it.attempts, it.updatedAt, it.nextRetryAt, it.lastError ?: it.message)

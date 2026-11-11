@@ -49,6 +49,27 @@ interface SettingsRepository {
     }
     suspend fun refreshCloudDriveAccessToken(): String?
     suspend fun getValidDriveAccessToken(): String?
+    suspend fun saveTestProbe(folderId: String, fileId: String, folderName: String) {
+        update { it.copy(
+            lastTestProbeFolderId = folderId,
+            lastTestProbeFileId = fileId,
+            lastTestProbeFolderName = folderName,
+        ) }
+    }
+    suspend fun clearTestProbe() {
+        update { it.copy(
+            lastTestProbeFolderId = "",
+            lastTestProbeFileId = "",
+            lastTestProbeFolderName = "",
+        ) }
+    }
+    suspend fun restoreKnownProbe() {
+        saveTestProbe(
+            folderId = AppSettings.KNOWN_TEST_PROBE_FOLDER_ID,
+            fileId = AppSettings.KNOWN_TEST_PROBE_FILE_ID,
+            folderName = AppSettings.KNOWN_TEST_PROBE_FOLDER_NAME,
+        )
+    }
     suspend fun clear()
 }
 
@@ -81,6 +102,9 @@ class DataStoreSettingsRepository(
         val cloudDriveFolderId = stringPreferencesKey("cloud_drive_folder_id")
         val lastRunAt = longPreferencesKey("last_run_at")
         val lastRunSummary = stringPreferencesKey("last_run_summary")
+        val lastTestProbeFolderId = stringPreferencesKey("last_test_probe_folder_id")
+        val lastTestProbeFileId = stringPreferencesKey("last_test_probe_file_id")
+        val lastTestProbeFolderName = stringPreferencesKey("last_test_probe_folder_name")
     }
 
     override val settings: Flow<AppSettings> = dataStore.data
@@ -90,6 +114,20 @@ class DataStoreSettingsRepository(
     private fun Preferences.toSettings(): AppSettings {
         val p = this
         val defaults = AppSettings()
+        val savedFileId = p[Keys.lastTestProbeFileId]
+        val (probeFolderId, probeFileId, probeFolderName) = when {
+            savedFileId == null -> Triple(
+                AppSettings.KNOWN_TEST_PROBE_FOLDER_ID,
+                AppSettings.KNOWN_TEST_PROBE_FILE_ID,
+                AppSettings.KNOWN_TEST_PROBE_FOLDER_NAME,
+            )
+            savedFileId.isNotBlank() -> Triple(
+                p[Keys.lastTestProbeFolderId].orEmpty(),
+                savedFileId,
+                p[Keys.lastTestProbeFolderName].orEmpty(),
+            )
+            else -> Triple("", "", "")
+        }
         return AppSettings(
             autoProcess = p[Keys.autoProcess] ?: defaults.autoProcess,
             wifiOnly = p[Keys.wifiOnly] ?: defaults.wifiOnly,
@@ -112,6 +150,9 @@ class DataStoreSettingsRepository(
             hasCloudDriveRefreshToken = secretStore.get(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS) != null,
             lastRunAt = p[Keys.lastRunAt],
             lastRunSummary = p[Keys.lastRunSummary],
+            lastTestProbeFolderId = probeFolderId,
+            lastTestProbeFileId = probeFileId,
+            lastTestProbeFolderName = probeFolderName,
         )
     }
 
@@ -132,6 +173,25 @@ class DataStoreSettingsRepository(
             p[Keys.analysisModel] = next.analysis.model.trim()
             p[Keys.cloudProcessingEnabled] = next.cloudProcessingEnabled
             p[Keys.cloudDriveFolderId] = next.cloudDriveFolderId.trim()
+            p[Keys.lastTestProbeFolderId] = next.lastTestProbeFolderId.trim()
+            p[Keys.lastTestProbeFileId] = next.lastTestProbeFileId.trim()
+            p[Keys.lastTestProbeFolderName] = next.lastTestProbeFolderName.trim()
+        }
+    }
+
+    override suspend fun saveTestProbe(folderId: String, fileId: String, folderName: String) {
+        dataStore.edit { p ->
+            p[Keys.lastTestProbeFolderId] = folderId.trim()
+            p[Keys.lastTestProbeFileId] = fileId.trim()
+            p[Keys.lastTestProbeFolderName] = folderName.trim()
+        }
+    }
+
+    override suspend fun clearTestProbe() {
+        dataStore.edit { p ->
+            p[Keys.lastTestProbeFolderId] = ""
+            p[Keys.lastTestProbeFileId] = ""
+            p[Keys.lastTestProbeFolderName] = ""
         }
     }
 

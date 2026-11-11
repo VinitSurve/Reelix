@@ -28,6 +28,9 @@ data class AppSettings(
     val hasCloudDriveRefreshToken: Boolean = false,
     val lastRunAt: Long? = null,
     val lastRunSummary: String? = null,
+    val lastTestProbeFolderId: String = "",
+    val lastTestProbeFileId: String = "",
+    val lastTestProbeFolderName: String = "",
 ) {
     val processingNeedsNetwork: Boolean get() = fetchLinkPreviews || analysis.isComplete || cloudProcessingEnabled
     val maxMediaImportSizeBytes: Long get() = maxMediaImportSizeMb.toLong() * 1024 * 1024
@@ -38,5 +41,9 @@ data class AppSettings(
         const val DEFAULT_MAX_MEDIA_SIZE_MB = 200
         val MEDIA_SIZE_OPTIONS_MB = listOf(50, 100, 200, 500)
         val MEDIA_IMPORT_SIZE_RANGE_MB = 25..1000
+
+        const val KNOWN_TEST_PROBE_FOLDER_ID = "1yJttvfqZ9sBj9TOHWtzUVPa0zJn5QyFh"
+        const val KNOWN_TEST_PROBE_FILE_ID = "11Qqt-Dg4U6ePHc-1zg_ibDfDshsaVMhI"
+        const val KNOWN_TEST_PROBE_FOLDER_NAME = "reelix-cross-client-probe"
     }
 }

@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.AddLink
 import androidx.compose.material.icons.outlined.Bookmarks
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -73,7 +74,7 @@ import kotlinx.coroutines.launch
 class HomeViewModel(
     repository: SavedItemRepository,
     private val shareIntake: ShareIntakeUseCase,
-    scheduler: ProcessingScheduler,
+    private val scheduler: ProcessingScheduler,
 ) : ViewModel() {
 
     val counts: StateFlow<LibraryCounts> = repository.observeCounts()
@@ -88,9 +89,9 @@ class HomeViewModel(
     private val _feedback = MutableStateFlow<String?>(null)
     val feedback: StateFlow<String?> = _feedback.asStateFlow()
 
-    fun saveManualText(rawText: String) {
+    fun saveManualText(rawText: String, notes: String? = null, category: String? = null) {
         viewModelScope.launch {
-            val msg = when (val result = shareIntake.handleManualText(rawText)) {
+            val msg = when (val result = shareIntake.handleManualText(rawText, notes = notes, category = category)) {
                 ShareSaveResult.NothingShared -> "Paste an Instagram URL to save."
                 ShareSaveResult.NoInstagramLink -> "No valid Instagram Reel or post URL found."
                 is ShareSaveResult.Error -> result.message
@@ -104,6 +105,13 @@ class HomeViewModel(
                 }
             }
             _feedback.value = msg
+        }
+    }
+
+    fun syncNow() {
+        viewModelScope.launch {
+            scheduler.scheduleImmediate(forceRunNow = true)
+            _feedback.value = "Syncing vault with Google Drive..."
         }
     }
 
@@ -163,6 +171,12 @@ fun HomeScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = viewModel::syncNow,
+                        modifier = Modifier.testTag("home_sync_button"),
+                    ) {
+                        Icon(Icons.Outlined.Sync, contentDescription = "Sync vault")
+                    }
                     IconButton(onClick = { onNavigateToSearch(null) }) {
                         Icon(Icons.Outlined.Search, contentDescription = "Search vault")
                     }
@@ -286,9 +300,9 @@ fun HomeScreen(
 
     if (showSaveDialog) {
         SaveLinkDialog(
-            onSaveText = { text ->
+            onSave = { text, notes, category ->
                 showSaveDialog = false
-                viewModel.saveManualText(text)
+                viewModel.saveManualText(text, notes, category)
             },
             onDismiss = { showSaveDialog = false },
         )
