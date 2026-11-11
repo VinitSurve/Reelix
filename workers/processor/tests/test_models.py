@@ -141,6 +141,60 @@ class TestModels(unittest.TestCase):
         # Since media is None and acquisition wasn't present, acquisition defaults to PENDING
         self.assertEqual(restored.stages.acquisition, StageStatus.PENDING)
 
+    def test_schema_version_and_record_revision_decoupling(self):
+        manifest = JobManifest(
+            item_id="item-rev-test",
+            source="SHARE",
+            created_at=1730000000000,
+            updated_at=1730000000000,
+            schema_version=1,
+            record_revision=42,
+        )
+        d = manifest.to_dict()
+        self.assertEqual(d["schema_version"], 1)
+        self.assertEqual(d["record_revision"], 42)
+
+        restored = JobManifest.from_dict(d)
+        self.assertEqual(restored.schema_version, 1)
+        self.assertEqual(restored.record_revision, 42)
+        self.assertEqual(restored.job_id, "item-rev-test")
+
+    def test_stage_details_and_artifacts_tracking(self):
+        from workers.processor.src.models import ArtifactRef, StageDetail
+
+        manifest = JobManifest(
+            item_id="item-stage-test",
+            source="SHARE",
+            created_at=1730000000000,
+            updated_at=1730000000000,
+        )
+        manifest.record_stage_update("audio_extraction", StageStatus.RUNNING, now_ms=1000)
+        self.assertEqual(manifest.get_stage_detail("audio_extraction").status, StageStatus.RUNNING)
+        self.assertEqual(manifest.get_stage_detail("audio_extraction").started_at, 1000)
+        self.assertEqual(manifest.get_stage_detail("audio_extraction").attempts, 1)
+
+        manifest.record_stage_update("audio_extraction", StageStatus.SUCCEEDED, now_ms=2000)
+        self.assertEqual(manifest.get_stage_detail("audio_extraction").status, StageStatus.SUCCEEDED)
+        self.assertEqual(manifest.get_stage_detail("audio_extraction").completed_at, 2000)
+        self.assertEqual(manifest.stages.audio_extraction, StageStatus.SUCCEEDED)
+
+        manifest.artifacts["audio"] = ArtifactRef(
+            drive_file_id="audio-file-123",
+            mime_type="audio/wav",
+            size_bytes=1024,
+            content_hash="sha256:abc123",
+            name="item-stage-test.wav",
+        )
+
+        json_str = manifest.to_json()
+        restored = JobManifest.from_json(json_str)
+
+        self.assertEqual(restored.get_stage_detail("audio_extraction").status, StageStatus.SUCCEEDED)
+        self.assertEqual(restored.get_stage_detail("audio_extraction").attempts, 2)
+        self.assertIn("audio", restored.artifacts)
+        self.assertEqual(restored.artifacts["audio"].drive_file_id, "audio-file-123")
+        self.assertEqual(restored.artifacts["audio"].content_hash, "sha256:abc123")
+
 
 if __name__ == "__main__":
     unittest.main()

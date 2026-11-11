@@ -3,6 +3,14 @@
 from .audio_extractor import AudioExtractionOutcome, FFmpegAudioExtractor
 from .downloader import DownloadResult, DownloadStatus, MediaDownloader, YtDlpDownloader
 from .gemini_analyzer import GeminiAnalysisOutcome, GeminiAnalyzer
+from .instagram_resolver import (
+    CarouselItem,
+    InstagramMediaType,
+    InstagramPostResolver,
+    InstagramResolutionResult,
+    ResolutionStatus,
+)
+from .ocr_extractor import OcrExtractionOutcome, VisualTextExtractor
 from .transcriber import TranscriptionOutcome, WhisperTranscriber
 
 __all__ = [
@@ -14,6 +22,13 @@ __all__ = [
     "YtDlpDownloader",
     "GeminiAnalysisOutcome",
     "GeminiAnalyzer",
+    "CarouselItem",
+    "InstagramMediaType",
+    "InstagramPostResolver",
+    "InstagramResolutionResult",
+    "ResolutionStatus",
+    "OcrExtractionOutcome",
+    "VisualTextExtractor",
     "TranscriptionOutcome",
     "WhisperTranscriber",
 ]

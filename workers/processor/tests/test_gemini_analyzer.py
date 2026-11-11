@@ -123,7 +123,8 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertIn("Failed to parse", res.error)
 
     @patch("urllib.request.urlopen")
-    def test_quota_exceeded_handled_explicitly(self, mock_urlopen):
+    @patch("time.sleep")
+    def test_quota_exceeded_handled_explicitly(self, mock_sleep, mock_urlopen):
         import urllib.error
         mock_urlopen.side_effect = urllib.error.HTTPError(
             url="https://generativelanguage.googleapis.com",
@@ -136,6 +137,183 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertFalse(res.success)
         self.assertIn("429", res.error)
         self.assertIn("quota", res.error.lower())
+
+    @patch("urllib.request.urlopen")
+    def test_analyze_with_ocr_and_user_metadata(self, mock_urlopen):
+        expected_json = {
+            "summary": "Step by step recipe.",
+            "detailed_summary": "Details of cooking.",
+            "main_topic": "Pasta Recipe",
+            "category": "Cooking",
+            "keywords": ["pasta", "recipe"],
+            "tags": ["food", "italian"],
+            "key_takeaways": ["Boil water"],
+            "important_concepts": ["Al dente"],
+            "actionable_steps": ["1. Boil water"]
+        }
+        gemini_api_payload = {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(expected_json)}]}}]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(gemini_api_payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.analyzer.analyze(
+            title="Pasta Reel",
+            notes="Remember to salt water",
+            category="Cooking",
+            user_tags=["dinner", "quick"],
+            ocr_text="Step 1: 500g Pasta\nStep 2: 10 mins",
+        )
+        self.assertTrue(res.success)
+        self.assertEqual("Pasta Recipe", res.result.main_topic)
+
+    @patch("urllib.request.urlopen")
+    @patch("time.sleep")
+    def test_503_transient_error_retried_and_succeeds(self, mock_sleep, mock_urlopen):
+        import urllib.error
+
+        expected_json = {
+            "summary": "Recovered after 503.",
+            "detailed_summary": "Details.",
+            "main_topic": "Recovery",
+            "category": "Tech",
+            "keywords": ["retry"],
+            "tags": ["resilience"],
+            "key_takeaways": ["Backoff works"],
+            "important_concepts": ["Idempotence"],
+            "actionable_steps": ["Retry with jitter"]
+        }
+        success_payload = {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(expected_json)}]}}]
+        }
+        mock_success = MagicMock()
+        mock_success.read.return_value = json.dumps(success_payload).encode("utf-8")
+        mock_success.__enter__.return_value = mock_success
+
+        err_503 = urllib.error.HTTPError(
+            url="https://generativelanguage.googleapis.com",
+            code=503,
+            msg="Service Unavailable",
+            hdrs={},
+            fp=MagicMock(read=lambda: b"This model is currently experiencing high demand.")
+        )
+
+        mock_urlopen.side_effect = [err_503, mock_success]
+
+        res = self.analyzer.analyze(title="Retry Test", transcript="Testing retry logic")
+        self.assertTrue(res.success)
+        self.assertEqual("Recovery", res.result.main_topic)
+        self.assertEqual(2, mock_urlopen.call_count)
+        mock_sleep.assert_called_once()
+
+    @patch("urllib.request.urlopen")
+    @patch("time.sleep")
+    def test_429_rate_limit_with_retry_after(self, mock_sleep, mock_urlopen):
+        import urllib.error
+
+        expected_json = {
+            "summary": "Recovered after 429.",
+            "detailed_summary": "Details.",
+            "main_topic": "Rate Limit",
+            "category": "Networking",
+            "keywords": ["429"],
+            "tags": ["quota"],
+            "key_takeaways": ["Respect Retry-After"],
+            "important_concepts": ["Rate limiting"],
+            "actionable_steps": ["Wait Retry-After"]
+        }
+        success_payload = {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(expected_json)}]}}]
+        }
+        mock_success = MagicMock()
+        mock_success.read.return_value = json.dumps(success_payload).encode("utf-8")
+        mock_success.__enter__.return_value = mock_success
+
+        err_429 = urllib.error.HTTPError(
+            url="https://generativelanguage.googleapis.com",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={"Retry-After": "5"},
+            fp=MagicMock(read=lambda: b"Resource exhausted")
+        )
+
+        mock_urlopen.side_effect = [err_429, mock_success]
+
+        res = self.analyzer.analyze(title="429 Test", transcript="Testing 429 handling")
+        self.assertTrue(res.success)
+        self.assertEqual("Rate Limit", res.result.main_topic)
+        self.assertEqual(2, mock_urlopen.call_count)
+        mock_sleep.assert_called_once_with(5.0)
+
+    @patch("urllib.request.urlopen")
+    @patch("time.sleep")
+    def test_network_timeout_retried_and_succeeds(self, mock_sleep, mock_urlopen):
+        expected_json = {
+            "summary": "Recovered after timeout.",
+            "detailed_summary": "Details.",
+            "main_topic": "Timeout Recovery",
+            "category": "Networking",
+            "keywords": ["timeout"],
+            "tags": ["socket"],
+            "key_takeaways": ["Socket timeout handled"],
+            "important_concepts": ["Timeout"],
+            "actionable_steps": ["Retry request"]
+        }
+        success_payload = {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(expected_json)}]}}]
+        }
+        mock_success = MagicMock()
+        mock_success.read.return_value = json.dumps(success_payload).encode("utf-8")
+        mock_success.__enter__.return_value = mock_success
+
+        mock_urlopen.side_effect = [TimeoutError("The read operation timed out"), mock_success]
+
+        res = self.analyzer.analyze(title="Timeout Test", transcript="Testing timeout recovery")
+        self.assertTrue(res.success)
+        self.assertEqual("Timeout Recovery", res.result.main_topic)
+        self.assertEqual(2, mock_urlopen.call_count)
+        mock_sleep.assert_called_once()
+
+    @patch("urllib.request.urlopen")
+    def test_permanent_authentication_failure_aborts_immediately(self, mock_urlopen):
+        import urllib.error
+
+        err_401 = urllib.error.HTTPError(
+            url="https://generativelanguage.googleapis.com",
+            code=401,
+            msg="Unauthorized",
+            hdrs={},
+            fp=MagicMock(read=lambda: b"API_KEY_INVALID: API key not valid.")
+        )
+        mock_urlopen.side_effect = err_401
+
+        res = self.analyzer.analyze(title="Auth Test", transcript="Testing auth failure")
+        self.assertFalse(res.success)
+        self.assertFalse(res.is_retryable)
+        self.assertIn("authentication failed", res.error.lower())
+        self.assertEqual(1, mock_urlopen.call_count)
+
+    @patch("urllib.request.urlopen")
+    @patch("time.sleep")
+    def test_retry_exhaustion_marks_retryable(self, mock_sleep, mock_urlopen):
+        import urllib.error
+
+        err_503 = urllib.error.HTTPError(
+            url="https://generativelanguage.googleapis.com",
+            code=503,
+            msg="Service Unavailable",
+            hdrs={},
+            fp=MagicMock(read=lambda: b"High demand")
+        )
+        mock_urlopen.side_effect = err_503
+
+        res = self.analyzer.analyze(title="Exhaustion Test", transcript="Testing exhaustion")
+        self.assertFalse(res.success)
+        self.assertTrue(res.is_retryable)
+        self.assertEqual(3, mock_urlopen.call_count)
+        self.assertEqual(2, mock_sleep.call_count)
 
 
 if __name__ == "__main__":

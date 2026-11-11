@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..models import JobManifest, JobStatus
+from ..models import JobManifest, JobStatus, compute_file_sha256
 from . import StorageClient
 
 
@@ -45,8 +45,11 @@ class MockStorageClient(StorageClient):
                 manifest = JobManifest.from_json(file.read_text(encoding="utf-8"))
                 manifest.etag = self.etags.get(manifest.item_id, "mock_etag_init")
 
-                if manifest.status in (JobStatus.QUEUED, JobStatus.WAITING_RETRY):
+                if manifest.status == JobStatus.QUEUED:
                     results.append(manifest)
+                elif manifest.status == JobStatus.WAITING_RETRY:
+                    if manifest.next_retry_at is None or now_ms >= manifest.next_retry_at:
+                        results.append(manifest)
                 elif manifest.status == JobStatus.PROCESSING:
                     lease = manifest.lease_timeout_ms or self.default_lease_ms
                     if manifest.claimed_at and (now_ms - manifest.claimed_at) > lease:
@@ -77,6 +80,9 @@ class MockStorageClient(StorageClient):
                     return False
             elif existing.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL):
                 return False
+            job.version = existing.version or 1
+        else:
+            job.version = 1
 
         now_ms = int(time.time() * 1000)
         job.status = JobStatus.PROCESSING
@@ -93,6 +99,31 @@ class MockStorageClient(StorageClient):
             return False
 
         return True
+
+    def renew_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_timeout_ms: int = 900_000,
+        job: Optional[JobManifest] = None,
+    ) -> bool:
+        """Heartbeat renewal of active lease on mock manifest."""
+        existing = self.get_job(job_id)
+        if not existing:
+            return False
+        if existing.status != JobStatus.PROCESSING:
+            return False
+        if existing.claimed_by != worker_id:
+            return False
+        now_ms = int(time.time() * 1000)
+        lease = existing.lease_timeout_ms or self.default_lease_ms
+        if existing.claimed_at and (now_ms - existing.claimed_at) > lease:
+            return False  # Already expired and lost
+
+        target_job = job if job is not None else existing
+        target_job.claimed_at = now_ms
+        target_job.updated_at = now_ms
+        return self.update_job(target_job)
 
     def update_job(self, job: JobManifest) -> bool:
         existing = self.get_job(job.item_id)
@@ -111,7 +142,12 @@ class MockStorageClient(StorageClient):
         job_file.write_text(job.to_json(), encoding="utf-8")
         return True
 
-    def download_media(self, file_id: str, destination: Path) -> bool:
+    def download_media(
+        self,
+        file_id: str,
+        destination: Path,
+        expected_sha256: Optional[str] = None,
+    ) -> bool:
         src = self._files.get(file_id)
         if not src or not src.exists():
             media_candidate = self.media_dir / file_id
@@ -121,13 +157,31 @@ class MockStorageClient(StorageClient):
                 return False
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, destination)
+        if expected_sha256:
+            actual = compute_file_sha256(destination)
+            if actual != expected_sha256:
+                destination.unlink(missing_ok=True)
+                return False
         return True
 
-    def upload_audio(self, local_wav_path: Path, item_id: str) -> Optional[str]:
+    def upload_audio(
+        self,
+        local_wav_path: Path,
+        item_id: str,
+        content_hash: Optional[str] = None,
+    ) -> Optional[str]:
         if not local_wav_path.exists():
             return None
+        sha256 = content_hash or compute_file_sha256(local_wav_path)
         file_id = f"audio_{item_id}.wav"
         dest = self.audio_dir / file_id
+        # Idempotent deduplication: if destination artifact already exists with matching SHA-256, reuse it
+        if dest.exists() and dest.stat().st_size > 0:
+            existing_hash = compute_file_sha256(dest)
+            if existing_hash == sha256:
+                self._files[file_id] = dest
+                return file_id
+
         shutil.copy2(local_wav_path, dest)
         self._files[file_id] = dest
         return file_id
@@ -138,11 +192,20 @@ class MockStorageClient(StorageClient):
         item_id: str,
         mime_type: str = "video/mp4",
         original_file_name: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Optional[str]:
         if not local_media_path.exists():
             return None
+        sha256 = content_hash or compute_file_sha256(local_media_path)
         file_id = f"media_{item_id}.mp4"
         dest = self.media_dir / file_id
+        # Idempotent deduplication: if destination artifact already exists with matching SHA-256, reuse it
+        if dest.exists() and dest.stat().st_size > 0:
+            existing_hash = compute_file_sha256(dest)
+            if existing_hash == sha256:
+                self._files[file_id] = dest
+                return file_id
+
         shutil.copy2(local_media_path, dest)
         self._files[file_id] = dest
         return file_id

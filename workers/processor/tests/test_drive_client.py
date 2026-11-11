@@ -1,5 +1,8 @@
 """Unit tests for Google Drive persistent storage client."""
 
+import tempfile
+import time
+from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -326,6 +329,253 @@ class TestDriveClient(unittest.TestCase):
         mock_service.files().create().execute.return_value = {"id": "created-vault-id"}
         vault_id_created = client._ensure_root_folder()
         self.assertEqual("created-vault-id", vault_id_created)
+
+    def test_renew_lease_success(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        now_ms = int(time.time() * 1000)
+        remote_manifest = JobManifest(
+            item_id="item-renew-ok",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-alpha",
+            claimed_at=now_ms - 5000,
+            version=1,
+            created_at=now_ms - 10000,
+            updated_at=now_ms - 5000,
+        )
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "drive-manifest-id-1", "name": "item-renew-ok.json"}]
+        }
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            res = self.client.renew_lease("item-renew-ok", "worker-alpha")
+            self.assertTrue(res)
+            mock_files.update.assert_called()
+
+    def test_renew_lease_fails_if_claimed_by_other_worker(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        now_ms = int(time.time() * 1000)
+        remote_manifest = JobManifest(
+            item_id="item-renew-other",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-other",
+            claimed_at=now_ms - 5000,
+            version=1,
+            created_at=now_ms - 10000,
+            updated_at=now_ms - 5000,
+        )
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "drive-manifest-id-2", "name": "item-renew-other.json"}]
+        }
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            res = self.client.renew_lease("item-renew-other", "worker-alpha")
+            self.assertFalse(res)
+
+    def test_renew_lease_fails_if_lease_expired(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["jobs"] = "jobs-folder-id"
+
+        now_ms = int(time.time() * 1000)
+        remote_manifest = JobManifest(
+            item_id="item-renew-exp",
+            source="URL",
+            status=JobStatus.PROCESSING,
+            claimed_by="worker-alpha",
+            claimed_at=now_ms - 1_200_000,  # Expired > 900,000 ms
+            version=1,
+            created_at=now_ms - 2_000_000,
+            updated_at=now_ms - 1_200_000,
+        )
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "drive-manifest-id-3", "name": "item-renew-exp.json"}]
+        }
+
+        with patch.object(self.client, "_download_bytes", return_value=remote_manifest.to_json().encode("utf-8")):
+            res = self.client.renew_lease("item-renew-exp", "worker-alpha")
+            self.assertFalse(res)
+
+    def test_upload_audio_reuses_existing_artifact(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["audio"] = "audio-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "existing-audio-drive-id", "name": "item-audio-reuse.wav", "size": "1024"}]
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(b"wav content")
+            local_wav = Path(f.name)
+
+        try:
+            file_id = self.client.upload_audio(local_wav, "item-audio-reuse")
+            self.assertEqual("existing-audio-drive-id", file_id)
+            mock_files.create.assert_not_called()
+        finally:
+            local_wav.unlink(missing_ok=True)
+
+    def test_upload_media_reuses_existing_artifact(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["media"] = "media-folder-id"
+
+        mock_files = mock_service.files()
+        mock_files.list().execute.return_value = {
+            "files": [{"id": "existing-media-drive-id", "name": "item-media-reuse.mp4", "size": "4096"}]
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(b"video content")
+            local_mp4 = Path(f.name)
+
+        try:
+            file_id = self.client.upload_media(local_mp4, "item-media-reuse")
+            self.assertEqual("existing-media-drive-id", file_id)
+            mock_files.create.assert_not_called()
+        finally:
+            local_mp4.unlink(missing_ok=True)
+
+    def test_upload_media_mismatched_sha256_does_not_reuse_remote(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["media"] = "media-folder-id"
+
+        mock_files = mock_service.files()
+        # Remote file has different sha256
+        mock_files.list().execute.return_value = {
+            "files": [{
+                "id": "corrupt-media-id",
+                "name": "item-mismatch.mp4",
+                "size": "4096",
+                "appProperties": {"reelix_sha256": "totally_different_digest_value"}
+            }]
+        }
+        mock_files.create().execute.return_value = {"id": "new-fresh-media-id"}
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(b"video content")
+            local_mp4 = Path(f.name)
+
+        try:
+            file_id = self.client.upload_media(local_mp4, "item-mismatch")
+            # Must NOT reuse the corrupt remote file
+            self.assertEqual("new-fresh-media-id", file_id)
+            mock_files.create.assert_called()
+        finally:
+            local_mp4.unlink(missing_ok=True)
+
+    def test_download_media_verifies_sha256_integrity(self):
+        dest = Path(tempfile.mktemp(suffix=".mp4"))
+        try:
+            # Create a mock service and fake downloader
+            with patch.object(self.client, "_get_service") as mock_get_svc, \
+                 patch("googleapiclient.http.MediaIoBaseDownload") as mock_dl_cls:
+                mock_dl = MagicMock()
+                mock_dl.next_chunk.return_value = (None, True)
+                mock_dl_cls.return_value = mock_dl
+
+                # Simulate downloader writing content
+                def write_mock_content(fh, req):
+                    fh.write(b"verified payload data")
+                    return mock_dl
+
+                mock_dl_cls.side_effect = write_mock_content
+
+                import hashlib
+                expected = hashlib.sha256(b"verified payload data").hexdigest()
+
+                ok = self.client.download_media("file-id-123", dest, expected_sha256=expected)
+                self.assertTrue(ok)
+                self.assertTrue(dest.exists())
+        finally:
+            dest.unlink(missing_ok=True)
+
+    def test_download_media_corrupt_sha256_deletes_file(self):
+        dest = Path(tempfile.mktemp(suffix=".mp4"))
+        try:
+            with patch.object(self.client, "_get_service") as mock_get_svc, \
+                 patch("googleapiclient.http.MediaIoBaseDownload") as mock_dl_cls:
+                mock_dl = MagicMock()
+                mock_dl.next_chunk.return_value = (None, True)
+
+                def write_mock_content(fh, req):
+                    fh.write(b"tampered corrupt content")
+                    return mock_dl
+
+                mock_dl_cls.side_effect = write_mock_content
+
+                ok = self.client.download_media("file-id-123", dest, expected_sha256="expected_good_hash")
+                self.assertFalse(ok)
+                self.assertFalse(dest.exists(), "Corrupt file should have been deleted!")
+        finally:
+            dest.unlink(missing_ok=True)
+
+    def test_upload_audio_legacy_artifact_without_sha256_updates_metadata_and_reuses(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["audio"] = "audio-folder-id"
+
+        mock_files = mock_service.files()
+        # Legacy artifact: no reelix_sha256 in appProperties, but size matches local file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(b"legacy wav payload data")
+            f.flush()
+            local_wav = Path(f.name)
+            local_size = local_wav.stat().st_size
+
+        try:
+            mock_files.list().execute.return_value = {
+                "files": [{"id": "legacy-audio-id", "name": "item-legacy.wav", "size": str(local_size), "appProperties": {}}]
+            }
+            mock_files.update().execute.return_value = {"id": "legacy-audio-id"}
+
+            file_id = self.client.upload_audio(local_wav, "item-legacy")
+            self.assertEqual("legacy-audio-id", file_id)
+            # Must update metadata with computed SHA-256
+            mock_files.update.assert_called()
+            mock_files.create.assert_not_called()
+        finally:
+            local_wav.unlink(missing_ok=True)
+
+    def test_upload_audio_legacy_artifact_mismatched_size_does_not_reuse(self):
+        mock_service = MagicMock()
+        self.client._service = mock_service
+        self.client._subfolders["audio"] = "audio-folder-id"
+
+        mock_files = mock_service.files()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(b"new fresh audio payload")
+            f.flush()
+            local_wav = Path(f.name)
+
+        try:
+            # Legacy file has different size (9999 vs actual)
+            mock_files.list().execute.return_value = {
+                "files": [{"id": "stale-legacy-id", "name": "item-legacy-stale.wav", "size": "9999", "appProperties": {}}]
+            }
+            mock_files.create().execute.return_value = {"id": "new-audio-id"}
+
+            file_id = self.client.upload_audio(local_wav, "item-legacy-stale")
+            self.assertEqual("new-audio-id", file_id)
+            mock_files.create.assert_called()
+        finally:
+            local_wav.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

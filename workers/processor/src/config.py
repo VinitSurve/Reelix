@@ -32,12 +32,17 @@ class WorkerConfig:
     gdrive_service_account_path: Optional[str] = None
     gdrive_folder_id: Optional[str] = None
 
+    # Firestore coordination settings (Cloud Firestore Spark free tier for transactional queue & leases)
+    firestore_project_id: Optional[str] = None
+    allow_local_worker: bool = False
+
     # Processing and execution limits
     max_jobs_per_run: int = 5
     whisper_model: str = "base"
     work_dir: Path = Path("/tmp/reelix_worker")
     runner_id: str = "local-runner"
     lease_timeout_ms: int = 900_000  # 15 minutes lease before an active job can be reclaimed
+    heartbeat_interval_seconds: int = 30  # Active renewal cadence during long-running tasks
 
     # Testing / Dry-run mode
     mock_mode: bool = False
@@ -74,5 +79,8 @@ class WorkerConfig:
             work_dir=work_dir,
             runner_id=runner_id,
             lease_timeout_ms=int(os.getenv("LEASE_TIMEOUT_MS", "900000")),
+            heartbeat_interval_seconds=int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "30")),
+            firestore_project_id=os.getenv("FIRESTORE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT"),
+            allow_local_worker=os.getenv("ALLOW_LOCAL_WORKER") == "1",
             mock_mode=os.getenv("MOCK_STORAGE", "").lower() in ("true", "1", "yes"),
         )

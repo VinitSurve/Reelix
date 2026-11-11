@@ -27,19 +27,39 @@ class StorageClient(abc.ABC):
         """Attempts to claim a job safely with lease validation and read-after-write verification."""
         pass
 
+    def renew_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_timeout_ms: int = 900_000,
+        job: Optional[JobManifest] = None,
+    ) -> bool:
+        """Heartbeat renewal for an active lease. Returns True if lease renewed, False if lost."""
+        return True
+
     @abc.abstractmethod
     def update_job(self, job: JobManifest) -> bool:
         """Persists the updated job manifest to cloud storage."""
         pass
 
     @abc.abstractmethod
-    def download_media(self, file_id: str, destination: Path) -> bool:
-        """Downloads a media file to local destination."""
+    def download_media(
+        self,
+        file_id: str,
+        destination: Path,
+        expected_sha256: Optional[str] = None,
+    ) -> bool:
+        """Downloads a media file to local destination with optional SHA-256 verification."""
         pass
 
     @abc.abstractmethod
-    def upload_audio(self, local_wav_path: Path, item_id: str) -> Optional[str]:
-        """Uploads an extracted audio WAV file and returns its cloud file ID."""
+    def upload_audio(
+        self,
+        local_wav_path: Path,
+        item_id: str,
+        content_hash: Optional[str] = None,
+    ) -> Optional[str]:
+        """Uploads an extracted audio WAV file with content hash deduplication."""
         pass
 
     @abc.abstractmethod
@@ -49,6 +69,7 @@ class StorageClient(abc.ABC):
         item_id: str,
         mime_type: str = "video/mp4",
         original_file_name: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Optional[str]:
-        """Uploads acquired media file to cloud storage and returns its cloud file ID."""
+        """Uploads acquired media file to cloud storage with content hash deduplication."""
         pass
