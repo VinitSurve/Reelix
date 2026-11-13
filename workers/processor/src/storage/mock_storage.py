@@ -34,12 +34,19 @@ class MockStorageClient(StorageClient):
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.transitions_dir = self.root_dir / "transitions"
         self.transitions_dir.mkdir(parents=True, exist_ok=True)
+        self.intents_dir = self.root_dir / "transition_intents"
+        self.intents_dir.mkdir(parents=True, exist_ok=True)
+        self.file_ids_dir = self.root_dir / "file_ids"
+        self.file_ids_dir.mkdir(parents=True, exist_ok=True)
 
         self._files: Dict[str, Path] = {}
         self.etags: Dict[str, str] = {}
         self._etag_counter = 0
         self.simulated_listing_delay: Dict[str, int] = {}
         self.simulated_upload_conflicts: Dict[str, bool] = {}
+        self.fault_crash_after_id_generation: bool = False
+        self.fault_crash_after_intent_persistence: bool = False
+        self.fault_crash_after_drive_creation_before_response: bool = False
 
     def register_media(self, file_id: str, path: Path):
         self._files[file_id] = path
@@ -247,23 +254,133 @@ class MockStorageClient(StorageClient):
         self._files[file_id] = dest
         return file_id
 
+    def generate_drive_file_id(self) -> str:
+        """Simulates obtaining an authorized pre-generated Google Drive file ID."""
+        import uuid
+        return f"mock_drive_id_{uuid.uuid4().hex[:16]}"
+
+    def save_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+        drive_file_id: str,
+        payload_hash: str,
+    ) -> bool:
+        """Persists mapping between logical transition identity and Drive file ID on disk."""
+        target_dir = self.intents_dir / item_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "item_id": item_id,
+            "deterministic_transition_id": deterministic_transition_id,
+            "drive_file_id": drive_file_id,
+            "payload_hash": payload_hash,
+            "created_at": int(time.time() * 1000),
+        }
+        target = target_dir / f"{deterministic_transition_id}.json"
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        return True
+
+    def find_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> Optional[dict]:
+        """Recovers persisted transition intent if a previous runner crashed before completing creation."""
+        target = self.intents_dir / item_id / f"{deterministic_transition_id}.json"
+        if target.exists():
+            try:
+                return json.loads(target.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+        return None
+
+    def delete_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> bool:
+        """Removes intent record after transition creation is verified."""
+        target = self.intents_dir / item_id / f"{deterministic_transition_id}.json"
+        if target.exists():
+            target.unlink(missing_ok=True)
+        return True
+
+    def get_transition_by_file_id(self, file_id: str) -> Optional[TransitionRecord]:
+        """Fetches transition record by its mock Drive file ID."""
+        target = self.file_ids_dir / f"{file_id}.json"
+        if target.exists():
+            try:
+                return TransitionRecord.from_json(target.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+        return None
+
     def append_transition(self, transition: TransitionRecord) -> bool:
         """Appends an immutable transition record to the item's transition directory."""
         item_dir = self.transitions_dir / transition.item_id
         item_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{transition.deterministic_transition_id}.json"
 
-        # Check for simulated 409 conflict
+        # Step 1: Search-before-create
+        existing = self.find_transition(transition.item_id, transition.deterministic_transition_id)
+        if existing is not None:
+            if existing.matches_identity_and_payload(transition):
+                self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
+                return True
+            else:
+                return False
+
+        # Step 2: Intent recovery / ID generation
+        intent = self.find_transition_intent(transition.item_id, transition.deterministic_transition_id)
+        drive_file_id: Optional[str] = None
+        if intent:
+            candidate_id = intent.get("drive_file_id")
+            if candidate_id:
+                existing_by_id = self.get_transition_by_file_id(candidate_id)
+                if existing_by_id is not None:
+                    if existing_by_id.matches_identity_and_payload(transition):
+                        self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
+                        return True
+                    else:
+                        return False
+                drive_file_id = candidate_id
+
+        if not drive_file_id:
+            drive_file_id = self.generate_drive_file_id()
+            if self.fault_crash_after_id_generation:
+                raise RuntimeError("CRASH_AFTER_ID_GENERATION")
+            self.save_transition_intent(
+                transition.item_id,
+                transition.deterministic_transition_id,
+                drive_file_id,
+                transition.payload_integrity_hash,
+            )
+            if self.fault_crash_after_intent_persistence:
+                raise RuntimeError("CRASH_AFTER_INTENT_PERSISTENCE")
+
+        # Step 3: Check for simulated 409 conflict
         if self.simulated_upload_conflicts.get(filename, False):
-            # In real Drive, a 409 indicates the file was already uploaded
-            # We preserve existing file or write if not present
+            # In simulated 409, file already exists on remote Drive with drive_file_id
             target = item_dir / filename
             if not target.exists():
                 target.write_text(transition.to_json(), encoding="utf-8")
+                (self.file_ids_dir / f"{drive_file_id}.json").write_text(transition.to_json(), encoding="utf-8")
+            verified = self.get_transition_by_file_id(drive_file_id) or self.find_transition(transition.item_id, transition.deterministic_transition_id)
+            if verified and verified.matches_identity_and_payload(transition):
+                self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
+                return True
             return False
 
+        # Step 4: Write transition and file ID link
         target = item_dir / filename
-        target.write_text(transition.to_json(), encoding="utf-8")
+        transition_json = transition.to_json()
+        target.write_text(transition_json, encoding="utf-8")
+        (self.file_ids_dir / f"{drive_file_id}.json").write_text(transition_json, encoding="utf-8")
+
+        if self.fault_crash_after_drive_creation_before_response:
+            raise RuntimeError("CRASH_AFTER_DRIVE_CREATION_BEFORE_RESPONSE")
+
+        self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
         return True
 
     def list_transitions(self, item_id: str) -> List[TransitionRecord]:

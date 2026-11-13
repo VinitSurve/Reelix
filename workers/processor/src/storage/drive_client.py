@@ -826,25 +826,188 @@ class GoogleDriveStorageClient(StorageClient):
         self._subfolders[key] = created["id"]
         return created["id"]
 
+    def generate_drive_file_id(self) -> str:
+        """Obtains an authorized pre-generated Google Drive file ID via files.generateIds."""
+        service = self._get_service()
+        res = service.files().generateIds(count=1, space="drive").execute()
+        ids = res.get("ids", [])
+        if not ids:
+            raise RuntimeError("Google Drive files.generateIds returned no IDs")
+        return ids[0]
+
+    def _ensure_item_intents_folder(self, item_id: str) -> str:
+        """Finds or creates transition_intents/{item_id} subfolder in Drive."""
+        key = f"intents_{item_id}"
+        if key in self._subfolders:
+            return self._subfolders[key]
+
+        intents_root = self._ensure_subfolder("transition_intents")
+        service = self._get_service()
+        query = (
+            f"name = '{item_id}' and mimeType = 'application/vnd.google-apps.folder' "
+            f"and '{intents_root}' in parents and trashed = false"
+        )
+        res = service.files().list(q=query, fields="files(id, name)").execute()
+        files = res.get("files", [])
+        if files:
+            self._subfolders[key] = files[0]["id"]
+            return files[0]["id"]
+
+        meta = {
+            "name": item_id,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [intents_root],
+        }
+        created = service.files().create(body=meta, fields="id").execute()
+        self._subfolders[key] = created["id"]
+        return created["id"]
+
+    def save_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+        drive_file_id: str,
+        payload_hash: str,
+    ) -> bool:
+        """Persists mapping between logical transition identity and Drive file ID across runner lifecycles."""
+        service = self._get_service()
+        intents_folder = self._ensure_item_intents_folder(item_id)
+        filename = f"{deterministic_transition_id}.json"
+
+        from googleapiclient.http import MediaIoBaseUpload
+
+        query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
+        res = service.files().list(q=query, fields="files(id, name)").execute()
+        files = res.get("files", [])
+
+        intent_payload = {
+            "item_id": item_id,
+            "deterministic_transition_id": deterministic_transition_id,
+            "drive_file_id": drive_file_id,
+            "payload_hash": payload_hash,
+            "created_at": int(time.time() * 1000),
+        }
+        body_bytes = json.dumps(intent_payload).encode("utf-8")
+        media_body = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json")
+
+        if files:
+            service.files().update(fileId=files[0]["id"], media_body=media_body).execute()
+        else:
+            meta = {
+                "name": filename,
+                "parents": [intents_folder],
+                "mimeType": "application/json",
+            }
+            service.files().create(body=meta, media_body=media_body, fields="id").execute()
+        return True
+
+    def find_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> Optional[dict]:
+        """Recovers persisted transition intent if a previous runner crashed before completing creation."""
+        service = self._get_service()
+        intents_folder = self._ensure_item_intents_folder(item_id)
+        filename = f"{deterministic_transition_id}.json"
+        query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
+        res = service.files().list(q=query, fields="files(id, name)").execute()
+        files = res.get("files", [])
+        if not files:
+            return None
+        try:
+            raw = self._download_bytes(files[0]["id"])
+            return json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            logger.warning("Could not parse transition intent %s: %s", filename, e)
+            return None
+
+    def delete_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> bool:
+        """Removes intent record after transition creation is verified."""
+        service = self._get_service()
+        intents_folder = self._ensure_item_intents_folder(item_id)
+        filename = f"{deterministic_transition_id}.json"
+        query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
+        res = service.files().list(q=query, fields="files(id, name)").execute()
+        files = res.get("files", [])
+        for f in files:
+            try:
+                service.files().delete(fileId=f["id"]).execute()
+            except Exception as e:
+                logger.debug("Failed deleting intent %s (%s): %s", filename, f["id"], e)
+        return True
+
+    def get_transition_by_file_id(self, file_id: str) -> Optional[TransitionRecord]:
+        """Fetches transition record by its remote Drive file ID."""
+        try:
+            raw = self._download_bytes(file_id)
+            return TransitionRecord.from_json(raw.decode("utf-8"))
+        except Exception:
+            return None
+
     def append_transition(self, transition: TransitionRecord) -> bool:
         """Appends an immutable transition record to the item's Drive transition folder.
 
-        Uses pre-generated file ID where possible, and handles retries / HTTP 409 conflict
-        by running the 6-point verification protocol before reporting success or fork.
+        Strict protocol:
+        1. Checks if transition already exists by deterministic filename (search-before-create).
+           Runs 6-point verification. If matches, cleans intent and returns True. If mismatched, returns False.
+        2. Checks if an intent mapping exists for (item_id, deterministic_transition_id).
+           If intent exists, recovers drive_file_id.
+           Checks get_transition_by_file_id(drive_file_id). If file exists on Drive, runs 6-point verification.
+           If matches, cleans intent and returns True. If file does not exist (404), reuses drive_file_id.
+        3. If no intent exists:
+           Obtains valid Drive file ID through files.generateIds endpoint.
+           Persists the intent mapping to Google Drive (transition_intents/{item_id}/{transition_id}.json).
+        4. Calls files().create(body={'id': drive_file_id, 'name': filename, 'parents': [item_folder], ...}).
+        5. On success: cleans intent and returns True.
+        6. On HTTP 409 (or duplicate file error):
+           Fetches existing file with drive_file_id (or by filename) and executes strict 6-point check.
+           Never assumes arbitrary 409 is proof of success.
         """
         service = self._get_service()
         item_folder = self._ensure_item_transitions_folder(transition.item_id)
         filename = f"{transition.deterministic_transition_id}.json"
 
-        # Search-before-create: check if already exists to prevent redundant uploads
+        # Step 1: Search-before-create
         existing = self.find_transition(transition.item_id, transition.deterministic_transition_id)
         if existing is not None:
-            if existing.payload_integrity_hash == transition.payload_integrity_hash:
-                logger.info("Transition %s already exists on Drive with matching hash; deduplicating", filename)
+            if existing.matches_identity_and_payload(transition):
+                logger.info("Transition %s already exists on Drive with matching 6-point identity; deduplicating", filename)
+                self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
                 return True
             else:
-                logger.error("INTEGRITY FORK: Transition %s already exists with conflicting hash!", filename)
+                logger.error("INTEGRITY FORK: Transition %s already exists with conflicting identity/payload!", filename)
                 return False
+
+        # Step 2: Recover or generate Drive file ID via intent store
+        intent = self.find_transition_intent(transition.item_id, transition.deterministic_transition_id)
+        drive_file_id: Optional[str] = None
+        if intent:
+            candidate_id = intent.get("drive_file_id")
+            if candidate_id:
+                existing_by_id = self.get_transition_by_file_id(candidate_id)
+                if existing_by_id is not None:
+                    if existing_by_id.matches_identity_and_payload(transition):
+                        logger.info("Transition %s recovered via intent ID %s (6-point check passed)", filename, candidate_id)
+                        self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
+                        return True
+                    else:
+                        logger.error("INTEGRITY FORK: File %s found with conflicting identity/payload!", candidate_id)
+                        return False
+                drive_file_id = candidate_id
+
+        if not drive_file_id:
+            drive_file_id = self.generate_drive_file_id()
+            self.save_transition_intent(
+                transition.item_id,
+                transition.deterministic_transition_id,
+                drive_file_id,
+                transition.payload_integrity_hash,
+            )
 
         from googleapiclient.http import MediaIoBaseUpload
 
@@ -852,6 +1015,7 @@ class GoogleDriveStorageClient(StorageClient):
         media_body = MediaIoBaseUpload(io.BytesIO(body_bytes), mimetype="application/json")
 
         file_metadata = {
+            "id": drive_file_id,
             "name": filename,
             "parents": [item_folder],
             "mimeType": "application/json",
@@ -863,8 +1027,6 @@ class GoogleDriveStorageClient(StorageClient):
                 "reelix_hash": transition.payload_integrity_hash,
             },
         }
-        if transition.pregenerated_file_id:
-            file_metadata["id"] = transition.pregenerated_file_id
 
         try:
             created = service.files().create(
@@ -873,16 +1035,18 @@ class GoogleDriveStorageClient(StorageClient):
                 fields="id, name",
             ).execute()
             logger.info("Committed transition %s to Drive (id=%s)", filename, created.get("id"))
+            self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
             return True
         except Exception as e:
             from googleapiclient.errors import HttpError
             if isinstance(e, HttpError) and getattr(e, "resp", None) and e.resp.status in (409, 400):
-                # Retry verification: fetch file and execute 6-point check
-                verified = self.find_transition(transition.item_id, transition.deterministic_transition_id)
-                if verified and verified.payload_integrity_hash == transition.payload_integrity_hash:
-                    logger.info("HTTP 409 on transition creation for %s, verified matching payload on Drive", filename)
+                # 6-point verification on conflict
+                verified = self.get_transition_by_file_id(drive_file_id) or self.find_transition(transition.item_id, transition.deterministic_transition_id)
+                if verified and verified.matches_identity_and_payload(transition):
+                    logger.info("HTTP %d on transition creation for %s, verified matching payload on Drive (id=%s)", e.resp.status, filename, drive_file_id)
+                    self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
                     return True
-                logger.error("HTTP 409 conflict could not be verified for %s: %s", filename, e)
+                logger.error("HTTP %d conflict could not be verified for %s: %s", e.resp.status, filename, e)
                 return False
             logger.error("Failed to append transition %s to Drive: %s", filename, e)
             return False

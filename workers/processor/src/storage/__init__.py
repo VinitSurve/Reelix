@@ -16,6 +16,41 @@ class StorageClient(abc.ABC):
         """Appends an immutable transition record to the item's transition log."""
         return True
 
+    def generate_drive_file_id(self) -> str:
+        """Obtains an authorized pre-generated Google Drive file ID."""
+        import uuid
+        return f"gen_id_{uuid.uuid4().hex}"
+
+    def save_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+        drive_file_id: str,
+        payload_hash: str,
+    ) -> bool:
+        """Persists mapping between logical transition identity and Drive file ID across runner lifecycles."""
+        return True
+
+    def find_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> Optional[dict]:
+        """Recovers persisted transition intent if a previous runner crashed before completing creation."""
+        return None
+
+    def delete_transition_intent(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> bool:
+        """Removes intent record after transition creation is verified."""
+        return True
+
+    def get_transition_by_file_id(self, file_id: str) -> Optional[TransitionRecord]:
+        """Fetches transition record by its remote Drive file ID."""
+        return None
+
     def list_transitions(self, item_id: str) -> List[TransitionRecord]:
         """Lists all immutable transition records for a specific item ID."""
         return []

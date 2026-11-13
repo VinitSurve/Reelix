@@ -80,10 +80,33 @@ class ContinuousHeartbeatManager:
         return self.cancelled_event.is_set()
 
     def renew_now(self) -> bool:
-        """Explicit synchronously invoked renewal."""
+        """Explicit synchronously invoked renewal decoupled from disposable projection."""
         with self._lock:
             if self.is_cancelled:
                 return False
+
+            # Authoritative check: verify worker authority in append-only transition log
+            try:
+                transitions = self.storage.list_transitions(self.job.item_id)
+                for t in transitions:
+                    if t.generation > self.job.generation or (
+                        t.generation == self.job.generation
+                        and t.attempt_epoch > (self.job.active_attempt_epoch or 1)
+                    ):
+                        logger.warning(
+                            "Worker fenced out for job %s: newer transition found (gen=%d, epoch=%d) > active (gen=%d, epoch=%d)",
+                            self.job.item_id,
+                            t.generation,
+                            t.attempt_epoch,
+                            self.job.generation,
+                            self.job.active_attempt_epoch or 1,
+                        )
+                        self.cancelled_event.set()
+                        return False
+            except Exception as e:
+                logger.warning("Could not list transitions for lease authority check on %s: %s", self.job.item_id, e)
+
+            # Check storage lease renewal
             success = True
             if self.coordinator:
                 success = self.coordinator.renew_lease(
@@ -100,13 +123,34 @@ class ContinuousHeartbeatManager:
                 )
             if not success:
                 logger.warning(
-                    "Heartbeat lease renewal failed for job %s! Lease stolen, expired, or storage error.",
+                    "Heartbeat lease renewal failed for job %s! Lease stolen, expired, or cancelled.",
                     self.job.item_id,
                 )
                 self.cancelled_event.set()
-                self.renewal_failures += 1
                 return False
-            self.last_renewal_ts = self.clock_func()
+
+            # Emit authoritative HEARTBEAT transition if elapsed time >= 5 minutes
+            now = self.clock_func()
+            now_ms = int(now * 1000)
+            if (now - self.last_renewal_ts) >= 300.0:
+                try:
+                    hb_seq = getattr(self.job, "_heartbeat_seq", 100) + 1
+                    setattr(self.job, "_heartbeat_seq", hb_seq)
+                    hb_trans = TransitionRecord(
+                        item_id=self.job.item_id,
+                        generation=self.job.generation,
+                        attempt_epoch=self.job.active_attempt_epoch or 1,
+                        transition_seq=hb_seq,
+                        transition_type=TransitionType.HEARTBEAT,
+                        attempt_id=self.runner_id,
+                        created_at=now_ms,
+                        payload={"lease_timeout_ms": self.lease_timeout_ms},
+                    )
+                    self.storage.append_transition(hb_trans)
+                except Exception as hb_err:
+                    logger.warning("Failed appending authoritative HEARTBEAT transition for %s: %s", self.job.item_id, hb_err)
+
+            self.last_renewal_ts = now
             return True
 
     def _run_loop(self) -> None:
@@ -271,9 +315,16 @@ class CloudProcessingPipeline:
                 logger.warning("Lost distributed lease on job %s during stage %s update", job.item_id, stage)
                 return False
 
-        if not self.storage.update_job(job):
-            logger.warning("Aborting job %s: lost lease during %s update", job.item_id, stage)
-            return False
+        # Update disposable projection (non-fatal; authoritative state is recorded in transition log)
+        try:
+            self.storage.update_job(job)
+        except Exception as e:
+            logger.warning(
+                "Failed to refresh projection jobs/%s.json after %s update: %s (authoritative transitions intact)",
+                job.item_id,
+                stage,
+                e,
+            )
 
         return True
 
@@ -338,16 +389,33 @@ class CloudProcessingPipeline:
             folded, warnings = fold_transitions(job.item_id, existing_transitions, base_manifest=job)
             for w in warnings:
                 logger.warning("Transition log warning for %s: %s", job.item_id, w)
-            if folded.status == JobStatus.COMPLETED:
-                logger.info("Job %s is already settled COMPLETED according to transition log; skipping", job.item_id)
+            if folded.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                logger.info("Job %s is already settled (%s) according to transition log; skipping", job.item_id, folded.status.value)
                 self.storage.update_job(folded)
                 return False
             for k, v in folded.__dict__.items():
                 setattr(job, k, v)
 
+        now_ms = int(time.time() * 1000)
         gen_transitions = [t for t in existing_transitions if t.generation == job.generation]
         if gen_transitions:
             highest_epoch = max(t.attempt_epoch for t in gen_transitions)
+            # Check if active epoch currently has an unexpired lease held by another runner
+            latest_claim = next(
+                (t for t in reversed(gen_transitions) if t.attempt_epoch == highest_epoch and t.transition_type == TransitionType.CLAIM),
+                None,
+            )
+            if latest_claim:
+                claimed_at = latest_claim.created_at
+                timeout = latest_claim.payload.get("lease_timeout_ms", self.config.lease_timeout_ms)
+                if (now_ms - claimed_at) < timeout and latest_claim.attempt_id != self.config.runner_id:
+                    logger.warning(
+                        "Job %s is actively claimed by %s (lease active for %d ms); skipping claim",
+                        job.item_id,
+                        latest_claim.attempt_id,
+                        timeout - (now_ms - claimed_at),
+                    )
+                    return False
             active_epoch = highest_epoch + 1
         else:
             active_epoch = getattr(job, "active_attempt_epoch", 1) or 1

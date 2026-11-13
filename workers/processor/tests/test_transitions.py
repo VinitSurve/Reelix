@@ -555,6 +555,196 @@ class TestTransitionLogAndProjections(unittest.TestCase):
         self.assertEqual(JobStatus.PROCESSING, current_job.status)
         self.assertGreater(current_job.claimed_at, 1000)
 
+    def test_fresh_runner_crash_after_drive_creation_before_response_receipt(self):
+        """Blocker 3: Worker A creates transition, response lost / terminates. Fresh Worker B recovers."""
+        item_id = "item-fresh-crash-recovery"
+        job = self._create_job(item_id)
+
+        # Worker A in Runner Environment 1
+        storage_a = MockStorageClient(root_dir=self.storage_dir)
+        storage_a.fault_crash_after_drive_creation_before_response = True
+
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-worker-A",
+            created_at=1000,
+            payload={"claimed_at": 1000, "lease_timeout_ms": 900_000},
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            storage_a.append_transition(trans)
+        self.assertIn("CRASH_AFTER_DRIVE_CREATION_BEFORE_RESPONSE", str(ctx.exception))
+
+        # Worker A environment is destroyed (storage_a dereferenced)
+        del storage_a
+
+        # Worker B starts in completely FRESH runner environment
+        storage_b = MockStorageClient(root_dir=self.storage_dir)
+
+        # Worker B attempts to emit the exact same logical transition
+        recovered_ok = storage_b.append_transition(trans)
+        self.assertTrue(recovered_ok, "Fresh Worker B must recover and verify the transition")
+
+        # Exactly ONE transition file must exist on disk for this logical transition
+        transitions_folder = self.storage_dir / "transitions" / item_id
+        files = list(transitions_folder.glob("*.json"))
+        self.assertEqual(1, len(files), f"Expected exactly 1 transition file, found: {files}")
+        self.assertEqual(f"{trans.deterministic_transition_id}.json", files[0].name)
+
+        # Folded state must be correct
+        transitions = storage_b.list_transitions(item_id)
+        self.assertEqual(1, len(transitions))
+        folded, warnings = fold_transitions(item_id, transitions)
+        self.assertEqual([], warnings)
+        self.assertEqual(JobStatus.PROCESSING, folded.status)
+        self.assertEqual("runner-worker-A", folded.claimed_by)
+        self.assertEqual(1, folded.active_attempt_epoch)
+
+    def test_fresh_runner_crash_immediately_after_id_generation(self):
+        """Blocker 3: Runner terminates immediately after ID generation before intent persistence."""
+        item_id = "item-crash-after-id-gen"
+        job = self._create_job(item_id)
+
+        storage_a = MockStorageClient(root_dir=self.storage_dir)
+        storage_a.fault_crash_after_id_generation = True
+
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-worker-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            storage_a.append_transition(trans)
+        self.assertIn("CRASH_AFTER_ID_GENERATION", str(ctx.exception))
+        del storage_a
+
+        # Fresh Runner B starts: no intent exists, generates fresh ID and succeeds
+        storage_b = MockStorageClient(root_dir=self.storage_dir)
+        ok = storage_b.append_transition(trans)
+        self.assertTrue(ok)
+
+        transitions = storage_b.list_transitions(item_id)
+        self.assertEqual(1, len(transitions))
+        self.assertEqual(trans.deterministic_transition_id, transitions[0].deterministic_transition_id)
+
+    def test_fresh_runner_crash_after_intent_persistence_before_create(self):
+        """Blocker 3: Runner terminates after intent persistence but before files.create."""
+        item_id = "item-crash-after-intent"
+        job = self._create_job(item_id)
+
+        storage_a = MockStorageClient(root_dir=self.storage_dir)
+        storage_a.fault_crash_after_intent_persistence = True
+
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-worker-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            storage_a.append_transition(trans)
+        self.assertIn("CRASH_AFTER_INTENT_PERSISTENCE", str(ctx.exception))
+        del storage_a
+
+        # Intent exists on disk, but transition does not exist yet
+        storage_b = MockStorageClient(root_dir=self.storage_dir)
+        intent = storage_b.find_transition_intent(item_id, trans.deterministic_transition_id)
+        self.assertNotNull = self.assertIsNotNone(intent)
+        self.assertTrue(intent["drive_file_id"].startswith("mock_drive_id_"))
+
+        # Fresh Runner B reuses the persisted intent Drive file ID
+        ok = storage_b.append_transition(trans)
+        self.assertTrue(ok)
+
+        # Transition exists and intent is cleaned up
+        transitions = storage_b.list_transitions(item_id)
+        self.assertEqual(1, len(transitions))
+        self.assertIsNone(storage_b.find_transition_intent(item_id, trans.deterministic_transition_id))
+
+    def test_fresh_runner_crash_after_transition_before_projection_publish(self):
+        """Blocker 3: Runner terminates after transition is written but before projection publication."""
+        item_id = "item-crash-before-projection"
+        job = self._create_job(item_id)
+
+        storage_a = MockStorageClient(root_dir=self.storage_dir)
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-worker-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+        storage_a.append_transition(trans)
+        # Runner A dies before updating jobs/{item_id}.json
+        del storage_a
+
+        # Fresh Runner B starts: projection on disk is still QUEUED, but transition log has CLAIM
+        storage_b = MockStorageClient(root_dir=self.storage_dir)
+        stale_proj = storage_b.get_job(item_id)
+        self.assertEqual(JobStatus.QUEUED, stale_proj.status)
+
+        # Rebuilding projection restores authoritative state
+        rebuilt = storage_b.rebuild_projection(item_id)
+        self.assertEqual(JobStatus.PROCESSING, rebuilt.status)
+        self.assertEqual("runner-worker-A", rebuilt.claimed_by)
+
+    def test_409_conflict_with_mismatched_payload_rejected_as_fork(self):
+        """Blocker 1: An arbitrary 409 is NEVER treated as proof of success if payload differs."""
+        item_id = "item-409-mismatch"
+        job = self._create_job(item_id)
+
+        storage = MockStorageClient(root_dir=self.storage_dir)
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+
+        filename = f"{trans.deterministic_transition_id}.json"
+        storage.simulated_upload_conflicts[filename] = True
+
+        # Pre-seed conflicting transition with different payload
+        conflict_trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-CONFLICT",
+            created_at=1000,
+            payload={"claimed_at": 9999},
+        )
+        target_dir = storage.transitions_dir / item_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / filename).write_text(conflict_trans.to_json(), encoding="utf-8")
+
+        # Now attempting to append trans must be REJECTED (returns False), not accepted blindly
+        res = storage.append_transition(trans)
+        self.assertFalse(res, "409 with conflicting payload/identity must be rejected")
+
 
 if __name__ == "__main__":
     unittest.main()

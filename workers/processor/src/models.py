@@ -44,6 +44,7 @@ class TransitionType(str, Enum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     FORK_FENCED = "FORK_FENCED"
+    HEARTBEAT = "HEARTBEAT"
 
 
 class StageStatus(str, Enum):
@@ -246,6 +247,17 @@ class TransitionRecord:
         prev = self.previous_hash or "ROOT"
         content = f"{prev}:{self.deterministic_transition_id}:{self.payload_integrity_hash}"
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def matches_identity_and_payload(self, other: TransitionRecord) -> bool:
+        """6-point verification between two transition records."""
+        return (
+            self.item_id == other.item_id
+            and self.generation == other.generation
+            and self.attempt_epoch == other.attempt_epoch
+            and self.attempt_id == other.attempt_id
+            and self.transition_type == other.transition_type
+            and self.payload_integrity_hash == other.payload_integrity_hash
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -632,6 +644,10 @@ def fold_transitions(
             manifest.status = JobStatus.PROCESSING
             manifest.claimed_by = t.attempt_id
             manifest.claimed_at = t.created_at
+        elif t.transition_type == TransitionType.HEARTBEAT:
+            manifest.claimed_at = t.created_at
+            if "lease_timeout_ms" in t.payload:
+                manifest.lease_timeout_ms = t.payload["lease_timeout_ms"]
 
     if has_fork:
         manifest.status = JobStatus.NEEDS_ATTENTION

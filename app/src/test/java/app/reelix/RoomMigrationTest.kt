@@ -164,6 +164,28 @@ class RoomMigrationTest {
         assertEquals("v1_item_1", ftsCursor.getString(0))
         ftsCursor.close()
 
+        // Execute MIGRATION_2_3
+        ReelixDatabase.MIGRATION_2_3.migrate(v1Db)
+
+        // Verify newly added 3D projection sync columns in saved_items
+        val cursorV3 = v1Db.query("SELECT id, lastSyncedGeneration, lastSyncedAttemptEpoch, lastSyncedProjectionVersion FROM `saved_items` WHERE id = 'v1_item_1'")
+        assertTrue(cursorV3.moveToFirst())
+        assertEquals("v1_item_1", cursorV3.getString(0))
+        assertEquals(1, cursorV3.getInt(1)) // lastSyncedGeneration default 1
+        assertEquals(1, cursorV3.getInt(2)) // lastSyncedAttemptEpoch default 1
+        assertEquals(0L, cursorV3.getLong(3)) // lastSyncedProjectionVersion default 0
+        cursorV3.close()
+
+        val tableInfoCursor = v1Db.query("PRAGMA table_info(`saved_items`)")
+        val columns = mutableListOf<String>()
+        while (tableInfoCursor.moveToNext()) {
+            columns.add(tableInfoCursor.getString(1))
+        }
+        tableInfoCursor.close()
+        assertTrue(columns.contains("lastSyncedGeneration"))
+        assertTrue(columns.contains("lastSyncedAttemptEpoch"))
+        assertTrue(columns.contains("lastSyncedProjectionVersion"))
+
         v1Db.close()
     }
 }
