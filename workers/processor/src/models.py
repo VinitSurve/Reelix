@@ -94,6 +94,7 @@ class ArtifactRef:
     content_hash: Optional[str] = None
     name: Optional[str] = None
     generation: int = 1
+    attempt_epoch: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -103,6 +104,7 @@ class ArtifactRef:
             "content_hash": self.content_hash,
             "name": self.name,
             "generation": self.generation,
+            "attempt_epoch": self.attempt_epoch,
         }
 
     @classmethod
@@ -114,6 +116,7 @@ class ArtifactRef:
             content_hash=data.get("content_hash"),
             name=data.get("name"),
             generation=data.get("generation", 1),
+            attempt_epoch=data.get("attempt_epoch", 1),
         )
 
 

@@ -253,6 +253,34 @@ class CloudProcessingPipeline:
             logger.warning("Rejecting stage update for %s on job %s: worker lease cancelled/lost", stage, job.item_id)
             return False
 
+        # Authoritative fencing check before publication:
+        # Check transition log to verify worker has not been superseded by a newer epoch or generation
+        try:
+            transitions = self.storage.list_transitions(job.item_id)
+            for t in transitions:
+                if t.generation > job.generation or (
+                    t.generation == job.generation
+                    and t.attempt_epoch > (job.active_attempt_epoch or 1)
+                ):
+                    logger.warning(
+                        "Fenced out before publishing stage %s on %s: newer transition found (gen=%d, epoch=%d) > active (gen=%d, epoch=%d)",
+                        stage,
+                        job.item_id,
+                        t.generation,
+                        t.attempt_epoch,
+                        job.generation,
+                        job.active_attempt_epoch or 1,
+                    )
+                    if self._current_heartbeat:
+                        self._current_heartbeat.cancelled_event.set()
+                    return False
+        except Exception as e:
+            logger.warning("Could not list transitions for stage fencing check on %s: %s", job.item_id, e)
+
+        if artifact:
+            artifact.generation = job.generation
+            artifact.attempt_epoch = job.active_attempt_epoch or 1
+
         job.record_stage_update(stage, status, error)
         if artifact:
             job.artifacts[stage] = artifact
@@ -328,8 +356,26 @@ class CloudProcessingPipeline:
 
         return True
 
-    def _record_completion_transition(self, job: JobManifest) -> None:
+    def _record_completion_transition(self, job: JobManifest) -> bool:
         """Appends a terminal COMPLETED transition record to immutable storage and updates projection fields."""
+        # Fencing check before terminal completion
+        try:
+            transitions = self.storage.list_transitions(job.item_id)
+            for t in transitions:
+                if t.generation > job.generation or (
+                    t.generation == job.generation
+                    and t.attempt_epoch > (job.active_attempt_epoch or 1)
+                ):
+                    logger.warning(
+                        "Fenced out before recording completion for %s: newer transition found (gen=%d, epoch=%d)",
+                        job.item_id,
+                        t.generation,
+                        t.attempt_epoch,
+                    )
+                    return False
+        except Exception as e:
+            logger.warning("Could not list transitions for completion fencing check on %s: %s", job.item_id, e)
+
         seq = self._next_seq(job.item_id)
         comp_trans = TransitionRecord(
             item_id=job.item_id,
@@ -349,6 +395,7 @@ class CloudProcessingPipeline:
         job.projection_version = (job.projection_version or 1) + 1
         job.last_transition_id = comp_trans.deterministic_transition_id
         job.last_transition_hash = comp_trans.compute_transition_hash()
+        return True
 
     def run_batch(self) -> BatchRunSummary:
         """Finds and executes up to max_jobs_per_run pending jobs."""
@@ -483,11 +530,11 @@ class CloudProcessingPipeline:
         job.last_transition_id = claim_trans.deterministic_transition_id
         job.last_transition_hash = claim_trans.compute_transition_hash()
 
-        job_dir = self.config.work_dir / f"{job.item_id}_gen{job.generation}"
+        job_dir = self.config.work_dir / f"{job.item_id}_gen{job.generation}_e{active_epoch}"
         job_dir.mkdir(parents=True, exist_ok=True)
 
         local_media_path: Optional[Path] = None
-        local_wav_path = job_dir / f"{job.item_id}_gen{job.generation}_audio.wav"
+        local_wav_path = job_dir / f"{job.item_id}_gen{job.generation}_e{active_epoch}_audio.wav"
 
         with ContinuousHeartbeatManager(
             storage=self.storage,
@@ -529,6 +576,7 @@ class CloudProcessingPipeline:
                                 original_file_name=dl_res.file_name,
                                 content_hash=media_hash,
                                 generation=job.generation,
+                                attempt_epoch=active_epoch,
                             )
                             if not drive_file_id:
                                 self._update_stage(job, "acquisition", StageStatus.FAILED, error="Failed to upload acquired media")
@@ -653,6 +701,7 @@ class CloudProcessingPipeline:
                             job.item_id,
                             content_hash=audio_hash,
                             generation=job.generation,
+                            attempt_epoch=active_epoch,
                         )
                         job.results.audio_drive_file_id = audio_drive_id
                         job.results.audio_size_bytes = extract_res.size_bytes
@@ -662,8 +711,13 @@ class CloudProcessingPipeline:
                             mime_type="audio/wav",
                             size_bytes=extract_res.size_bytes or 0,
                             content_hash=audio_hash,
-                            name=f"{job.item_id}_gen{job.generation}.wav",
+                            name=(
+                                f"{job.item_id}_gen{job.generation}_e{active_epoch}.wav"
+                                if active_epoch > 1
+                                else (f"{job.item_id}_gen{job.generation}.wav" if job.generation > 1 else f"{job.item_id}.wav")
+                            ),
                             generation=job.generation,
+                            attempt_epoch=active_epoch,
                         )
                         if not self._update_stage(job, "audio_extraction", StageStatus.SUCCEEDED, artifact=audio_artifact):
                             logger.warning("Aborting job %s: lost lease during audio extraction update", job.item_id)

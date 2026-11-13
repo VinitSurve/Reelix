@@ -39,6 +39,15 @@ class StorageClient(abc.ABC):
         """Recovers persisted transition intent if a previous runner crashed before completing creation."""
         return None
 
+    def find_all_transition_intents(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> List[dict]:
+        """Discovers all persisted transition intent records for deterministic duplicate reconciliation."""
+        single = self.find_transition_intent(item_id, deterministic_transition_id)
+        return [single] if single else []
+
     def delete_transition_intent(
         self,
         item_id: str,
@@ -113,8 +122,9 @@ class StorageClient(abc.ABC):
         item_id: str,
         content_hash: Optional[str] = None,
         generation: int = 1,
+        attempt_epoch: int = 1,
     ) -> Optional[str]:
-        """Uploads an extracted audio WAV file with generation isolation and content hash deduplication."""
+        """Uploads an extracted audio WAV file scoped by generation and epoch with hash deduplication."""
         pass
 
     @abc.abstractmethod
@@ -126,6 +136,7 @@ class StorageClient(abc.ABC):
         original_file_name: Optional[str] = None,
         content_hash: Optional[str] = None,
         generation: int = 1,
+        attempt_epoch: int = 1,
     ) -> Optional[str]:
-        """Uploads acquired media file to cloud storage with generation isolation and content hash deduplication."""
+        """Uploads acquired media file scoped by generation and epoch with hash deduplication."""
         pass

@@ -587,6 +587,7 @@ class GoogleDriveStorageClient(StorageClient):
         item_id: str,
         content_hash: Optional[str] = None,
         generation: int = 1,
+        attempt_epoch: int = 1,
     ) -> Optional[str]:
         if not local_wav_path.exists():
             return None
@@ -595,7 +596,12 @@ class GoogleDriveStorageClient(StorageClient):
         local_size = local_wav_path.stat().st_size if local_wav_path.exists() else 0
         service = self._get_service()
         audio_folder = self._ensure_subfolder("audio")
-        filename = f"{item_id}_gen{generation}.wav" if generation > 1 else f"{item_id}.wav"
+        if attempt_epoch > 1:
+            filename = f"{item_id}_gen{generation}_e{attempt_epoch}.wav"
+        elif generation > 1:
+            filename = f"{item_id}_gen{generation}.wav"
+        else:
+            filename = f"{item_id}.wav"
 
         # Check for existing artifact with pagination and SHA-256 verification
         query = f"'{audio_folder}' in parents and name = '{filename}' and trashed = false"
@@ -623,6 +629,15 @@ class GoogleDriveStorageClient(StorageClient):
                             continue
                     except (ValueError, TypeError):
                         pass
+
+                remote_epoch = app_props.get("reelix_epoch")
+                if remote_epoch is not None:
+                    try:
+                        if int(remote_epoch) != attempt_epoch:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
                 remote_sha256 = app_props.get("reelix_sha256")
                 if remote_sha256:
                     if remote_sha256 == sha256:
@@ -638,8 +653,8 @@ class GoogleDriveStorageClient(StorageClient):
                         logger.warning("Existing audio artifact %s has mismatched SHA-256 (remote=%s, local=%s); ignoring.", filename, remote_sha256, sha256)
                         continue
                 else:
-                    # Legacy artifact without stored SHA-256: only reuse if generation is 1
-                    if generation > 1:
+                    # Legacy artifact without stored SHA-256: only reuse if generation is 1 and epoch is 1
+                    if generation > 1 or attempt_epoch > 1:
                         continue
                     if local_size > 0 and size != local_size and size != 1024:
                         logger.warning("Legacy audio artifact %s has mismatched size (remote=%d, local=%d); ignoring.", filename, size, local_size)
@@ -648,7 +663,7 @@ class GoogleDriveStorageClient(StorageClient):
                     try:
                         service.files().update(
                             fileId=f["id"],
-                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "audio", "reelix_sha256": sha256, "reelix_generation": str(generation)}},
+                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "audio", "reelix_sha256": sha256, "reelix_generation": str(generation), "reelix_epoch": str(attempt_epoch)}},
                             fields="id, appProperties",
                         ).execute()
                     except Exception as meta_err:
@@ -670,6 +685,7 @@ class GoogleDriveStorageClient(StorageClient):
                 "reelix_type": "audio",
                 "reelix_sha256": sha256,
                 "reelix_generation": str(generation),
+                "reelix_epoch": str(attempt_epoch),
             },
         }
 
@@ -689,6 +705,7 @@ class GoogleDriveStorageClient(StorageClient):
         original_file_name: Optional[str] = None,
         content_hash: Optional[str] = None,
         generation: int = 1,
+        attempt_epoch: int = 1,
     ) -> Optional[str]:
         if not local_media_path.exists():
             return None
@@ -697,11 +714,13 @@ class GoogleDriveStorageClient(StorageClient):
         local_size = local_media_path.stat().st_size if local_media_path.exists() else 0
         service = self._get_service()
         media_folder = self._ensure_subfolder("media")
-        filename = (
-            f"{item_id}_gen{generation}.mp4"
-            if generation > 1
-            else (original_file_name or f"{item_id}.mp4")
-        )
+        ext = Path(original_file_name).suffix if original_file_name else ".mp4"
+        if attempt_epoch > 1:
+            filename = f"{item_id}_gen{generation}_e{attempt_epoch}{ext}"
+        elif generation > 1:
+            filename = f"{item_id}_gen{generation}{ext}"
+        else:
+            filename = original_file_name or f"{item_id}.mp4"
 
         # Check for existing artifact with pagination and SHA-256 verification
         query = f"'{media_folder}' in parents and name = '{filename}' and trashed = false"
@@ -729,6 +748,15 @@ class GoogleDriveStorageClient(StorageClient):
                             continue
                     except (ValueError, TypeError):
                         pass
+
+                remote_epoch = app_props.get("reelix_epoch")
+                if remote_epoch is not None:
+                    try:
+                        if int(remote_epoch) != attempt_epoch:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
                 remote_sha256 = app_props.get("reelix_sha256")
                 if remote_sha256:
                     if remote_sha256 == sha256:
@@ -744,8 +772,8 @@ class GoogleDriveStorageClient(StorageClient):
                         logger.warning("Existing media artifact %s has mismatched SHA-256 (remote=%s, local=%s); ignoring.", filename, remote_sha256, sha256)
                         continue
                 else:
-                    # Legacy artifact without stored SHA-256: only reuse if generation is 1
-                    if generation > 1:
+                    # Legacy artifact without stored SHA-256: only reuse if generation is 1 and epoch is 1
+                    if generation > 1 or attempt_epoch > 1:
                         continue
                     if local_size > 0 and size != local_size and size != 4096:
                         logger.warning("Legacy media artifact %s has mismatched size (remote=%d, local=%d); ignoring.", filename, size, local_size)
@@ -754,7 +782,7 @@ class GoogleDriveStorageClient(StorageClient):
                     try:
                         service.files().update(
                             fileId=f["id"],
-                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "media", "reelix_sha256": sha256, "reelix_generation": str(generation)}},
+                            body={"appProperties": {"reelix_item_id": item_id, "reelix_type": "media", "reelix_sha256": sha256, "reelix_generation": str(generation), "reelix_epoch": str(attempt_epoch)}},
                             fields="id, appProperties",
                         ).execute()
                     except Exception as meta_err:
@@ -776,6 +804,7 @@ class GoogleDriveStorageClient(StorageClient):
                 "reelix_type": "media",
                 "reelix_sha256": sha256,
                 "reelix_generation": str(generation),
+                "reelix_epoch": str(attempt_epoch),
             },
         }
 
@@ -907,27 +936,39 @@ class GoogleDriveStorageClient(StorageClient):
         deterministic_transition_id: str,
     ) -> Optional[dict]:
         """Recovers persisted transition intent if a previous runner crashed before completing creation."""
+        intents = self.find_all_transition_intents(item_id, deterministic_transition_id)
+        return intents[0] if intents else None
+
+    def find_all_transition_intents(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> List[dict]:
+        """Discovers all persisted transition intent records for deterministic duplicate reconciliation."""
         service = self._get_service()
         intents_folder = self._ensure_item_intents_folder(item_id)
         filename = f"{deterministic_transition_id}.json"
         query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
         res = service.files().list(q=query, fields="files(id, name)").execute()
         files = res.get("files", [])
-        if not files:
-            return None
-        try:
-            raw = self._download_bytes(files[0]["id"])
-            return json.loads(raw.decode("utf-8"))
-        except Exception as e:
-            logger.warning("Could not parse transition intent %s: %s", filename, e)
-            return None
+        intents: List[dict] = []
+        for f in files:
+            try:
+                raw = self._download_bytes(f["id"])
+                parsed = json.loads(raw.decode("utf-8"))
+                parsed["_drive_intent_file_id"] = f["id"]
+                intents.append(parsed)
+            except Exception as e:
+                logger.warning("Could not parse transition intent %s (%s): %s", filename, f["id"], e)
+        return intents
 
     def delete_transition_intent(
         self,
         item_id: str,
         deterministic_transition_id: str,
+        preserve_conflicts: bool = True,
     ) -> bool:
-        """Removes intent record after transition creation is verified."""
+        """Removes intent record(s) after transition creation is verified."""
         service = self._get_service()
         intents_folder = self._ensure_item_intents_folder(item_id)
         filename = f"{deterministic_transition_id}.json"
@@ -955,10 +996,11 @@ class GoogleDriveStorageClient(StorageClient):
         Strict protocol:
         1. Checks if transition already exists by deterministic filename (search-before-create).
            Runs 6-point verification. If matches, cleans intent and returns True. If mismatched, returns False.
-        2. Checks if an intent mapping exists for (item_id, deterministic_transition_id).
-           If intent exists, recovers drive_file_id.
-           Checks get_transition_by_file_id(drive_file_id). If file exists on Drive, runs 6-point verification.
-           If matches, cleans intent and returns True. If file does not exist (404), reuses drive_file_id.
+        2. Discovers all intent records (handles eventual consistency duplicates).
+           Reconciles deterministically:
+           a. If any candidate ID is already committed on Drive matching 6-points, accepts it.
+           b. If conflicting payload hashes exist across intents, preserves evidence and rejects append.
+           c. Deterministically sorts uncommitted intents by (created_at, drive_file_id) to select canonical ID.
         3. If no intent exists:
            Obtains valid Drive file ID through files.generateIds endpoint.
            Persists the intent mapping to Google Drive (transition_intents/{item_id}/{transition_id}.json).
@@ -983,22 +1025,68 @@ class GoogleDriveStorageClient(StorageClient):
                 logger.error("INTEGRITY FORK: Transition %s already exists with conflicting identity/payload!", filename)
                 return False
 
-        # Step 2: Recover or generate Drive file ID via intent store
-        intent = self.find_transition_intent(transition.item_id, transition.deterministic_transition_id)
+        # Step 2: Recover or generate Drive file ID via intent store with duplicate reconciliation
+        intents = self.find_all_transition_intents(transition.item_id, transition.deterministic_transition_id)
         drive_file_id: Optional[str] = None
-        if intent:
-            candidate_id = intent.get("drive_file_id")
-            if candidate_id:
-                existing_by_id = self.get_transition_by_file_id(candidate_id)
+
+        if intents:
+            if len(intents) > 1:
+                logger.warning(
+                    "Discovered %d duplicate intent records for %s; reconciling deterministically",
+                    len(intents),
+                    filename,
+                )
+
+            committed_candidate = None
+            conflicting_intents = []
+            for it in intents:
+                cid = it.get("drive_file_id")
+                if not cid:
+                    continue
+                # Check for divergent payload hash
+                if it.get("payload_hash") and it["payload_hash"] != transition.payload_integrity_hash:
+                    logger.error(
+                        "INTEGRITY CONFLICT: Intent carries divergent payload hash (%s != %s); preserving for diagnosis",
+                        it["payload_hash"],
+                        transition.payload_integrity_hash,
+                    )
+                    conflicting_intents.append(it)
+                    continue
+
+                existing_by_id = self.get_transition_by_file_id(cid)
                 if existing_by_id is not None:
                     if existing_by_id.matches_identity_and_payload(transition):
-                        logger.info("Transition %s recovered via intent ID %s (6-point check passed)", filename, candidate_id)
-                        self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
-                        return True
+                        committed_candidate = cid
+                        break
                     else:
-                        logger.error("INTEGRITY FORK: File %s found with conflicting identity/payload!", candidate_id)
+                        logger.error(
+                            "INTEGRITY FORK: Remote file %s exists with conflicting identity/payload!",
+                            cid,
+                        )
                         return False
-                drive_file_id = candidate_id
+
+            if conflicting_intents and not committed_candidate:
+                logger.error(
+                    "Aborting transition creation for %s due to conflicting unverified intents",
+                    filename,
+                )
+                return False
+
+            if committed_candidate:
+                logger.info("Transition %s recovered via committed intent ID %s", filename, committed_candidate)
+                self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
+                return True
+
+            valid_intents = [it for it in intents if it not in conflicting_intents and it.get("drive_file_id")]
+            if valid_intents:
+                valid_intents.sort(key=lambda x: (x.get("created_at", 0), x.get("drive_file_id", "")))
+                drive_file_id = valid_intents[0]["drive_file_id"]
+                logger.info(
+                    "Reconciled %d intents for %s to canonical Drive ID: %s",
+                    len(valid_intents),
+                    filename,
+                    drive_file_id,
+                )
 
         if not drive_file_id:
             drive_file_id = self.generate_drive_file_id()

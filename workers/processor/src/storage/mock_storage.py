@@ -47,6 +47,7 @@ class MockStorageClient(StorageClient):
         self.fault_crash_after_id_generation: bool = False
         self.fault_crash_after_intent_persistence: bool = False
         self.fault_crash_after_drive_creation_before_response: bool = False
+        self.fault_delayed_intent_visibility: int = 0
 
     def register_media(self, file_id: str, path: Path):
         self._files[file_id] = path
@@ -212,13 +213,19 @@ class MockStorageClient(StorageClient):
         item_id: str,
         content_hash: Optional[str] = None,
         generation: int = 1,
+        attempt_epoch: int = 1,
     ) -> Optional[str]:
         if not local_wav_path.exists():
             return None
         sha256 = content_hash or compute_file_sha256(local_wav_path)
-        file_id = f"audio_{item_id}_gen{generation}.wav" if generation > 1 else f"audio_{item_id}.wav"
+        if attempt_epoch > 1:
+            file_id = f"audio_{item_id}_gen{generation}_e{attempt_epoch}.wav"
+        elif generation > 1:
+            file_id = f"audio_{item_id}_gen{generation}.wav"
+        else:
+            file_id = f"audio_{item_id}.wav"
         dest = self.audio_dir / file_id
-        # Idempotent deduplication: if destination artifact already exists with matching SHA-256 and generation, reuse it
+        # Idempotent deduplication: if destination artifact already exists with matching SHA-256, generation, and epoch, reuse it
         if dest.exists() and dest.stat().st_size > 0:
             existing_hash = compute_file_sha256(dest)
             if existing_hash == sha256:
@@ -237,13 +244,20 @@ class MockStorageClient(StorageClient):
         original_file_name: Optional[str] = None,
         content_hash: Optional[str] = None,
         generation: int = 1,
+        attempt_epoch: int = 1,
     ) -> Optional[str]:
         if not local_media_path.exists():
             return None
         sha256 = content_hash or compute_file_sha256(local_media_path)
-        file_id = f"media_{item_id}_gen{generation}.mp4" if generation > 1 else f"media_{item_id}.mp4"
+        ext = Path(original_file_name).suffix if original_file_name else ".mp4"
+        if attempt_epoch > 1:
+            file_id = f"media_{item_id}_gen{generation}_e{attempt_epoch}{ext}"
+        elif generation > 1:
+            file_id = f"media_{item_id}_gen{generation}{ext}"
+        else:
+            file_id = f"media_{item_id}.mp4"
         dest = self.media_dir / file_id
-        # Idempotent deduplication: if destination artifact already exists with matching SHA-256 and generation, reuse it
+        # Idempotent deduplication
         if dest.exists() and dest.stat().st_size > 0:
             existing_hash = compute_file_sha256(dest)
             if existing_hash == sha256:
@@ -280,29 +294,53 @@ class MockStorageClient(StorageClient):
         target.write_text(json.dumps(payload), encoding="utf-8")
         return True
 
+    def find_all_transition_intents(
+        self,
+        item_id: str,
+        deterministic_transition_id: str,
+    ) -> List[dict]:
+        """Discovers all persisted transition intent records on disk, simulating Drive duplicates."""
+        if self.fault_delayed_intent_visibility > 0:
+            self.fault_delayed_intent_visibility -= 1
+            return []
+
+        target_dir = self.intents_dir / item_id
+        if not target_dir.exists():
+            return []
+
+        intents = []
+        for f in sorted(target_dir.glob(f"{deterministic_transition_id}*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                data["_drive_intent_file_id"] = f.name
+                intents.append(data)
+            except Exception:
+                continue
+        return intents
+
     def find_transition_intent(
         self,
         item_id: str,
         deterministic_transition_id: str,
     ) -> Optional[dict]:
         """Recovers persisted transition intent if a previous runner crashed before completing creation."""
-        target = self.intents_dir / item_id / f"{deterministic_transition_id}.json"
-        if target.exists():
-            try:
-                return json.loads(target.read_text(encoding="utf-8"))
-            except Exception:
-                return None
-        return None
+        intents = self.find_all_transition_intents(item_id, deterministic_transition_id)
+        return intents[0] if intents else None
 
     def delete_transition_intent(
         self,
         item_id: str,
         deterministic_transition_id: str,
+        preserve_conflicts: bool = True,
     ) -> bool:
-        """Removes intent record after transition creation is verified."""
-        target = self.intents_dir / item_id / f"{deterministic_transition_id}.json"
-        if target.exists():
-            target.unlink(missing_ok=True)
+        """Removes intent record(s) after transition creation is verified."""
+        target_dir = self.intents_dir / item_id
+        if not target_dir.exists():
+            return True
+        for f in target_dir.glob(f"{deterministic_transition_id}*.json"):
+            if "conflict" in f.name and preserve_conflicts:
+                continue
+            f.unlink(missing_ok=True)
         return True
 
     def get_transition_by_file_id(self, file_id: str) -> Optional[TransitionRecord]:
@@ -330,20 +368,44 @@ class MockStorageClient(StorageClient):
             else:
                 return False
 
-        # Step 2: Intent recovery / ID generation
-        intent = self.find_transition_intent(transition.item_id, transition.deterministic_transition_id)
+        # Step 2: Intent recovery / ID generation with duplicate reconciliation
+        intents = self.find_all_transition_intents(transition.item_id, transition.deterministic_transition_id)
         drive_file_id: Optional[str] = None
-        if intent:
-            candidate_id = intent.get("drive_file_id")
-            if candidate_id:
-                existing_by_id = self.get_transition_by_file_id(candidate_id)
+
+        if intents:
+            committed_candidate = None
+            conflicting_intents = []
+            for it in intents:
+                cid = it.get("drive_file_id")
+                if not cid:
+                    continue
+                # Verify payload hash consistency
+                if it.get("payload_hash") and it["payload_hash"] != transition.payload_integrity_hash:
+                    # Preserve conflict evidence for diagnosis
+                    conflict_file = self.intents_dir / transition.item_id / f"{transition.deterministic_transition_id}__conflict_{cid}.json"
+                    conflict_file.write_text(json.dumps(it), encoding="utf-8")
+                    conflicting_intents.append(it)
+                    continue
+
+                existing_by_id = self.get_transition_by_file_id(cid)
                 if existing_by_id is not None:
                     if existing_by_id.matches_identity_and_payload(transition):
-                        self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
-                        return True
+                        committed_candidate = cid
+                        break
                     else:
                         return False
-                drive_file_id = candidate_id
+
+            if conflicting_intents and not committed_candidate:
+                return False
+
+            if committed_candidate:
+                self.delete_transition_intent(transition.item_id, transition.deterministic_transition_id)
+                return True
+
+            valid_intents = [it for it in intents if it not in conflicting_intents and it.get("drive_file_id")]
+            if valid_intents:
+                valid_intents.sort(key=lambda x: (x.get("created_at", 0), x.get("drive_file_id", "")))
+                drive_file_id = valid_intents[0]["drive_file_id"]
 
         if not drive_file_id:
             drive_file_id = self.generate_drive_file_id()

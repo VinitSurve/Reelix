@@ -745,6 +745,278 @@ class TestTransitionLogAndProjections(unittest.TestCase):
         res = storage.append_transition(trans)
         self.assertFalse(res, "409 with conflicting payload/identity must be rejected")
 
+    def test_duplicate_intent_reconciliation_picks_committed_transition(self):
+        """Duplicate intent recovery: If one intent already committed a transition, reconciler picks it."""
+        import json
+        item_id = "item-dup-intent-committed"
+        job = self._create_job(item_id)
+        storage = MockStorageClient(root_dir=self.storage_dir)
+
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+        tid = trans.deterministic_transition_id
+
+        # Intent 1: committed to file_ids and transitions
+        id_1 = "mock_drive_id_committed_111"
+        payload_1 = {
+            "item_id": item_id,
+            "deterministic_transition_id": tid,
+            "drive_file_id": id_1,
+            "payload_hash": trans.payload_integrity_hash,
+            "created_at": 1000,
+        }
+        intents_dir = storage.intents_dir / item_id
+        intents_dir.mkdir(parents=True, exist_ok=True)
+        (intents_dir / f"{tid}.json").write_text(json.dumps(payload_1), encoding="utf-8")
+        # Commit file on storage for id_1
+        (storage.transitions_dir / item_id).mkdir(parents=True, exist_ok=True)
+        (storage.transitions_dir / item_id / f"{tid}.json").write_text(trans.to_json(), encoding="utf-8")
+        (storage.file_ids_dir / f"{id_1}.json").write_text(trans.to_json(), encoding="utf-8")
+
+        # Intent 2: duplicate uncommitted intent created by Runner B during listing lag
+        id_2 = "mock_drive_id_uncommitted_222"
+        payload_2 = {
+            "item_id": item_id,
+            "deterministic_transition_id": tid,
+            "drive_file_id": id_2,
+            "payload_hash": trans.payload_integrity_hash,
+            "created_at": 1050,
+        }
+        (intents_dir / f"{tid}__dup2.json").write_text(json.dumps(payload_2), encoding="utf-8")
+
+        # Now Runner C or retry runs append_transition:
+        ok = storage.append_transition(trans)
+        self.assertTrue(ok)
+
+        # Verify only 1 transition file exists
+        transitions = storage.list_transitions(item_id)
+        self.assertEqual(1, len(transitions))
+        self.assertEqual(tid, transitions[0].deterministic_transition_id)
+
+    def test_duplicate_intent_reconciliation_picks_canonical_earliest_when_uncommitted(self):
+        """Duplicate intent recovery: Picks canonical earliest created intent when neither is committed."""
+        import json
+        item_id = "item-dup-intent-uncommitted"
+        job = self._create_job(item_id)
+        storage = MockStorageClient(root_dir=self.storage_dir)
+
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+        tid = trans.deterministic_transition_id
+        intents_dir = storage.intents_dir / item_id
+        intents_dir.mkdir(parents=True, exist_ok=True)
+
+        id_earlier = "mock_drive_id_earlier_100"
+        (intents_dir / f"{tid}__earlier.json").write_text(
+            json.dumps({
+                "item_id": item_id,
+                "deterministic_transition_id": tid,
+                "drive_file_id": id_earlier,
+                "payload_hash": trans.payload_integrity_hash,
+                "created_at": 1000,
+            }),
+            encoding="utf-8",
+        )
+
+        id_later = "mock_drive_id_later_200"
+        (intents_dir / f"{tid}__later.json").write_text(
+            json.dumps({
+                "item_id": item_id,
+                "deterministic_transition_id": tid,
+                "drive_file_id": id_later,
+                "payload_hash": trans.payload_integrity_hash,
+                "created_at": 1050,
+            }),
+            encoding="utf-8",
+        )
+
+        # Worker calls append_transition
+        ok = storage.append_transition(trans)
+        self.assertTrue(ok)
+
+        # Verify transition was created with the canonical earlier ID
+        self.assertTrue((storage.file_ids_dir / f"{id_earlier}.json").exists())
+        self.assertFalse((storage.file_ids_dir / f"{id_later}.json").exists())
+
+    def test_duplicate_intent_with_conflicting_payload_preserved_and_rejected(self):
+        """Duplicate intent recovery: Divergent payload hash preserves evidence and rejects creation."""
+        import json
+        item_id = "item-dup-intent-conflict"
+        job = self._create_job(item_id)
+        storage = MockStorageClient(root_dir=self.storage_dir)
+
+        trans = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+        tid = trans.deterministic_transition_id
+        intents_dir = storage.intents_dir / item_id
+        intents_dir.mkdir(parents=True, exist_ok=True)
+
+        # Conflicting intent with different payload hash
+        (intents_dir / f"{tid}__divergent.json").write_text(
+            json.dumps({
+                "item_id": item_id,
+                "deterministic_transition_id": tid,
+                "drive_file_id": "mock_conflict_id",
+                "payload_hash": "divergent_hash_xyz_999",
+                "created_at": 999,
+            }),
+            encoding="utf-8",
+        )
+
+        ok = storage.append_transition(trans)
+        self.assertFalse(ok, "Conflicting intent payload must reject transition creation")
+
+        # Evidence must be preserved on disk for diagnosis
+        conflict_files = list(intents_dir.glob("*conflict*")) + list(intents_dir.glob("*divergent*"))
+        self.assertGreater(len(conflict_files), 0, "Conflicting intent evidence must NOT be deleted")
+
+    def test_delayed_intent_visibility_beyond_retry_window_recovers_via_fold_deduplication(self):
+        """Duplicate intent recovery: Eventual consistency lag producing 2 identical transitions folds cleanly."""
+        item_id = "item-delayed-intent-fold"
+        job = self._create_job(item_id)
+        storage = MockStorageClient(root_dir=self.storage_dir)
+
+        # Transition 1 created with ID A
+        t1 = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+        # Transition 2 created with ID B (identical identity and payload)
+        t2 = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="runner-A",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+
+        folded, warnings = fold_transitions(item_id, [t1, t2])
+        self.assertEqual([], warnings)
+        self.assertEqual(JobStatus.PROCESSING, folded.status)
+        self.assertEqual(1, folded.active_attempt_epoch)
+
+    def test_artifact_fencing_stale_worker_cannot_overwrite_newer_epoch_artifact(self):
+        """Artifact fencing: Audio artifacts scoped by attempt epoch cannot overwrite newer epoch outputs."""
+        item_id = "item-artifact-fencing-paths"
+        storage = MockStorageClient(root_dir=self.storage_dir)
+
+        dummy_wav_1 = self.storage_dir / "test_e1.wav"
+        dummy_wav_1.write_bytes(b"RIFF dummy audio content from epoch 1")
+
+        dummy_wav_2 = self.storage_dir / "test_e2.wav"
+        dummy_wav_2.write_bytes(b"RIFF dummy audio content from epoch 2 (newer)")
+
+        # Epoch 1 uploads
+        id_1 = storage.upload_audio(dummy_wav_1, item_id, generation=1, attempt_epoch=1)
+        # Epoch 2 uploads
+        id_2 = storage.upload_audio(dummy_wav_2, item_id, generation=1, attempt_epoch=2)
+
+        self.assertNotEqual(id_1, id_2)
+        # Both artifacts exist independently and safely
+        file_1 = storage.audio_dir / f"audio_{item_id}.wav" if False else storage.audio_dir / id_1
+        file_2 = storage.audio_dir / id_2
+        self.assertTrue(file_1.exists())
+        self.assertTrue(file_2.exists())
+        self.assertEqual(b"RIFF dummy audio content from epoch 1", file_1.read_bytes())
+        self.assertEqual(b"RIFF dummy audio content from epoch 2 (newer)", file_2.read_bytes())
+
+    def test_artifact_fencing_stale_worker_fenced_out_from_publishing_stage(self):
+        """Artifact fencing: Worker A losing ownership during execution is fenced out from publishing stage."""
+        item_id = "item-stage-fencing"
+        job = self._create_job(item_id)
+        storage = MockStorageClient(root_dir=self.storage_dir)
+
+        p1 = CloudProcessingPipeline(
+            config=WorkerConfig(work_dir=self.test_dir / "work_p1", runner_id="worker-P1"),
+            storage=storage,
+        )
+
+        # Worker P1 claims epoch 1
+        claim_p1 = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=1,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="worker-P1",
+            created_at=1000,
+            payload={"claimed_at": 1000},
+        )
+        storage.append_transition(claim_p1)
+        job.active_attempt_epoch = 1
+
+        # Mid-flight: Worker P2 claims epoch 2!
+        claim_p2 = TransitionRecord(
+            item_id=item_id,
+            generation=1,
+            attempt_epoch=2,
+            transition_seq=1,
+            transition_type=TransitionType.CLAIM,
+            attempt_id="worker-P2",
+            created_at=2000,
+            payload={"claimed_at": 2000},
+        )
+        storage.append_transition(claim_p2)
+
+        # Worker P1 finishes audio extraction and tries to publish AUDIO_EXTRACTED under epoch 1
+        art_p1 = ArtifactRef(
+            drive_file_id="audio_p1_stale",
+            mime_type="audio/wav",
+            size_bytes=1024,
+            content_hash="sha_p1",
+            name=f"{item_id}_gen1_e1.wav",
+            generation=1,
+            attempt_epoch=1,
+        )
+        published_p1 = p1._update_stage(job, "audio_extraction", StageStatus.SUCCEEDED, artifact=art_p1)
+        self.assertFalse(published_p1, "Stale worker P1 must be fenced out from publishing stage transition")
+
+        # Verify transition log does NOT contain P1's stage transition
+        transitions = storage.list_transitions(item_id)
+        self.assertFalse(
+            any(t.transition_type == TransitionType.AUDIO_EXTRACTED and t.attempt_epoch == 1 for t in transitions),
+            "Epoch 1 stage transition must NOT be published",
+        )
+
+        # Authoritative folded state reflects Epoch 2
+        folded, _ = fold_transitions(item_id, transitions)
+        self.assertEqual(2, folded.active_attempt_epoch)
+        self.assertEqual("worker-P2", folded.claimed_by)
+        self.assertNotEqual(StageStatus.SUCCEEDED, folded.stages.audio_extraction)
+
 
 if __name__ == "__main__":
     unittest.main()
