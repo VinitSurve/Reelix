@@ -88,7 +88,7 @@ class MockStorageClient(StorageClient):
         manifest.etag = self.etags.get(item_id, "mock_etag_init")
         return manifest
 
-    def claim_job(self, job: JobManifest, runner_id: Optional[str] = None) -> bool:
+    def claim_job(self, job: JobManifest, runner_id: Optional[str] = None, force: bool = False) -> bool:
         actual_runner = runner_id or job.claimed_by or "mock-runner"
         existing = self.get_job(job.item_id)
         if existing:
@@ -99,11 +99,20 @@ class MockStorageClient(StorageClient):
             if existing.status == JobStatus.PROCESSING:
                 now_ms = int(time.time() * 1000)
                 lease = existing.lease_timeout_ms or self.default_lease_ms
-                if existing.claimed_at and (now_ms - existing.claimed_at) < lease:
-                    return False
+                is_newer_authority = (
+                    job.generation > existing.generation
+                    or (
+                        job.generation == existing.generation
+                        and (job.active_attempt_epoch or 1) > (existing.active_attempt_epoch or 1)
+                    )
+                )
+                if not is_newer_authority and not force:
+                    if existing.claimed_at and (now_ms - existing.claimed_at) < lease:
+                        return False
             elif existing.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL):
-                return False
-            job.generation = existing.generation
+                if job.generation <= existing.generation and not force:
+                    return False
+            job.generation = max(job.generation, existing.generation)
             job.version = existing.version or 1
         else:
             job.version = 1

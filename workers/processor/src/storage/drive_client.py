@@ -241,7 +241,7 @@ class GoogleDriveStorageClient(StorageClient):
             manifest.etag = files[0]["etag"]
         return manifest
 
-    def claim_job(self, job: JobManifest, runner_id: Optional[str] = None) -> bool:
+    def claim_job(self, job: JobManifest, runner_id: Optional[str] = None, force: bool = False) -> bool:
         """Attempts to claim a job safely using application-level lease validation, HTTP If-Match condition, and read-after-write verification.
 
         Reelix achieves concurrency safety through:
@@ -275,15 +275,24 @@ class GoogleDriveStorageClient(StorageClient):
             lease_timeout = current_manifest.lease_timeout_ms or self.config.lease_timeout_ms
 
             if current_manifest.status == JobStatus.PROCESSING:
-                if current_manifest.claimed_at and (now_ms - current_manifest.claimed_at) < lease_timeout:
-                    logger.info(
-                        "Job %s is actively claimed by %s; aborting claim",
-                        job.item_id, current_manifest.claimed_by
+                is_newer_authority = (
+                    job.generation > current_manifest.generation
+                    or (
+                        job.generation == current_manifest.generation
+                        and (job.active_attempt_epoch or 1) > (current_manifest.active_attempt_epoch or 1)
                     )
-                    return False
+                )
+                if not is_newer_authority and not force:
+                    if current_manifest.claimed_at and (now_ms - current_manifest.claimed_at) < lease_timeout:
+                        logger.info(
+                            "Job %s is actively claimed by %s; aborting claim",
+                            job.item_id, current_manifest.claimed_by
+                        )
+                        return False
             elif current_manifest.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL):
-                logger.info("Job %s is already settled (%s); aborting claim", job.item_id, current_manifest.status.value)
-                return False
+                if job.generation <= current_manifest.generation and not force:
+                    logger.info("Job %s is already settled (%s); aborting claim", job.item_id, current_manifest.status.value)
+                    return False
 
             if current_manifest.generation > job.generation:
                 logger.warning(

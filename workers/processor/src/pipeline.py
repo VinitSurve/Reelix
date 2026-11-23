@@ -506,7 +506,7 @@ class CloudProcessingPipeline:
                 )
                 return False
         else:
-            if not self.storage.claim_job(job, runner_id=self.config.runner_id):
+            if not self.storage.claim_job(job, runner_id=self.config.runner_id, force=force_claim):
                 logger.warning(
                     "Could not claim job %s (concurrent worker claimed it or lease still active); skipping",
                     job.item_id,
