@@ -604,6 +604,32 @@ class CloudProcessingPipeline:
                             if not self._update_stage(job, "acquisition", StageStatus.SUCCEEDED, artifact=media_artifact):
                                 logger.warning("Aborting job %s: lost lease during acquisition update", job.item_id)
                                 return False
+                        if not dl_res.is_success and job.historical_generations:
+                            for hist in reversed(job.historical_generations):
+                                hist_data = hist if isinstance(hist, dict) else (hist.to_dict() if hasattr(hist, "to_dict") else {})
+                                hist_media = hist_data.get("media")
+                                if hist_media and hist_media.get("drive_file_id"):
+                                    logger.info(
+                                        "Fresh acquisition encountered restriction (%s); reusing verified media from historical generation %s",
+                                        dl_res.error_message or "restriction",
+                                        hist_data.get("generation", 1),
+                                    )
+                                    job.media = MediaInfo.from_dict(hist_media)
+                                    media_artifact = ArtifactRef(
+                                        drive_file_id=job.media.drive_file_id,
+                                        mime_type=job.media.mime_type,
+                                        size_bytes=job.media.size_bytes or 0,
+                                        content_hash=job.media.content_hash,
+                                        name=job.media.file_name,
+                                        generation=job.generation,
+                                    )
+                                    if not self._update_stage(job, "acquisition", StageStatus.SUCCEEDED, artifact=media_artifact):
+                                        logger.warning("Aborting job %s: lost lease during historical media reuse update", job.item_id)
+                                        return False
+                                    break
+
+                        if job.media is not None:
+                            pass
                         elif dl_res.is_retryable and job.retry_count < job.max_retries:
                             logger.warning(
                                 "Temporary media acquisition restriction for %s: %s; scheduling retry",

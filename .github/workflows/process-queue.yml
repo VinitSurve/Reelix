@@ -10,6 +10,10 @@ on:
         description: "Optional specific item ID to process exclusively (e.g. b313dec3-e021-4885-92a1-f890b7c814b6)"
         required: false
         default: ""
+      reprocess:
+        description: "Set to 'true' to trigger a fresh generation reprocess for target_item_id"
+        required: false
+        default: "false"
       max_jobs:
         description: "Maximum number of jobs to process in this run"
         required: false
@@ -77,5 +81,6 @@ jobs:
           MAX_JOBS_PER_RUN: ${{ github.event.inputs.max_jobs || '5' }}
           WHISPER_MODEL: ${{ github.event.inputs.whisper_model || 'base' }}
           TARGET_ITEM_ID: ${{ github.event.inputs.target_item_id }}
+          REPROCESS_ITEM: ${{ github.event.inputs.reprocess == 'true' && '1' || '0' }}
         run: |
           python -m workers.processor.src.main

@@ -518,6 +518,11 @@ def fold_transitions(
 
     # 1. Highest generation determines active generation
     max_gen = max(t.generation for t in transitions)
+    if base_manifest is not None and base_manifest.generation > max_gen:
+        # Base manifest has already advanced to a newer generation queued for execution;
+        # existing transitions in storage belong to historical completed/failed generations.
+        return base_manifest, warnings
+
     gen_transitions = [t for t in transitions if t.generation == max_gen]
 
     # 2. Highest attempt epoch within active generation

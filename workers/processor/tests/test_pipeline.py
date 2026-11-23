@@ -1293,6 +1293,88 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(1, updated.generation)
         self.assertEqual(JobStatus.COMPLETED, updated.status)
 
+    def test_reprocess_generation_advancement_and_historical_media_fallback(self):
+        """When reprocessing in Generation 2 and fresh Instagram download hits a restriction,
+        the pipeline seamlessly falls back to the verified historical media artifact from Gen 1.
+        """
+        item_id = "item-reprocess-test"
+        # 1. Create a dummy media file in storage
+        media_file = self.test_dir / "gen1_media.mp4"
+        dummy_bytes = b"dummy mp4 video data"
+        media_file.write_bytes(dummy_bytes)
+        import hashlib
+        media_sha = hashlib.sha256(dummy_bytes).hexdigest()
+        drive_media_id = self.storage.upload_media(
+            local_media_path=media_file,
+            item_id=item_id,
+            mime_type="video/mp4",
+            content_hash=media_sha,
+            generation=1,
+            attempt_epoch=1,
+        )
+
+        gen1_manifest = JobManifest(
+            item_id=item_id,
+            source="URL",
+            original_url="https://www.instagram.com/p/DfgFcSzlTae/",
+            status=JobStatus.COMPLETED,
+            generation=1,
+            created_at=1000,
+            updated_at=1000,
+            media=MediaInfo(
+                file_name="gen1_media.mp4",
+                mime_type="video/mp4",
+                drive_file_id=drive_media_id,
+                size_bytes=len(dummy_bytes),
+                content_hash=media_sha,
+            ),
+        )
+
+        # 2. Advance to Generation 2
+        gen2_manifest = JobManifest(
+            item_id=item_id,
+            source="URL",
+            original_url="https://www.instagram.com/p/DfgFcSzlTae/",
+            status=JobStatus.QUEUED,
+            generation=2,
+            active_generation=2,
+            created_at=1000,
+            updated_at=2000,
+            historical_generations=[gen1_manifest.to_dict()],
+            media=None,
+        )
+        self.storage.update_job(gen2_manifest)
+
+        # 3. Downloader simulates Instagram restriction/login wall
+        failing_downloader = FakeDownloader(
+            outcome=DownloadResult(
+                status=DownloadStatus.TRANSIENT_FAILURE,
+                error_message="Instagram login required (challenge checkpoint)",
+                is_retryable=True,
+            )
+        )
+
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            downloader=failing_downloader,
+            audio_extractor=FakeExtractor(),
+            transcriber=FakeTranscriber(),
+            gemini_analyzer=FakeAnalyzer(),
+        )
+
+        success = pipeline.process_job(gen2_manifest)
+        self.assertTrue(success, "Pipeline must succeed by falling back to verified historical media")
+
+        updated = self.storage.get_job(item_id)
+        self.assertEqual(2, updated.generation)
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual(1, len(updated.historical_generations))
+        self.assertEqual(1, updated.historical_generations[0]["generation"])
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.transcription)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
+
 
 if __name__ == "__main__":
     unittest.main()

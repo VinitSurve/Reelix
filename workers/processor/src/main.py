@@ -6,8 +6,10 @@ import argparse
 import logging
 import os
 import sys
+import time
 
 from .config import WorkerConfig
+from .models import JobResults, JobStatus, StageStates, StageStatus, fold_transitions
 from .pipeline import CloudProcessingPipeline
 from .storage.drive_client import GoogleDriveStorageClient
 from .storage.firestore_client import FirestoreJobCoordinator
@@ -43,6 +45,12 @@ def parse_args(args: list[str]) -> argparse.Namespace:
         type=str,
         default=os.getenv("TARGET_ITEM_ID") or None,
         help="Optional specific item ID to target and process exclusively",
+    )
+    parser.add_argument(
+        "--reprocess",
+        action="store_true",
+        default=os.getenv("REPROCESS_ITEM") in ("1", "true", "True"),
+        help="Trigger a fresh generation reprocess for the specified target item ID",
     )
     parser.add_argument(
         "--limit",
@@ -125,12 +133,47 @@ def main(argv: list[str] | None = None) -> int:
     pipeline = CloudProcessingPipeline(config=config, storage=storage, coordinator=coordinator)
 
     target_id = args.item_id or os.getenv("TARGET_ITEM_ID")
+    reprocess = args.reprocess or os.getenv("REPROCESS_ITEM") in ("1", "true", "True")
     if target_id:
-        logger.info("Targeted processing mode requested for item: %s", target_id)
+        logger.info("Targeted processing mode requested for item: %s (reprocess=%s)", target_id, reprocess)
         job = storage.get_job(target_id)
         if not job:
             logger.error("Target item %s not found in storage", target_id)
             return 1
+
+        existing_transitions = storage.list_transitions(target_id)
+        is_settled = job.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+        if existing_transitions:
+            folded, _ = fold_transitions(target_id, existing_transitions, base_manifest=job)
+            if folded.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                is_settled = True
+
+        if reprocess or is_settled:
+            logger.info("Starting fresh generation reprocess for item %s (current gen=%d, status=%s)", target_id, job.generation, job.status.value)
+            current_manifest_dict = job.to_dict()
+            job.historical_generations.append(current_manifest_dict)
+            job.generation += 1
+            job.active_generation = job.generation
+            job.active_attempt_epoch = 1
+            job.active_attempt_id = None
+            job.status = JobStatus.QUEUED
+            job.stages = StageStates(
+                acquisition=StageStatus.PENDING if job.original_url else StageStatus.SKIPPED,
+                audio_extraction=StageStatus.PENDING,
+                transcription=StageStatus.PENDING,
+                ocr=StageStatus.PENDING,
+                gemini_analysis=StageStatus.PENDING,
+            )
+            job.stage_details = {}
+            job.results = JobResults()
+            job.claimed_by = None
+            job.claimed_at = None
+            job.error_message = None
+            job.media = None
+            job.updated_at = int(time.time() * 1000)
+            storage.update_job(job)
+            logger.info("Advanced item %s to generation %d (status=QUEUED); proceeding to process", target_id, job.generation)
+
         success = pipeline.process_job(job)
         logger.info("Targeted processing for item %s: %s", target_id, "SUCCEEDED" if success else "FAILED")
         return 0 if success else 1
