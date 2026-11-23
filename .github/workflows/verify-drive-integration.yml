@@ -37,6 +37,7 @@ jobs:
 
       - name: Execute Isolated Real Drive Integration Verification
         env:
+          PYTHONPATH: .
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
