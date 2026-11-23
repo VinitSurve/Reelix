@@ -38,6 +38,13 @@ def parse_args(args: list[str]) -> argparse.Namespace:
         help="Custom worker / runner identity (default: gha-{run_id}-{attempt} or local-{pid})",
     )
     parser.add_argument(
+        "--item-id",
+        "--item",
+        type=str,
+        default=os.getenv("TARGET_ITEM_ID") or None,
+        help="Optional specific item ID to target and process exclusively",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -114,10 +121,20 @@ def main(argv: list[str] | None = None) -> int:
             coordinator = FirestoreJobCoordinator(project_id=config.firestore_project_id)
         except Exception as e:
             logger.warning("Failed to initialize Firestore coordinator (%s); falling back to direct storage queue", e)
-        except Exception as e:
-            logger.warning("Failed to initialize Firestore coordinator (%s); falling back to direct storage queue", e)
 
     pipeline = CloudProcessingPipeline(config=config, storage=storage, coordinator=coordinator)
+
+    target_id = args.item_id or os.getenv("TARGET_ITEM_ID")
+    if target_id:
+        logger.info("Targeted processing mode requested for item: %s", target_id)
+        job = storage.get_job(target_id)
+        if not job:
+            logger.error("Target item %s not found in storage", target_id)
+            return 1
+        success = pipeline.process_job(job)
+        logger.info("Targeted processing for item %s: %s", target_id, "SUCCEEDED" if success else "FAILED")
+        return 0 if success else 1
+
     summary = pipeline.run_batch()
 
     logger.info(

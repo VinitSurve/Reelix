@@ -947,8 +947,11 @@ class GoogleDriveStorageClient(StorageClient):
         """Discovers all persisted transition intent records for deterministic duplicate reconciliation."""
         service = self._get_service()
         intents_folder = self._ensure_item_intents_folder(item_id)
-        filename = f"{deterministic_transition_id}.json"
-        query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
+        if not deterministic_transition_id or deterministic_transition_id == "*":
+            query = f"'{intents_folder}' in parents and trashed = false"
+        else:
+            filename = f"{deterministic_transition_id}.json"
+            query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
         res = service.files().list(q=query, fields="files(id, name)").execute()
         files = res.get("files", [])
         intents: List[dict] = []
@@ -971,8 +974,11 @@ class GoogleDriveStorageClient(StorageClient):
         """Removes intent record(s) after transition creation is verified."""
         service = self._get_service()
         intents_folder = self._ensure_item_intents_folder(item_id)
-        filename = f"{deterministic_transition_id}.json"
-        query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
+        if not deterministic_transition_id or deterministic_transition_id == "*":
+            query = f"'{intents_folder}' in parents and trashed = false"
+        else:
+            filename = f"{deterministic_transition_id}.json"
+            query = f"name = '{filename}' and '{intents_folder}' in parents and trashed = false"
         res = service.files().list(q=query, fields="files(id, name)").execute()
         files = res.get("files", [])
         for f in files:

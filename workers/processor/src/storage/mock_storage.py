@@ -337,7 +337,8 @@ class MockStorageClient(StorageClient):
         target_dir = self.intents_dir / item_id
         if not target_dir.exists():
             return True
-        for f in target_dir.glob(f"{deterministic_transition_id}*.json"):
+        pattern = "*.json" if not deterministic_transition_id or deterministic_transition_id == "*" else f"{deterministic_transition_id}*.json"
+        for f in target_dir.glob(pattern):
             if "conflict" in f.name and preserve_conflicts:
                 continue
             f.unlink(missing_ok=True)

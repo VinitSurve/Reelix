@@ -1,5 +1,6 @@
 """Unit tests for the end-to-end cloud processing pipeline orchestrator."""
 
+import os
 import shutil
 import time
 import unittest
@@ -970,10 +971,42 @@ class TestPipeline(unittest.TestCase):
 
     def test_main_cli_mac_local_and_worker_id(self):
         from workers.processor.src.main import main, parse_args
-        args = parse_args(["--mac-local", "--worker-id", "custom-mac-worker-99", "--limit", "3"])
+        args = parse_args(["--mac-local", "--worker-id", "custom-mac-worker-99", "--limit", "3", "--item-id", "target-item-123"])
         self.assertTrue(args.confirm_local)
         self.assertEqual("custom-mac-worker-99", args.worker_id)
         self.assertEqual(3, args.limit)
+        self.assertEqual("target-item-123", args.item_id)
+
+    def test_main_cli_targeted_item_processing(self):
+        from workers.processor.src.main import main
+        job = JobManifest(
+            item_id="item-targeted-cli-test",
+            source="URL",
+            caption="Targeted item CLI test",
+            status=JobStatus.QUEUED,
+            created_at=1000,
+            updated_at=1000,
+            stages=StageStates(
+                acquisition=StageStatus.SKIPPED,
+                audio_extraction=StageStatus.SKIPPED,
+                transcription=StageStatus.SKIPPED,
+                ocr=StageStatus.SKIPPED,
+                gemini_analysis=StageStatus.SKIPPED,
+            ),
+        )
+        self.storage.update_job(job)
+
+        with patch.dict(os.environ, {"REELIX_MOCK_MODE": "1", "WORK_DIR": str(self.test_dir)}):
+            with patch("workers.processor.src.main.MockStorageClient", return_value=self.storage):
+                code = main(["--item-id", "item-targeted-cli-test"])
+                self.assertEqual(0, code)
+                completed = self.storage.get_job("item-targeted-cli-test")
+                self.assertIsNotNone(completed)
+                self.assertEqual(JobStatus.COMPLETED, completed.status)
+
+                # Non-existent item returns 1
+                code_missing = main(["--item-id", "non-existent-item"])
+                self.assertEqual(1, code_missing)
 
     def test_pipeline_heartbeat_renewal_during_execution(self):
         job = JobManifest(

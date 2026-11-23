@@ -1,0 +1,46 @@
+name: Verify Isolated Google Drive Integration
+
+'on':
+  workflow_dispatch:
+    inputs:
+      mock_mode:
+        description: "Set to 'true' to run with local mock storage (default: false runs against real Google Drive API in isolated test folder)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: reelix-processing
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  verify-drive-integration:
+    name: Verify Isolated Real Drive Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "workers/processor/requirements.txt"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r workers/processor/requirements.txt
+
+      - name: Execute Isolated Real Drive Integration Verification
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
+          REELIX_MOCK_MODE: ${{ github.event.inputs.mock_mode == 'true' && '1' || '0' }}
+        run: |
+          python workers/processor/scripts/verify_drive_integration.py
