@@ -163,10 +163,10 @@ class GoogleDriveStorageClient(StorageClient):
         page_token = None
 
         while True:
-            # Official Drive v3 File resource fields: nextPageToken, files(id, name, modifiedTime, version, etag)
+            # Official Drive v3 File resource fields: nextPageToken, files(id, name, modifiedTime, version)
             res = service.files().list(
                 q=query,
-                fields="nextPageToken, files(id, name, modifiedTime, version, etag)",
+                fields="nextPageToken, files(id, name, modifiedTime, version)",
                 orderBy="modifiedTime asc",
                 pageSize=max(limit * 3, 20),
                 pageToken=page_token,
@@ -223,7 +223,7 @@ class GoogleDriveStorageClient(StorageClient):
         filename = f"{item_id}.json"
 
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
         files = res.get("files", [])
         if not files:
             return None
@@ -251,7 +251,7 @@ class GoogleDriveStorageClient(StorageClient):
         actual_runner = runner_id or self.config.runner_id
 
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
         files = res.get("files", [])
         if not files:
             logger.warning("Cannot claim job %s: file not found in jobs folder", job.item_id)
@@ -308,7 +308,7 @@ class GoogleDriveStorageClient(StorageClient):
             req = service.files().update(
                 fileId=remote_file_id,
                 media_body=media_body,
-                fields="id, modifiedTime, version, etag",
+                fields="id, modifiedTime, version",
             )
             if remote_etag:
                 req.headers["If-Match"] = remote_etag
@@ -353,7 +353,7 @@ class GoogleDriveStorageClient(StorageClient):
 
         # Check if already exists
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
         files = res.get("files", [])
 
         if files:
@@ -412,7 +412,7 @@ class GoogleDriveStorageClient(StorageClient):
                 req = service.files().update(
                     fileId=remote_file_id,
                     media_body=media_body,
-                    fields="id, modifiedTime, version, etag",
+                    fields="id, modifiedTime, version",
                 )
                 expected_etag = job.etag or remote_etag
                 if expected_etag:
@@ -476,7 +476,7 @@ class GoogleDriveStorageClient(StorageClient):
         filename = f"{job_id}.json"
 
         query = f"'{jobs_folder}' in parents and name = '{filename}' and trashed = false"
-        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version, etag)").execute()
+        res = service.files().list(q=query, fields="files(id, name, modifiedTime, version)").execute()
         files = res.get("files", [])
         if not files:
             logger.warning("Cannot renew lease for job %s: file not found", job_id)
