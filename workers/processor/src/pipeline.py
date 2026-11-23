@@ -424,7 +424,7 @@ class CloudProcessingPipeline:
         )
         return summary
 
-    def process_job(self, job: JobManifest) -> bool:
+    def process_job(self, job: JobManifest, force_claim: bool = False) -> bool:
         """Processes a single job through all remaining uncompleted stages."""
         logger.info("========================================")
         logger.info("Claiming and processing job %s (source=%s)", job.item_id, job.source)
@@ -456,13 +456,21 @@ class CloudProcessingPipeline:
                 claimed_at = latest_claim.created_at
                 timeout = latest_claim.payload.get("lease_timeout_ms", self.config.lease_timeout_ms)
                 if (now_ms - claimed_at) < timeout and latest_claim.attempt_id != self.config.runner_id:
-                    logger.warning(
-                        "Job %s is actively claimed by %s (lease active for %d ms); skipping claim",
+                    if not force_claim:
+                        logger.warning(
+                            "Job %s is actively claimed by %s (lease active for %d ms); skipping claim",
+                            job.item_id,
+                            latest_claim.attempt_id,
+                            timeout - (now_ms - claimed_at),
+                        )
+                        return False
+                    logger.info(
+                        "Force-claiming job %s (superseding %s in epoch %d with new epoch %d)",
                         job.item_id,
                         latest_claim.attempt_id,
-                        timeout - (now_ms - claimed_at),
+                        highest_epoch,
+                        highest_epoch + 1,
                     )
-                    return False
             active_epoch = highest_epoch + 1
         else:
             active_epoch = getattr(job, "active_attempt_epoch", 1) or 1

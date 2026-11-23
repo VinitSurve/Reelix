@@ -54,6 +54,12 @@ def parse_args(args: list[str]) -> argparse.Namespace:
         help="Trigger a fresh generation reprocess for the specified target item ID",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        default=os.getenv("FORCE_CLAIM") in ("1", "true", "True"),
+        help="Force claim an active lease by superseding the attempt epoch",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -135,8 +141,9 @@ def main(argv: list[str] | None = None) -> int:
 
     target_id = args.item_id or os.getenv("TARGET_ITEM_ID")
     reprocess = args.reprocess or os.getenv("REPROCESS_ITEM") in ("1", "true", "True")
+    force_claim = args.force or os.getenv("FORCE_CLAIM") in ("1", "true", "True") or bool(target_id)
     if target_id:
-        logger.info("Targeted processing mode requested for item: %s (reprocess=%s)", target_id, reprocess)
+        logger.info("Targeted processing mode requested for item: %s (reprocess=%s, force_claim=%s)", target_id, reprocess, force_claim)
         job = storage.get_job(target_id)
         if not job:
             logger.error("Target item %s not found in storage", target_id)
@@ -176,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
             storage.update_job(job)
             logger.info("Advanced item %s to generation %d (status=QUEUED); proceeding to process", target_id, job.generation)
 
-        success = pipeline.process_job(job)
+        success = pipeline.process_job(job, force_claim=force_claim)
         logger.info("Targeted processing for item %s: %s", target_id, "SUCCEEDED" if success else "FAILED")
         return 0 if success else 1
 

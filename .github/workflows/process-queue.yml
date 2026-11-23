@@ -14,6 +14,10 @@ on:
         description: "Set to 'true' to trigger a fresh generation reprocess for target_item_id"
         required: false
         default: "false"
+      force_claim:
+        description: "Set to 'true' to force supersede any active lease with a new attempt epoch"
+        required: false
+        default: "false"
       max_jobs:
         description: "Maximum number of jobs to process in this run"
         required: false
@@ -83,5 +87,6 @@ jobs:
           WHISPER_MODEL: ${{ github.event.inputs.whisper_model || 'base' }}
           TARGET_ITEM_ID: ${{ github.event.inputs.target_item_id }}
           REPROCESS_ITEM: ${{ github.event.inputs.reprocess == 'true' && '1' || '0' }}
+          FORCE_CLAIM: ${{ github.event.inputs.force_claim == 'true' || github.event.inputs.target_item_id != '' && '1' || '0' }}
         run: |
           python -m workers.processor.src.main
