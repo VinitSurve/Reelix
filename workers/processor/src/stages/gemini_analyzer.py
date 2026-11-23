@@ -69,10 +69,10 @@ class GeminiAnalyzer:
         self,
         api_key: Optional[str],
         model: str = DEFAULT_GEMINI_MODEL,
-        max_retries: int = 3,
-        base_delay_seconds: float = 1.0,
-        max_delay_seconds: float = 30.0,
-        request_timeout_seconds: int = 30,
+        max_retries: int = 5,
+        base_delay_seconds: float = 3.0,
+        max_delay_seconds: float = 45.0,
+        request_timeout_seconds: int = 45,
     ):
         if model not in ALLOWED_GEMINI_MODELS:
             raise ValueError(
@@ -149,7 +149,8 @@ class GeminiAnalyzer:
                 is_retryable=False,
             )
 
-        url = f"{GEMINI_API_ENDPOINT.format(model=self.model)}?key={self.api_key}"
+        current_model = self.model
+        alt_model = "gemini-3.8-flash" if current_model == "gemini-3.6-flash" else "gemini-3.6-flash"
 
         payload = {
             "contents": [
@@ -173,6 +174,7 @@ class GeminiAnalyzer:
         req_data = json.dumps(payload).encode("utf-8")
 
         for attempt in range(1, self.max_retries + 1):
+            url = f"{GEMINI_API_ENDPOINT.format(model=current_model)}?key={self.api_key}"
             try:
                 req = urllib.request.Request(
                     url,
@@ -182,14 +184,14 @@ class GeminiAnalyzer:
                 )
 
                 start_t = time.time()
-                logger.info("Calling Gemini API (%s) attempt %d/%d...", self.model, attempt, self.max_retries)
+                logger.info("Calling Gemini API (%s) attempt %d/%d...", current_model, attempt, self.max_retries)
                 with urllib.request.urlopen(req, timeout=self.request_timeout_seconds) as resp:
                     resp_bytes = resp.read()
                     elapsed = time.time() - start_t
                     logger.info("Gemini API responded in %.2fs", elapsed)
 
                 resp_json = json.loads(resp_bytes.decode("utf-8"))
-                parsed_result = self._parse_gemini_response(resp_json)
+                parsed_result = self._parse_gemini_response(resp_json, model_name=current_model)
                 if parsed_result is None:
                     if attempt < self.max_retries:
                         logger.warning("Failed to parse structured JSON from Gemini response on attempt %d; retrying", attempt)
@@ -212,7 +214,7 @@ class GeminiAnalyzer:
                     if e.code == 401 or "API_KEY_INVALID" in err_body or "not valid" in err_body.lower():
                         msg = f"Gemini API authentication failed (HTTP {e.code}): invalid or unauthorized API key"
                     elif e.code in (403, 404):
-                        msg = f"Gemini API model access error (HTTP {e.code}): model '{self.model}' unavailable or access denied: {err_body}"
+                        msg = f"Gemini API model access error (HTTP {e.code}): model '{current_model}' unavailable or access denied: {err_body}"
                     else:
                         msg = f"Gemini API bad request (HTTP 400): {err_body}"
                     return GeminiAnalysisOutcome(success=False, error=msg, is_retryable=False)
@@ -226,6 +228,12 @@ class GeminiAnalyzer:
                         delay = self._compute_backoff_delay(attempt)
 
                     if attempt < self.max_retries:
+                        if e.code == 503 and alt_model in ALLOWED_GEMINI_MODELS and current_model != alt_model and attempt >= 2:
+                            logger.warning(
+                                "Gemini model '%s' experienced 503 high demand; failing over to alternative model '%s'",
+                                current_model, alt_model
+                            )
+                            current_model = alt_model
                         logger.warning(
                             "Gemini API transient HTTP %d error on attempt %d/%d; retrying in %.2fs (Retry-After=%s)",
                             e.code, attempt, self.max_retries, delay, retry_after
@@ -259,7 +267,9 @@ class GeminiAnalyzer:
                 logger.error("Unexpected error calling Gemini API: %s", e)
                 return GeminiAnalysisOutcome(success=False, error=f"Gemini API error: {e}", is_retryable=False)
 
-    def _parse_gemini_response(self, resp_json: Dict[str, Any]) -> Optional[GeminiAnalysisResult]:
+    def _parse_gemini_response(
+        self, resp_json: Dict[str, Any], model_name: Optional[str] = None
+    ) -> Optional[GeminiAnalysisResult]:
         try:
             candidates = resp_json.get("candidates", [])
             if not candidates:
@@ -298,7 +308,7 @@ class GeminiAnalyzer:
                 key_takeaways=key_takeaways,
                 important_concepts=self._clean_list(data.get("important_concepts")),
                 actionable_steps=self._clean_list(data.get("actionable_steps")),
-                model_name=self.model,
+                model_name=model_name or self.model,
                 generated_at=int(time.time() * 1000),
             )
         except Exception as e:

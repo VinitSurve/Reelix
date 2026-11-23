@@ -312,8 +312,8 @@ class TestGeminiAnalyzer(unittest.TestCase):
         res = self.analyzer.analyze(title="Exhaustion Test", transcript="Testing exhaustion")
         self.assertFalse(res.success)
         self.assertTrue(res.is_retryable)
-        self.assertEqual(3, mock_urlopen.call_count)
-        self.assertEqual(2, mock_sleep.call_count)
+        self.assertEqual(self.analyzer.max_retries, mock_urlopen.call_count)
+        self.assertEqual(self.analyzer.max_retries - 1, mock_sleep.call_count)
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ def get_latest_run(workflow_name: str) -> dict:
     return runs[0]
 
 
-def poll_run(run_id: int, timeout_sec: int = 900, interval_sec: int = 10) -> dict:
+def poll_run(run_id: int, timeout_sec: int = 1800, interval_sec: int = 10) -> dict:
     start_time = time.time()
     last_status = None
     while time.time() - start_time < timeout_sec:
