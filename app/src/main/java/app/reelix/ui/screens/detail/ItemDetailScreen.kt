@@ -315,6 +315,14 @@ fun ItemDetailScreen(
                                     Spacer(Modifier.width(6.dp))
                                     Pill(text = "Copy #${item.copyIndex + 1}")
                                 }
+                                if (item.generation > 1) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Pill(
+                                        text = "Gen ${item.generation}",
+                                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                                        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                                    )
+                                }
                                 Spacer(Modifier.weight(1f))
                                 ProcessingStatusBadge(
                                     status = item.processingStatus,

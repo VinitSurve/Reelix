@@ -288,6 +288,7 @@ class SavedItemRepository(
                 StageInfo(it.stage, it.status, it.attempts, it.updatedAt, it.nextRetryAt, it.lastError ?: it.message)
             },
             events = events.map { ProcessingEventInfo(it.stage, it.status, it.message, it.createdAt) },
+            generation = item.lastSyncedGeneration,
         )
     }
 
@@ -420,6 +421,7 @@ class SavedItemRepository(
         isMediaAvailable = item.mediaAvailable || !item.mediaPath.isNullOrBlank(),
         thumbnailPath = item.thumbnailPath,
         createdAt = item.createdAt,
+        generation = item.lastSyncedGeneration,
     )
 
     private fun ProcessingResultEntity.toInfo() = AiResultInfo(

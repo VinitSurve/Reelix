@@ -79,6 +79,7 @@ data class ItemListEntry(
     val isMediaAvailable: Boolean,
     val thumbnailPath: String?,
     val createdAt: Long,
+    val generation: Int = 1,
 ) {
     val isTranscribed: Boolean get() = transcriptionStatus == StageStatus.SUCCEEDED
     val isAiEnriched: Boolean get() = analysisStatus == StageStatus.SUCCEEDED
@@ -181,6 +182,7 @@ data class ItemDetails(
     val tags: List<TagInfo>,
     val stages: List<StageInfo>,
     val events: List<ProcessingEventInfo>,
+    val generation: Int = 1,
 ) {
     val displayTitle: String?
         get() = userTitle?.takeIf { it.isNotBlank() }

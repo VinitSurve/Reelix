@@ -224,6 +224,14 @@ fun SavedItemCard(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Pill(text = entry.contentType.label)
+                if (entry.generation > 1) {
+                    Spacer(Modifier.width(6.dp))
+                    Pill(
+                        text = "Gen ${entry.generation}",
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                }
                 entry.category?.takeIf { it.isNotBlank() }?.let { category ->
                     Spacer(Modifier.width(6.dp))
                     Pill(
