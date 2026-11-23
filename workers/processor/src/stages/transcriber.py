@@ -32,6 +32,9 @@ class WhisperTranscriber:
             return self._model
 
         try:
+            import os
+            import torch
+            torch.set_num_threads(min(4, os.cpu_count() or 1))
             import whisper
 
             logger.info("Loading Whisper model '%s' on CPU...", self.model_name)

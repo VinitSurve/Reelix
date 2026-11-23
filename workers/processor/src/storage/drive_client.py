@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -34,11 +35,16 @@ class GoogleDriveStorageClient(StorageClient):
         self.config = config
         self.folder_id = config.gdrive_folder_id
         self._service = None
+        self._local = threading.local()
+        self._api_lock = threading.RLock()
         self._subfolders: Dict[str, str] = {}  # name -> drive folder id
 
     def _get_service(self):
         if self._service is not None:
             return self._service
+        service = getattr(self._local, "service", None)
+        if service is not None:
+            return service
 
         try:
             from googleapiclient.discovery import build
@@ -94,8 +100,9 @@ class GoogleDriveStorageClient(StorageClient):
                     "For Workspace Shared Drives, provide GDRIVE_SERVICE_ACCOUNT_JSON."
                 )
 
-            self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
-            return self._service
+            service = build("drive", "v3", credentials=creds, cache_discovery=False)
+            self._local.service = service
+            return service
         except ImportError as e:
             logger.error("google-api-python-client or google-auth not installed: %s", e)
             raise
@@ -1159,7 +1166,7 @@ class GoogleDriveStorageClient(StorageClient):
                 for f in files:
                     try:
                         raw = self._download_bytes(f["id"])
-                        records.append(TransitionRecord.from_json(raw.decode("utf-8")))
+                        records.append(TransitionRecord.from_json(raw.decode("utf-8", errors="replace")))
                     except Exception as err:
                         logger.warning("Could not parse transition file %s (%s): %s", f.get("name"), f.get("id"), err)
                         continue
@@ -1184,7 +1191,7 @@ class GoogleDriveStorageClient(StorageClient):
                 files = res.get("files", [])
                 if files:
                     raw = self._download_bytes(files[0]["id"])
-                    return TransitionRecord.from_json(raw.decode("utf-8"))
+                    return TransitionRecord.from_json(raw.decode("utf-8", errors="replace"))
                 return None
             except Exception as e:
                 backoff = (2 ** attempt) * 0.5
