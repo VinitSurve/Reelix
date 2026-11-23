@@ -385,13 +385,21 @@ class JobManifest:
             setattr(self.stages, stage_name, status)
 
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
+        hist = self.historical_generations
+        self.historical_generations = []
+        try:
+            d = asdict(self)
+        finally:
+            self.historical_generations = hist
+
         d["status"] = self.status.value
         d["schema_version"] = self.schema_version
         d["record_revision"] = self.record_revision
         d["version"] = self.version
         d["generation"] = self.generation
-        d["historical_generations"] = self.historical_generations
+        d["historical_generations"] = [
+            dict(g) if isinstance(g, dict) else g for g in hist
+        ]
         d["job_id"] = self.job_id
         d["stages"] = {
             "acquisition": self.stages.acquisition.value,

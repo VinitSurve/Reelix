@@ -150,8 +150,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if reprocess or is_settled:
             logger.info("Starting fresh generation reprocess for item %s (current gen=%d, status=%s)", target_id, job.generation, job.status.value)
-            current_manifest_dict = job.to_dict()
-            job.historical_generations.append(current_manifest_dict)
+            current_snapshot = json.loads(job.to_json())
+            current_snapshot.pop("historical_generations", None)
+            job.historical_generations = list(job.historical_generations) + [current_snapshot]
             job.generation += 1
             job.active_generation = job.generation
             job.active_attempt_epoch = 1
