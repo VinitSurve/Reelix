@@ -63,7 +63,7 @@ def poll_run(run_id: int, timeout_sec: int = 900, interval_sec: int = 10) -> dic
         status = run.get("status")
         conclusion = run.get("conclusion")
         if status != last_status:
-            print(f"Run {run_id} status: {status} (conclusion: {conclusion})")
+            print(f"Run {run_id} status: {status} (conclusion: {conclusion})", flush=True)
             last_status = status
         if status == "completed":
             return run
@@ -85,8 +85,10 @@ def print_run_logs(run_id: int):
         class NoAuthRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-                if new_req and "authorization" in new_req.headers:
-                    del new_req.headers["authorization"]
+                if new_req:
+                    for k in list(new_req.headers.keys()):
+                        if k.lower() == "authorization":
+                            del new_req.headers[k]
                 return new_req
 
         opener = urllib.request.build_opener(NoAuthRedirect)
