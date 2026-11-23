@@ -82,7 +82,7 @@ jobs:
 
       - name: Execute Cloud Processing Pipeline
         env:
-          GEMINI_API_KEY: ${{ github.event.inputs.skip_ai == 'true' && '' || secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ github.event.inputs.skip_ai != 'true' && secrets.GEMINI_API_KEY || '' }}
           GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3.6-flash' }}
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
