@@ -338,7 +338,9 @@ class CloudSyncRepository(
 
     suspend fun uploadPendingDueItems(limit: Int = 10): Int = withContext(Dispatchers.IO) {
         if (!cloudClient.isConfigured()) return@withContext 0
-        val dueIds = itemDao.dueItemIds(clock.now(), limit)
+        val now = clock.now()
+        itemDao.resetInterrupted(now)
+        val dueIds = itemDao.dueItemIds(now, limit)
         var uploaded = 0
         for (id in dueIds) {
             val item = itemDao.getById(id)
