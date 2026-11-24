@@ -1019,10 +1019,19 @@ class CloudProcessingPipeline:
 
         if not is_retryable:
             # Permanent error: abort immediately without consuming retries
-            job.status = JobStatus.FAILED
-            job.next_retry_at = None
-            self._record_failure_transition(job, error)
-            logger.error("Job %s failed with permanent error; marked FAILED immediately", job.item_id)
+            # Honest partial vs failed classification
+            if job.results.transcript or job.stages.transcription == StageStatus.SUCCEEDED:
+                job.status = JobStatus.PARTIAL
+                job.next_retry_at = None
+                logger.warning(
+                    "Job %s encountered non-retryable error but preserved partial transcript results; marked PARTIAL",
+                    job.item_id,
+                )
+            else:
+                job.status = JobStatus.FAILED
+                job.next_retry_at = None
+                self._record_failure_transition(job, error)
+                logger.error("Job %s failed with permanent error; marked FAILED immediately", job.item_id)
             if self.coordinator:
                 self.coordinator.fail_job(
                     job_id=job.item_id,

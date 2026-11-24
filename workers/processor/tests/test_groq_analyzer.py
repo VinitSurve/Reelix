@@ -191,6 +191,54 @@ class TestGeminiGroqFailover(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_count, 1)
         self.assertIn("groq", outcome.result.model_name)
 
+    @patch("urllib.request.urlopen")
+    def test_groq_model_404_fails_over_to_fallback_model(self, mock_urlopen):
+        # 1st call to llama-3.3-70b-versatile returns 404 model_not_found
+        # 2nd call to llama-3.1-8b-instant succeeds
+        err_fp = io.BytesIO(b'{"error":{"message":"The model llama-3.3-70b-versatile does not exist or you do not have access to it.","code":"model_not_found"}}')
+        http_404 = urllib.error.HTTPError(
+            url="https://api.groq.com/openai/v1/chat/completions",
+            code=404,
+            msg="Not Found",
+            hdrs={},
+            fp=err_fp,
+        )
+
+        success_body = json.dumps({
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "summary": "Fallback 8B summary",
+                        "detailed_summary": "Detailed 8B breakdown",
+                        "main_topic": "Fallback AI",
+                        "category": "Tech",
+                        "keywords": ["fallback", "ai"],
+                        "tags": ["groq"],
+                        "key_takeaways": ["Model failover works"],
+                        "important_concepts": ["instant fallback"],
+                        "actionable_steps": ["use working model"],
+                    })
+                }
+            }]
+        }).encode("utf-8")
+        mock_success = MagicMock()
+        mock_success.read.return_value = success_body
+        mock_success.__enter__.return_value = mock_success
+
+        mock_urlopen.side_effect = [http_404, mock_success]
+
+        analyzer = GroqAnalyzer(api_keys=["gsk-test-key-1"])
+        outcome = analyzer.analyze(transcript="Testing model failover")
+
+        self.assertTrue(outcome.success)
+        self.assertEqual(outcome.result.summary, "Fallback 8B summary")
+        self.assertEqual(mock_urlopen.call_count, 2)
+        # Verify second call used fallback model in request body
+        second_call_req = mock_urlopen.call_args_list[1][0][0]
+        second_payload = json.loads(second_call_req.data.decode("utf-8"))
+        self.assertEqual(second_payload["model"], "llama-3.1-8b-instant")
+        self.assertIn("llama-3.1-8b-instant", outcome.result.model_name)
+
 
 if __name__ == "__main__":
     unittest.main()

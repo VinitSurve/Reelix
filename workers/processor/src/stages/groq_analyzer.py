@@ -327,6 +327,20 @@ class GroqAnalyzer:
                     self.key_manager.mark_permanent_failure(key_idx, f"HTTP {e.code}: {err_body}")
                     continue
 
+                # Model access / not found error (HTTP 404 or model error in body): failover model immediately
+                if (e.code in (400, 404) or "model" in err_body.lower()) and current_model == self.model and self.fallback_model:
+                    logger.warning(
+                        "Groq model '%s' unavailable (HTTP %d: %s); failing over to '%s'",
+                        current_model,
+                        e.code,
+                        err_body,
+                        self.fallback_model,
+                    )
+                    current_model = self.fallback_model
+                    payload["model"] = current_model
+                    req_data = json.dumps(payload).encode("utf-8")
+                    continue
+
                 # Rate limit (429) or server load (503)
                 if e.code == 429 or e.code in (500, 502, 503, 504):
                     retry_after = self._parse_retry_after(e.headers)
