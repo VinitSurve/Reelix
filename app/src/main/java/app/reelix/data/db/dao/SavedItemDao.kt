@@ -153,9 +153,12 @@ interface SavedItemDao {
     @Query(
         """
         SELECT id FROM saved_items
-        WHERE processingStatus IN ('QUEUED', 'WAITING_UPLOAD')
+        WHERE processingStatus IN ('WAITING_UPLOAD', 'QUEUED')
            OR (processingStatus = 'WAITING_RETRY' AND (nextAttemptAt IS NULL OR nextAttemptAt <= :now))
-        ORDER BY createdAt ASC LIMIT :limit
+        ORDER BY
+            CASE WHEN processingStatus = 'WAITING_UPLOAD' THEN 0 ELSE 1 END,
+            createdAt DESC
+        LIMIT :limit
         """,
     )
     suspend fun dueItemIds(now: Long, limit: Int): List<String>

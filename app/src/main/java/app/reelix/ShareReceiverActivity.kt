@@ -109,20 +109,27 @@ class ShareReceiverActivity : ComponentActivity() {
 
     private fun processIncomingIntent(incoming: Intent?) {
         uiState.value = ShareUiState.Saving
-        val intake = (application as ReelixApplication).container.shareIntakeUseCase
+        val container = (application as ReelixApplication).container
+        val intake = container.shareIntakeUseCase
         lifecycleScope.launch {
             val result = withContext(NonCancellable) {
-                intake.handleIntent(incoming)
+                val res = intake.handleIntent(incoming)
+                // Immediately offload to cloud without waiting for WorkManager delay
+                runCatching { container.cloudSyncRepository?.uploadPendingDueItems(limit = 5) }
+                res
             }
             uiState.value = ShareUiState.Result(result)
         }
     }
 
     private fun saveExplicitDuplicate(link: InstagramLink) {
-        val intake = (application as ReelixApplication).container.shareIntakeUseCase
+        val container = (application as ReelixApplication).container
+        val intake = container.shareIntakeUseCase
         lifecycleScope.launch {
             val outcome = withContext(NonCancellable) {
-                intake.saveAnotherCopy(link, source = SaveSource.SHARE)
+                val res = intake.saveAnotherCopy(link, source = SaveSource.SHARE)
+                runCatching { container.cloudSyncRepository?.uploadPendingDueItems(limit = 5) }
+                res
             }
             if (outcome is LinkSaveOutcome.Saved) {
                 uiState.value = ShareUiState.CopySaved(outcome.itemId, outcome.link)

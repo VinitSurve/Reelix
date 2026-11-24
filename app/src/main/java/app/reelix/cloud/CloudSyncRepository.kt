@@ -247,6 +247,11 @@ class CloudSyncRepository(
 
         val userTags = db.tagDao().tagsForItem(itemId).map { it.name }
         val remoteManifest = cloudClient.fetchJobManifest(itemId)
+        if (remoteManifest != null && remoteManifest.status == "COMPLETED") {
+            ReelixLog.d("Item $itemId is already COMPLETED on Google Drive; skipping upload and preserving completion")
+            syncCompletedJobs()
+            return@withContext true
+        }
         if (remoteManifest != null && remoteManifest.status == "QUEUED") {
             ReelixLog.d("Item $itemId is already confirmed QUEUED on Google Drive queue; avoiding redundant re-upload")
             val confirmedNow = clock.now()
@@ -259,8 +264,8 @@ class CloudSyncRepository(
             )
             return@withContext true
         }
-        val manifest = if (remoteManifest != null && (remoteManifest.status == "PROCESSING" || remoteManifest.status == "COMPLETED")) {
-            // Safe resubmit: preserve active or completed status and stage results
+        val manifest = if (remoteManifest != null && remoteManifest.status == "PROCESSING") {
+            // Safe resubmit: preserve active status and stage results
             ReelixLog.d("Preserving remote ${remoteManifest.status} status for item $itemId during resubmission")
             remoteManifest.copy(
                 caption = item.caption ?: item.userCaption,
@@ -329,6 +334,21 @@ class CloudSyncRepository(
             )
             return@withContext false
         }
+    }
+
+    suspend fun uploadPendingDueItems(limit: Int = 10): Int = withContext(Dispatchers.IO) {
+        if (!cloudClient.isConfigured()) return@withContext 0
+        val dueIds = itemDao.dueItemIds(clock.now(), limit)
+        var uploaded = 0
+        for (id in dueIds) {
+            val item = itemDao.getById(id)
+            if (item != null && (item.processingStatus == ProcessingStatus.WAITING_UPLOAD || item.processingStatus == ProcessingStatus.QUEUED)) {
+                if (uploadPendingItem(id)) {
+                    uploaded++
+                }
+            }
+        }
+        uploaded
     }
 
     suspend fun syncCompletedJobs(): Int = withContext(Dispatchers.IO) {

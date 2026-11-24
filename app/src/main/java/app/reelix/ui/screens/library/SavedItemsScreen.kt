@@ -86,7 +86,10 @@ class SavedItemsViewModel(
     init {
         if (cloudSyncRepository != null) {
             viewModelScope.launch(Dispatchers.IO) {
-                runCatching { cloudSyncRepository.syncCompletedJobs() }
+                runCatching {
+                    cloudSyncRepository.uploadPendingDueItems(limit = 10)
+                    cloudSyncRepository.syncCompletedJobs()
+                }
             }
         }
     }
@@ -168,8 +171,13 @@ class SavedItemsViewModel(
             if (cloudSyncRepository != null) {
                 withContext(Dispatchers.IO) {
                     runCatching {
+                        val uploaded = cloudSyncRepository.uploadPendingDueItems(limit = 10)
                         val synced = cloudSyncRepository.syncCompletedJobs()
-                        if (synced > 0) {
+                        if (uploaded > 0 && synced > 0) {
+                            _feedback.value = "Offloaded $uploaded item(s), synced $synced from Drive"
+                        } else if (uploaded > 0) {
+                            _feedback.value = "Offloaded $uploaded item(s) to cloud queue"
+                        } else if (synced > 0) {
                             _feedback.value = "Synced $synced item(s) from Google Drive"
                         }
                     }

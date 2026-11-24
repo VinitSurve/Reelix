@@ -268,7 +268,7 @@ def run_diagnostics(
                     "generation": generation,
                 })
                 print(f"  • [{status:12}] item={item_id} | gen={generation} | retries={retry_count} | DriveMod={mod_time} | url={original_url}")
-                print(f"      stages={stages} | caption='{caption}'")
+                print(f"      created_at={created_at} | updated_at={updated_at} | stages={stages} | caption='{caption}'")
             except Exception as parse_err:
                 status_counts["PARSE_ERROR"] = status_counts.get("PARSE_ERROR", 0) + 1
                 print(f"  • [PARSE_ERROR] file={fname} ({format_id(fid)}): {parse_err}")
