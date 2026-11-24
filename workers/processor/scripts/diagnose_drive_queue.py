@@ -273,6 +273,20 @@ def run_diagnostics(
                 status_counts["PARSE_ERROR"] = status_counts.get("PARSE_ERROR", 0) + 1
                 print(f"  • [PARSE_ERROR] file={fname} ({format_id(fid)}): {parse_err}")
 
+        # 6b. Search specifically for Dc_bjs4z0Y9 across all Drive files
+        print("\n--- 6b. TARGETED SEARCH FOR 'Dc_bjs4z0Y9' IN GOOGLE DRIVE ---")
+        try:
+            target_code = "Dc_bjs4z0Y9"
+            q_code = f"(name contains '{target_code}' or fullText contains '{target_code}') and trashed = false"
+            target_res = service.files().list(q=q_code, fields="files(id, name, mimeType, parents, modifiedTime)").execute()
+            matching_files = target_res.get("files", [])
+            print(f"Search query: {q_code}")
+            print(f"Total matching files found in Drive: {len(matching_files)}")
+            for mf in matching_files:
+                print(f"  • File: {mf.get('name')} (id={format_id(mf.get('id', ''))}, mime={mf.get('mimeType')}, parents={mf.get('parents')})")
+        except Exception as search_err:
+            print(f"Error executing targeted search in Drive: {search_err}")
+
         # 7. Check recent files in other subfolders (media, transitions)
         for sub_name in ["media", "transition_intents", "transitions", "audio"]:
             try:
