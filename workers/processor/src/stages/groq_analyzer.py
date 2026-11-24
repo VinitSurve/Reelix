@@ -20,13 +20,23 @@ from .gemini_analyzer import GeminiAnalysisOutcome, SYSTEM_INSTRUCTION
 logger = logging.getLogger(__name__)
 
 GROQ_API_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_GROQ_MODEL = "llama-3.1-8b-instant"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+FALLBACK_GROQ_MODEL = "openai/gpt-oss-20b"
 ALLOWED_GROQ_MODELS = (
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "llama-3.1-70b-versatile",
     "mixtral-8x7b-32768",
+)
+CANDIDATE_GROQ_MODELS = (
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
 )
 
 
@@ -237,7 +247,9 @@ class GroqAnalyzer:
                 is_retryable=False,
             )
 
-        current_model = self.model
+        candidate_models = list(dict.fromkeys([self.model, self.fallback_model, *CANDIDATE_GROQ_MODELS]))
+        failed_models: set[str] = set()
+        current_model = candidate_models[0]
         max_total_attempts = max(3, self.key_manager.total_keys * self.max_retries_per_key)
         attempt = 0
         last_error: Optional[str] = None
@@ -328,18 +340,24 @@ class GroqAnalyzer:
                     continue
 
                 # Model access / not found error (HTTP 404 or model error in body): failover model immediately
-                if (e.code in (400, 404) or "model" in err_body.lower()) and current_model == self.model and self.fallback_model:
-                    logger.warning(
-                        "Groq model '%s' unavailable (HTTP %d: %s); failing over to '%s'",
-                        current_model,
-                        e.code,
-                        err_body,
-                        self.fallback_model,
-                    )
-                    current_model = self.fallback_model
-                    payload["model"] = current_model
-                    req_data = json.dumps(payload).encode("utf-8")
-                    continue
+                if e.code in (400, 404) or "model" in err_body.lower():
+                    failed_models.add(current_model)
+                    next_candidates = [m for m in candidate_models if m not in failed_models]
+                    if next_candidates:
+                        next_model = next_candidates[0]
+                        logger.warning(
+                            "Groq model '%s' unavailable (HTTP %d: %s); failing over to '%s'",
+                            current_model,
+                            e.code,
+                            err_body,
+                            next_model,
+                        )
+                        current_model = next_model
+                        payload["model"] = current_model
+                        req_data = json.dumps(payload).encode("utf-8")
+                        continue
+                    else:
+                        logger.error("All candidate Groq models exhausted: %s", failed_models)
 
                 # Rate limit (429) or server load (503)
                 if e.code == 429 or e.code in (500, 502, 503, 504):
@@ -352,12 +370,20 @@ class GroqAnalyzer:
                     )
                     min_retry_delay = delay if min_retry_delay is None else min(min_retry_delay, delay)
 
-                    # Model failover if high demand on primary model
-                    if e.code == 503 and current_model == self.model and self.fallback_model:
-                        logger.warning("Groq model '%s' returned 503; failing over to '%s'", current_model, self.fallback_model)
-                        current_model = self.fallback_model
-                        payload["model"] = current_model
-                        req_data = json.dumps(payload).encode("utf-8")
+                    # Model failover if high demand on current model
+                    if e.code == 503:
+                        failed_models.add(current_model)
+                        next_candidates = [m for m in candidate_models if m not in failed_models]
+                        if next_candidates:
+                            next_model = next_candidates[0]
+                            logger.warning(
+                                "Groq model '%s' returned 503; failing over to '%s'",
+                                current_model,
+                                next_model,
+                            )
+                            current_model = next_model
+                            payload["model"] = current_model
+                            req_data = json.dumps(payload).encode("utf-8")
 
                     continue
 
@@ -398,10 +424,20 @@ class GroqAnalyzer:
             if not raw_text:
                 return None
 
-            cleaned_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+            # Strip any thinking/reasoning tags like <think>...</think> from reasoning models
+            cleaned_text = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
+            cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text)
             cleaned_text = re.sub(r"\s*```$", "", cleaned_text).strip()
 
-            data = json.loads(cleaned_text)
+            try:
+                data = json.loads(cleaned_text)
+            except Exception:
+                # Find outermost JSON object
+                match = re.search(r"\{[\s\S]*\}", cleaned_text)
+                if match:
+                    data = json.loads(match.group(0))
+                else:
+                    raise
             if not isinstance(data, dict):
                 return None
 

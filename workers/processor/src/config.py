@@ -15,15 +15,29 @@ ALLOWED_GEMINI_MODELS = ("gemini-3.6-flash", "gemini-3.8-flash")
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 
+# Groq AI fallback settings
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+FALLBACK_GROQ_MODEL = "openai/gpt-oss-20b"
+ALLOWED_GROQ_MODELS = (
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768",
+)
+
+
 @dataclass
 class WorkerConfig:
     # Google Gemini AI settings (Strictly restricted to gemini-3.6-flash and gemini-3.8-flash on Free Tier)
     gemini_api_key: Optional[str] = None
     gemini_model: str = DEFAULT_GEMINI_MODEL
 
-    # Groq AI fallback settings (Llama 3.3 70B Versatile / Llama 3.1 8B Instant with 3-key rotation)
+    # Groq AI fallback settings (OpenAI GPT-OSS / Qwen / Llama with multi-key rotation)
     groq_api_keys: List[str] = field(default_factory=list)
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = DEFAULT_GROQ_MODEL
 
     # Google Drive persistent storage settings (OAuth 2.0 on behalf of personal Google account)
     gdrive_client_id: Optional[str] = None
@@ -83,7 +97,7 @@ class WorkerConfig:
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             groq_api_keys=groq_keys,
-            groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            groq_model=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL),
             gdrive_client_id=os.getenv("GDRIVE_CLIENT_ID"),
             gdrive_client_secret=os.getenv("GDRIVE_CLIENT_SECRET"),
             gdrive_refresh_token=os.getenv("GDRIVE_REFRESH_TOKEN"),

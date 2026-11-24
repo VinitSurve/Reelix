@@ -193,9 +193,9 @@ class TestGeminiGroqFailover(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_groq_model_404_fails_over_to_fallback_model(self, mock_urlopen):
-        # 1st call to llama-3.3-70b-versatile returns 404 model_not_found
-        # 2nd call to llama-3.1-8b-instant succeeds
-        err_fp = io.BytesIO(b'{"error":{"message":"The model llama-3.3-70b-versatile does not exist or you do not have access to it.","code":"model_not_found"}}')
+        # 1st call to primary model returns 404 model_not_found
+        # 2nd call to fallback model succeeds
+        err_fp = io.BytesIO(b'{"error":{"message":"The model openai/gpt-oss-120b does not exist or you do not have access to it.","code":"model_not_found"}}')
         http_404 = urllib.error.HTTPError(
             url="https://api.groq.com/openai/v1/chat/completions",
             code=404,
@@ -208,8 +208,8 @@ class TestGeminiGroqFailover(unittest.TestCase):
             "choices": [{
                 "message": {
                     "content": json.dumps({
-                        "summary": "Fallback 8B summary",
-                        "detailed_summary": "Detailed 8B breakdown",
+                        "summary": "Fallback summary",
+                        "detailed_summary": "Detailed breakdown",
                         "main_topic": "Fallback AI",
                         "category": "Tech",
                         "keywords": ["fallback", "ai"],
@@ -231,13 +231,13 @@ class TestGeminiGroqFailover(unittest.TestCase):
         outcome = analyzer.analyze(transcript="Testing model failover")
 
         self.assertTrue(outcome.success)
-        self.assertEqual(outcome.result.summary, "Fallback 8B summary")
+        self.assertEqual(outcome.result.summary, "Fallback summary")
         self.assertEqual(mock_urlopen.call_count, 2)
         # Verify second call used fallback model in request body
         second_call_req = mock_urlopen.call_args_list[1][0][0]
         second_payload = json.loads(second_call_req.data.decode("utf-8"))
-        self.assertEqual(second_payload["model"], "llama-3.1-8b-instant")
-        self.assertIn("llama-3.1-8b-instant", outcome.result.model_name)
+        self.assertEqual(second_payload["model"], "openai/gpt-oss-20b")
+        self.assertIn("openai/gpt-oss-20b", outcome.result.model_name)
 
 
 if __name__ == "__main__":

@@ -75,6 +75,7 @@ class GeminiAnalyzer:
         request_timeout_seconds: int = 45,
         groq_api_keys: Optional[List[str]] = None,
         groq_analyzer: Optional[Any] = None,
+        groq_model: Optional[str] = None,
     ):
         if model not in ALLOWED_GEMINI_MODELS:
             raise ValueError(
@@ -90,7 +91,10 @@ class GeminiAnalyzer:
         self.groq_analyzer = groq_analyzer
         if self.groq_analyzer is None and groq_api_keys:
             from .groq_analyzer import GroqAnalyzer
-            self.groq_analyzer = GroqAnalyzer(api_keys=groq_api_keys)
+            kwargs = {}
+            if groq_model:
+                kwargs["model"] = groq_model
+            self.groq_analyzer = GroqAnalyzer(api_keys=groq_api_keys, **kwargs)
 
     def _fallback_to_groq(
         self,
