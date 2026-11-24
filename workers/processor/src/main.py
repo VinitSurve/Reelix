@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -46,6 +47,12 @@ def parse_args(args: list[str]) -> argparse.Namespace:
         type=str,
         default=os.getenv("TARGET_ITEM_ID") or None,
         help="Optional specific item ID to target and process exclusively",
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=os.getenv("TARGET_URL") or None,
+        help="Optional Instagram Reel URL to dynamically ingest and process",
     )
     parser.add_argument(
         "--reprocess",
@@ -139,15 +146,43 @@ def main(argv: list[str] | None = None) -> int:
 
     pipeline = CloudProcessingPipeline(config=config, storage=storage, coordinator=coordinator)
 
-    target_id = args.item_id or os.getenv("TARGET_ITEM_ID")
+    target_id = args.item_id or args.url or os.getenv("TARGET_ITEM_ID") or os.getenv("TARGET_URL")
     reprocess = args.reprocess or os.getenv("REPROCESS_ITEM") in ("1", "true", "True")
     force_claim = args.force or os.getenv("FORCE_CLAIM") in ("1", "true", "True") or bool(target_id)
     if target_id:
         logger.info("Targeted processing mode requested for item: %s (reprocess=%s, force_claim=%s)", target_id, reprocess, force_claim)
         job = storage.get_job(target_id)
         if not job:
-            logger.error("Target item %s not found in storage", target_id)
-            return 1
+            from .stages.instagram_resolver import InstagramPostResolver
+            extracted_sc = InstagramPostResolver.extract_shortcode(target_id)
+            is_sc = bool(re.match(r"^[A-Za-z0-9_-]{11}$", target_id))
+            if extracted_sc or is_sc:
+                shortcode = extracted_sc or target_id
+                target_id = shortcode
+                job = storage.get_job(target_id)
+                if not job:
+                    canonical_url = f"https://www.instagram.com/reel/{shortcode}/"
+                    logger.info("Initializing new queue manifest in storage for shortcode %s (url=%s)", shortcode, canonical_url)
+                    job = JobManifest(
+                        item_id=shortcode,
+                        source="instagram",
+                        original_url=canonical_url,
+                        status=JobStatus.QUEUED,
+                        created_at=int(time.time() * 1000),
+                        updated_at=int(time.time() * 1000),
+                        stages=StageStates(
+                            acquisition=StageStatus.PENDING,
+                            audio_extraction=StageStatus.PENDING,
+                            transcription=StageStatus.PENDING,
+                            ocr=StageStatus.PENDING,
+                            gemini_analysis=StageStatus.PENDING,
+                        ),
+                    )
+                    storage.update_job(job)
+                    reprocess = False
+            else:
+                logger.error("Target item %s not found in storage", target_id)
+                return 1
 
         existing_transitions = storage.list_transitions(target_id)
         is_settled = job.status in (JobStatus.COMPLETED, JobStatus.FAILED)

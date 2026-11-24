@@ -369,7 +369,7 @@ class GoogleDriveCloudClient(
         }
 
     override suspend fun submitJobManifest(manifest: CloudJobManifest): Boolean = withContext(Dispatchers.IO) {
-        val token = tokenProvider() ?: return@withContext false
+        var token = tokenProvider() ?: return@withContext false
         val configuredFolder = folderIdProvider()
         val rootFolderId = if (!configuredFolder.isNullOrBlank()) configuredFolder else ensureVaultFolder(token)
 
@@ -384,21 +384,33 @@ class GoogleDriveCloudClient(
             if (existingId != null) {
                 // Update
                 val updateUrl = "https://www.googleapis.com/upload/drive/v3/files/$existingId?uploadType=media"
-                val reqBuilder = Request.Builder()
-                    .url(updateUrl)
-                    .addHeader("Authorization", "Bearer $token")
-                if (!manifest.etag.isNullOrBlank()) {
-                    reqBuilder.addHeader("If-Match", manifest.etag)
+                fun buildPatchRequest(tok: String): Request {
+                    val reqBuilder = Request.Builder()
+                        .url(updateUrl)
+                        .addHeader("Authorization", "Bearer $tok")
+                    if (!manifest.etag.isNullOrBlank()) {
+                        reqBuilder.addHeader("If-Match", manifest.etag)
+                    }
+                    return reqBuilder
+                        .patch(jsonContent.toRequestBody("application/json".toMediaType()))
+                        .build()
                 }
-                val request = reqBuilder
-                    .patch(jsonContent.toRequestBody("application/json".toMediaType()))
-                    .build()
-                client.newCall(request).execute().use { resp ->
-                    if (resp.code == 412) {
+
+                var resp = client.newCall(buildPatchRequest(token)).execute()
+                if (resp.code == 401 && tokenRefresher != null) {
+                    resp.close()
+                    val refreshed = tokenRefresher.invoke()
+                    if (!refreshed.isNullOrBlank()) {
+                        token = refreshed
+                        resp = client.newCall(buildPatchRequest(token)).execute()
+                    }
+                }
+                resp.use {
+                    if (it.code == 412) {
                         ReelixLog.w("Manifest update rejected with HTTP 412 Precondition Failed for ${manifest.itemId}; remote file was modified")
                         return@withContext false
                     }
-                    resp.isSuccessful
+                    it.isSuccessful
                 }
             } else {
                 // Create
@@ -410,12 +422,22 @@ class GoogleDriveCloudClient(
                 val body = "--$boundary\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n$createMeta\r\n" +
                     "--$boundary\r\nContent-Type: application/json\r\n\r\n$jsonContent\r\n--$boundary--"
 
-                val request = Request.Builder()
+                fun buildPostRequest(tok: String) = Request.Builder()
                     .url("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
-                    .addHeader("Authorization", "Bearer $token")
+                    .addHeader("Authorization", "Bearer $tok")
                     .post(body.toByteArray().toRequestBody("multipart/related; boundary=$boundary".toMediaType()))
                     .build()
-                client.newCall(request).execute().use { it.isSuccessful }
+
+                var resp = client.newCall(buildPostRequest(token)).execute()
+                if (resp.code == 401 && tokenRefresher != null) {
+                    resp.close()
+                    val refreshed = tokenRefresher.invoke()
+                    if (!refreshed.isNullOrBlank()) {
+                        token = refreshed
+                        resp = client.newCall(buildPostRequest(token)).execute()
+                    }
+                }
+                resp.use { it.isSuccessful }
             }
         } catch (e: Exception) {
             ReelixLog.w("Failed to submit job manifest to Drive", e)

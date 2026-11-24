@@ -359,7 +359,13 @@ class CloudSyncRepository(
 
         for (manifest in completed) {
             val wasSynced = db.withTransaction {
-                val item = itemDao.getById(manifest.itemId) ?: return@withTransaction false
+                val item = itemDao.getById(manifest.itemId)
+                    ?: manifest.originalUrl?.let { url ->
+                        itemDao.findByNormalizedUrl(url)
+                            ?: app.reelix.core.url.InstagramUrlParser.parse(url)?.normalizedUrl?.let { itemDao.findByNormalizedUrl(it) }
+                    }
+                    ?: return@withTransaction false
+                val targetItemId = item.id
 
                 // 3-Dimensional Staleness Protection (Generation -> Attempt Epoch -> Projection Version)
                 val isStaleGeneration = manifest.generation < item.lastSyncedGeneration
@@ -378,11 +384,11 @@ class CloudSyncRepository(
                 }
 
                 val now = clock.now()
-                val existingResults = processingDao.resultsFor(manifest.itemId)
+                val existingResults = processingDao.resultsFor(targetItemId)
 
                 // Clean up previous generation results when a freshly completed generation arrives
                 val activeResults = if (item.processingStatus != ProcessingStatus.COMPLETED && existingResults.isNotEmpty()) {
-                    processingDao.deleteResultsFor(manifest.itemId)
+                    processingDao.deleteResultsFor(targetItemId)
                     emptyList()
                 } else {
                     existingResults
@@ -393,7 +399,7 @@ class CloudSyncRepository(
                 if (!hasValidLocalMedia && manifest.media != null && manifest.stages.acquisition == "SUCCEEDED") {
                     if (!item.mediaAvailable || item.mediaFileName != manifest.media.fileName) {
                         itemDao.updateMediaDetails(
-                            id = manifest.itemId,
+                            id = targetItemId,
                             available = true,
                             mediaPath = item.mediaPath,
                             mediaMimeType = manifest.media.mimeType.ifBlank { item.mediaMimeType ?: "video/mp4" },
@@ -410,7 +416,7 @@ class CloudSyncRepository(
                 if (!hasExistingTranscript && manifest.results.transcript != null) {
                     processingDao.insertResult(
                         ProcessingResultEntity(
-                            savedItemId = manifest.itemId,
+                            savedItemId = targetItemId,
                             stage = ProcessingStage.TRANSCRIPTION,
                             transcript = manifest.results.transcript,
                             providerId = "github-actions-whisper",
@@ -418,19 +424,19 @@ class CloudSyncRepository(
                             generatedAt = now,
                         ),
                     )
-                    itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
+                    itemDao.setTranscriptionStatus(targetItemId, StageStatus.SUCCEEDED, now)
                 } else if (manifest.results.transcript != null && item.transcriptionStatus != StageStatus.SUCCEEDED) {
-                    itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
+                    itemDao.setTranscriptionStatus(targetItemId, StageStatus.SUCCEEDED, now)
                 }
 
                 if (manifest.stages.audioExtraction == "SUCCEEDED") {
-                    itemDao.setAudioExtractionStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
+                    itemDao.setAudioExtractionStatus(targetItemId, StageStatus.SUCCEEDED, now)
                 } else if (manifest.stages.audioExtraction == "FAILED") {
-                    itemDao.setAudioExtractionStatus(manifest.itemId, StageStatus.FAILED, now)
+                    itemDao.setAudioExtractionStatus(targetItemId, StageStatus.FAILED, now)
                 }
 
                 if (manifest.stages.transcription == "FAILED") {
-                    itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.FAILED, now)
+                    itemDao.setTranscriptionStatus(targetItemId, StageStatus.FAILED, now)
                 }
 
                 // 1b. On-screen Visual Text (OCR) Result (idempotent: avoid duplicate result inserts)
@@ -438,7 +444,7 @@ class CloudSyncRepository(
                 if (!hasExistingOcr && !manifest.results.ocrText.isNullOrBlank()) {
                     processingDao.insertResult(
                         ProcessingResultEntity(
-                            savedItemId = manifest.itemId,
+                            savedItemId = targetItemId,
                             stage = ProcessingStage.VISUAL_ANALYSIS,
                             transcript = manifest.results.ocrText,
                             providerId = "github-actions-ocr",
@@ -454,7 +460,7 @@ class CloudSyncRepository(
                 if (!hasExistingAnalysis && analysis != null) {
                     processingDao.insertResult(
                         ProcessingResultEntity(
-                            savedItemId = manifest.itemId,
+                            savedItemId = targetItemId,
                             stage = ProcessingStage.ANALYSIS,
                             summary = analysis.summary,
                             detailedSummary = analysis.detailedSummary,
@@ -470,21 +476,21 @@ class CloudSyncRepository(
                             generatedAt = analysis.generatedAt,
                         ),
                     )
-                    itemDao.setAnalysisStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
+                    itemDao.setAnalysisStatus(targetItemId, StageStatus.SUCCEEDED, now)
 
                     // Apply AI tags
                     val aiTags = TagNormalizer.normalizeAll(analysis.tags)
                     if (aiTags.isNotEmpty()) {
-                        savedItemRepository.replaceTagsLocked(manifest.itemId, aiTags, TagSource.AI, now)
+                        savedItemRepository.replaceTagsLocked(targetItemId, aiTags, TagSource.AI, now)
                     }
                 } else if (analysis != null && item.analysisStatus != StageStatus.SUCCEEDED) {
-                    itemDao.setAnalysisStatus(manifest.itemId, StageStatus.SUCCEEDED, now)
+                    itemDao.setAnalysisStatus(targetItemId, StageStatus.SUCCEEDED, now)
                 } else if (manifest.stages.geminiAnalysis == "FAILED") {
-                    itemDao.setAnalysisStatus(manifest.itemId, StageStatus.FAILED, now)
+                    itemDao.setAnalysisStatus(targetItemId, StageStatus.FAILED, now)
                 } else if (manifest.stages.geminiAnalysis == "SKIPPED") {
-                    itemDao.setAnalysisStatus(manifest.itemId, StageStatus.SKIPPED, now)
+                    itemDao.setAnalysisStatus(targetItemId, StageStatus.SKIPPED, now)
                 } else if (manifest.stages.geminiAnalysis == "NOT_CONFIGURED") {
-                    itemDao.setAnalysisStatus(manifest.itemId, StageStatus.NOT_CONFIGURED, now)
+                    itemDao.setAnalysisStatus(targetItemId, StageStatus.NOT_CONFIGURED, now)
                 }
 
                 // 3. Honest state determination based on cloud outcome
@@ -497,8 +503,8 @@ class CloudSyncRepository(
 
                         if ((hasAnalysis || aiSkippedOrNotConfigured) && (!expectedAudio || hasTranscript)) {
                             // Truly completed (fully processed with AI or processed without AI analysis)
-                            itemDao.markCompleted(manifest.itemId, now)
-                            indexer.reindex(manifest.itemId)
+                            itemDao.markCompleted(targetItemId, now)
+                            indexer.reindex(targetItemId)
                             val message = if (hasAnalysis) {
                                 "Synchronized complete transcripts & Gemini analysis from GitHub Actions cloud worker"
                             } else {
@@ -506,7 +512,7 @@ class CloudSyncRepository(
                             }
                             processingDao.insertEvent(
                                 ProcessingEventEntity(
-                                    savedItemId = manifest.itemId,
+                                    savedItemId = targetItemId,
                                     stage = ProcessingStage.COMPLETION,
                                     status = "CLOUD_SYNCED",
                                     message = message,
@@ -521,16 +527,16 @@ class CloudSyncRepository(
                                 "Missing transcript from cloud worker"
                             }
                             itemDao.updateProcessingStatus(
-                                id = manifest.itemId,
+                                id = targetItemId,
                                 status = ProcessingStatus.NEEDS_ATTENTION,
                                 nextAttemptAt = null,
                                 lastError = reason,
                                 now = now,
                             )
-                            indexer.reindex(manifest.itemId)
+                            indexer.reindex(targetItemId)
                             processingDao.insertEvent(
                                 ProcessingEventEntity(
-                                    savedItemId = manifest.itemId,
+                                    savedItemId = targetItemId,
                                     stage = ProcessingStage.COMPLETION,
                                     status = "CLOUD_INCOMPLETE",
                                     message = "Cloud processing incomplete ($reason); attention required",
@@ -541,7 +547,7 @@ class CloudSyncRepository(
                     }
                     "PROCESSING" -> {
                         itemDao.updateProcessingStatus(
-                            id = manifest.itemId,
+                            id = targetItemId,
                             status = ProcessingStatus.PROCESSING,
                             nextAttemptAt = null,
                             lastError = null,
@@ -549,21 +555,21 @@ class CloudSyncRepository(
                         )
                         // Sync granular running stages for accurate UI reflection
                         if (manifest.stages.acquisition == "RUNNING") {
-                            itemDao.setExtractionStatus(manifest.itemId, StageStatus.RUNNING, now)
+                            itemDao.setExtractionStatus(targetItemId, StageStatus.RUNNING, now)
                         }
                         if (manifest.stages.audioExtraction == "RUNNING") {
-                            itemDao.setAudioExtractionStatus(manifest.itemId, StageStatus.RUNNING, now)
+                            itemDao.setAudioExtractionStatus(targetItemId, StageStatus.RUNNING, now)
                         }
                         if (manifest.stages.transcription == "RUNNING") {
-                            itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.RUNNING, now)
+                            itemDao.setTranscriptionStatus(targetItemId, StageStatus.RUNNING, now)
                         }
                         if (manifest.stages.geminiAnalysis == "RUNNING") {
-                            itemDao.setAnalysisStatus(manifest.itemId, StageStatus.RUNNING, now)
+                            itemDao.setAnalysisStatus(targetItemId, StageStatus.RUNNING, now)
                         }
                         if (item.processingStatus != ProcessingStatus.PROCESSING) {
                             processingDao.insertEvent(
                                 ProcessingEventEntity(
-                                    savedItemId = manifest.itemId,
+                                    savedItemId = targetItemId,
                                     stage = null,
                                     status = "CLOUD_PROCESSING",
                                     message = "Job claimed by cloud worker (${manifest.claimedBy ?: "active"}); processing in progress",
@@ -575,7 +581,7 @@ class CloudSyncRepository(
                     "QUEUED" -> {
                         if (item.processingStatus != ProcessingStatus.QUEUED) {
                             itemDao.updateProcessingStatus(
-                                id = manifest.itemId,
+                                id = targetItemId,
                                 status = ProcessingStatus.QUEUED,
                                 nextAttemptAt = null,
                                 lastError = null,
@@ -585,16 +591,16 @@ class CloudSyncRepository(
                     }
                     "WAITING_RETRY" -> {
                         itemDao.updateProcessingStatus(
-                            id = manifest.itemId,
+                            id = targetItemId,
                             status = ProcessingStatus.WAITING_RETRY,
                             nextAttemptAt = manifest.nextRetryAt ?: 0L,
                             lastError = manifest.errorMessage,
                             now = now,
                         )
-                        indexer.reindex(manifest.itemId)
+                        indexer.reindex(targetItemId)
                         processingDao.insertEvent(
                             ProcessingEventEntity(
-                                savedItemId = manifest.itemId,
+                                savedItemId = targetItemId,
                                 stage = ProcessingStage.COMPLETION,
                                 status = "CLOUD_WAITING_RETRY",
                                 message = "Authoritative Drive manifest set to WAITING_RETRY; synced to local Room database",
@@ -605,16 +611,16 @@ class CloudSyncRepository(
                     "PARTIAL" -> {
                         val errorMsg = manifest.errorMessage ?: "Partial cloud processing; some stages incomplete"
                         itemDao.updateProcessingStatus(
-                            id = manifest.itemId,
+                            id = targetItemId,
                             status = ProcessingStatus.NEEDS_ATTENTION,
                             nextAttemptAt = null,
                             lastError = errorMsg,
                             now = now,
                         )
-                        indexer.reindex(manifest.itemId)
+                        indexer.reindex(targetItemId)
                         processingDao.insertEvent(
                             ProcessingEventEntity(
-                                savedItemId = manifest.itemId,
+                                savedItemId = targetItemId,
                                 stage = ProcessingStage.COMPLETION,
                                 status = "CLOUD_PARTIAL",
                                 message = "Synchronized partial cloud results: $errorMsg",
@@ -625,16 +631,16 @@ class CloudSyncRepository(
                     "FAILED" -> {
                         val errorMsg = manifest.errorMessage ?: "Cloud processing failed"
                         itemDao.updateProcessingStatus(
-                            id = manifest.itemId,
+                            id = targetItemId,
                             status = ProcessingStatus.NEEDS_ATTENTION,
                             nextAttemptAt = null,
                             lastError = errorMsg,
                             now = now,
                         )
-                        indexer.reindex(manifest.itemId)
+                        indexer.reindex(targetItemId)
                         processingDao.insertEvent(
                             ProcessingEventEntity(
-                                savedItemId = manifest.itemId,
+                                savedItemId = targetItemId,
                                 stage = ProcessingStage.COMPLETION,
                                 status = "CLOUD_FAILED",
                                 message = "Cloud processing failed: $errorMsg",
@@ -644,7 +650,7 @@ class CloudSyncRepository(
                     }
                 }
                 itemDao.updateSyncDimensions(
-                    id = manifest.itemId,
+                    id = targetItemId,
                     gen = maxOf(item.lastSyncedGeneration, manifest.generation),
                     epoch = if (manifest.generation > item.lastSyncedGeneration) manifest.activeAttemptEpoch else maxOf(item.lastSyncedAttemptEpoch, manifest.activeAttemptEpoch),
                     ver = maxOf(item.lastSyncedProjectionVersion, manifest.projectionVersion),

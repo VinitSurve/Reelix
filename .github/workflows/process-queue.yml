@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       target_item_id:
-        description: "Optional specific item ID to process exclusively (e.g. b313dec3-e021-4885-92a1-f890b7c814b6)"
+        description: "Optional specific item ID or shortcode to process exclusively (e.g. b313dec3-... or Dc_bjs4z0Y9)"
+        required: false
+        default: ""
+      target_url:
+        description: "Optional specific Instagram Reel URL or shortcode to ingest and process (e.g. https://www.instagram.com/reel/Dc_bjs4z0Y9/)"
         required: false
         default: ""
       reprocess:
@@ -94,8 +98,8 @@ jobs:
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           MAX_JOBS_PER_RUN: ${{ github.event.inputs.max_jobs || '5' }}
           WHISPER_MODEL: ${{ github.event.inputs.whisper_model || 'base' }}
-          TARGET_ITEM_ID: ${{ github.event.inputs.target_item_id }}
+          TARGET_ITEM_ID: ${{ github.event.inputs.target_item_id || github.event.inputs.target_url }}
           REPROCESS_ITEM: ${{ github.event.inputs.reprocess == 'true' && '1' || '0' }}
-          FORCE_CLAIM: ${{ github.event.inputs.force_claim == 'true' || github.event.inputs.target_item_id != '' && '1' || '0' }}
+          FORCE_CLAIM: ${{ github.event.inputs.force_claim == 'true' || (github.event.inputs.target_item_id != '' || github.event.inputs.target_url != '') && '1' || '0' }}
         run: |
           python -m workers.processor.src.main
