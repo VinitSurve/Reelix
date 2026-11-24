@@ -89,15 +89,30 @@ data class ItemListEntry(
     /** Honest status badge label reflecting actual pipeline achievements rather than generic "Processed". */
     val primaryStatusLabel: String
         get() = when {
-            isNeedsAttention && !isMediaAvailable -> "Media needed"
-            isNeedsAttention -> "Needs attention"
-            isAiEnriched -> "AI enriched"
-            isTranscribed -> "Transcribed"
-            isAudioExtracted -> "Audio extracted"
-            isMediaAvailable -> "Media available"
-            extractionStatus == StageStatus.SUCCEEDED -> "Metadata extracted"
-            processingStatus.isAwaiting -> processingStatus.label
-            else -> "Saved"
+            processingStatus == ProcessingStatus.NEEDS_ATTENTION -> {
+                if (!isMediaAvailable) "Needs Attention" else "Needs Attention"
+            }
+            processingStatus == ProcessingStatus.COMPLETED -> {
+                if (isAiEnriched) "Completed" else "Completed without AI analysis"
+            }
+            processingStatus == ProcessingStatus.PROCESSING -> {
+                when {
+                    analysisStatus == StageStatus.RUNNING -> "AI analyzing"
+                    transcriptionStatus == StageStatus.RUNNING -> "Transcribing"
+                    audioExtractionStatus == StageStatus.RUNNING -> "Processing"
+                    extractionStatus == StageStatus.RUNNING -> "Downloading"
+                    !isMediaAvailable -> "Downloading"
+                    else -> "Processing"
+                }
+            }
+            processingStatus == ProcessingStatus.UPLOADING -> "Uploading"
+            processingStatus == ProcessingStatus.WAITING_UPLOAD -> "Waiting to upload"
+            processingStatus == ProcessingStatus.QUEUED -> "Queued"
+            processingStatus == ProcessingStatus.WAITING_RETRY -> "Retry scheduled"
+            processingStatus == ProcessingStatus.SAVED_LOCALLY -> "Saved locally"
+            isAiEnriched -> "Completed"
+            isTranscribed -> "Completed without AI analysis"
+            else -> processingStatus.label
         }
 }
 

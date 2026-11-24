@@ -94,10 +94,15 @@ fun ProvenanceBadge(kind: ProvenanceKind, modifier: Modifier = Modifier) {
 fun ItemHonestStatusBadge(label: String, isAttention: Boolean, isAwaiting: Boolean, modifier: Modifier = Modifier) {
     val scheme = MaterialTheme.colorScheme
     val (bg, fg) = when {
-        isAttention -> scheme.errorContainer to scheme.onErrorContainer
+        isAttention || label == "Needs Attention" || label == "Failed" -> scheme.errorContainer to scheme.onErrorContainer
+        label == "Completed" || label == "AI enriched" -> scheme.primaryContainer to scheme.onPrimaryContainer
+        label == "Completed without AI analysis" -> scheme.secondaryContainer to scheme.onSecondaryContainer
+        label in listOf("AI analyzing", "Transcribing", "Processing", "Downloading", "Uploading") ->
+            scheme.tertiaryContainer to scheme.onTertiaryContainer
+        label in listOf("Queued", "Waiting to upload", "Retry scheduled", "Saved locally", "Media needed", "Manual input needed") ->
+            scheme.surfaceVariant to scheme.onSurfaceVariant
         isAwaiting -> scheme.surfaceVariant to scheme.onSurfaceVariant
-        label == "AI enriched" -> scheme.primaryContainer to scheme.onPrimaryContainer
-        label == "Transcribed" || label == "Media needed" || label == "Manual input needed" -> scheme.tertiaryContainer to scheme.onTertiaryContainer
+        label == "Transcribed" -> scheme.tertiaryContainer to scheme.onTertiaryContainer
         label == "Media available" || label == "Audio extracted" -> scheme.secondaryContainer to scheme.onSecondaryContainer
         else -> scheme.secondaryContainer.copy(alpha = 0.7f) to scheme.onSecondaryContainer
     }

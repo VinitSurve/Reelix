@@ -3,6 +3,7 @@
 from .audio_extractor import AudioExtractionOutcome, FFmpegAudioExtractor
 from .downloader import DownloadResult, DownloadStatus, MediaDownloader, YtDlpDownloader
 from .gemini_analyzer import GeminiAnalysisOutcome, GeminiAnalyzer
+from .groq_analyzer import GroqAnalyzer, GroqKeyManager
 from .instagram_resolver import (
     CarouselItem,
     InstagramMediaType,
@@ -22,6 +23,8 @@ __all__ = [
     "YtDlpDownloader",
     "GeminiAnalysisOutcome",
     "GeminiAnalyzer",
+    "GroqAnalyzer",
+    "GroqKeyManager",
     "CarouselItem",
     "InstagramMediaType",
     "InstagramPostResolver",

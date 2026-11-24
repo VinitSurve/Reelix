@@ -73,6 +73,8 @@ class GeminiAnalyzer:
         base_delay_seconds: float = 3.0,
         max_delay_seconds: float = 45.0,
         request_timeout_seconds: int = 45,
+        groq_api_keys: Optional[List[str]] = None,
+        groq_analyzer: Optional[Any] = None,
     ):
         if model not in ALLOWED_GEMINI_MODELS:
             raise ValueError(
@@ -85,6 +87,51 @@ class GeminiAnalyzer:
         self.base_delay_seconds = base_delay_seconds
         self.max_delay_seconds = max_delay_seconds
         self.request_timeout_seconds = request_timeout_seconds
+        self.groq_analyzer = groq_analyzer
+        if self.groq_analyzer is None and groq_api_keys:
+            from .groq_analyzer import GroqAnalyzer
+            self.groq_analyzer = GroqAnalyzer(api_keys=groq_api_keys)
+
+    def _fallback_to_groq(
+        self,
+        gemini_error: str,
+        title: Optional[str] = None,
+        caption: Optional[str] = None,
+        transcript: Optional[str] = None,
+        notes: Optional[str] = None,
+        ocr_text: Optional[str] = None,
+        category: Optional[str] = None,
+        user_tags: Optional[List[str]] = None,
+    ) -> Optional[GeminiAnalysisOutcome]:
+        """Attempts failover to secondary Groq provider when Gemini encounters an error or is unconfigured."""
+        if (
+            self.groq_analyzer
+            and hasattr(self.groq_analyzer, "key_manager")
+            and self.groq_analyzer.key_manager.has_usable_keys()
+        ):
+            logger.warning(
+                "Gemini AI provider unavailable or exhausted (%s); failing over to Groq provider with %d key(s)...",
+                gemini_error,
+                self.groq_analyzer.key_manager.total_keys,
+            )
+            groq_res = self.groq_analyzer.analyze(
+                title=title,
+                caption=caption,
+                transcript=transcript,
+                notes=notes,
+                ocr_text=ocr_text,
+                category=category,
+                user_tags=user_tags,
+            )
+            if groq_res.success:
+                logger.info(
+                    "Groq fallback succeeded using model '%s'",
+                    groq_res.result.model_name if groq_res.result else "unknown",
+                )
+                return groq_res
+            logger.error("Groq fallback also failed: %s", groq_res.error)
+            return groq_res
+        return None
 
     def _parse_retry_after(self, headers: Any) -> Optional[float]:
         if not headers:
@@ -119,6 +166,18 @@ class GeminiAnalyzer:
         user_tags: Optional[List[str]] = None,
     ) -> GeminiAnalysisOutcome:
         if not self.api_key:
+            fallback = self._fallback_to_groq(
+                "GEMINI_API_KEY is not configured",
+                title=title,
+                caption=caption,
+                transcript=transcript,
+                notes=notes,
+                ocr_text=ocr_text,
+                category=category,
+                user_tags=user_tags,
+            )
+            if fallback is not None:
+                return fallback
             return GeminiAnalysisOutcome(
                 success=False,
                 error="GEMINI_API_KEY is not configured",
@@ -197,6 +256,18 @@ class GeminiAnalyzer:
                         logger.warning("Failed to parse structured JSON from Gemini response on attempt %d; retrying", attempt)
                         time.sleep(self.base_delay_seconds)
                         continue
+                    fallback = self._fallback_to_groq(
+                        "Failed to parse structured JSON from Gemini response",
+                        title=title,
+                        caption=caption,
+                        transcript=transcript,
+                        notes=notes,
+                        ocr_text=ocr_text,
+                        category=category,
+                        user_tags=user_tags,
+                    )
+                    if fallback is not None:
+                        return fallback
                     return GeminiAnalysisOutcome(
                         success=False,
                         error="Failed to parse structured JSON from Gemini response",
@@ -217,6 +288,18 @@ class GeminiAnalyzer:
                         msg = f"Gemini API model access error (HTTP {e.code}): model '{current_model}' unavailable or access denied: {err_body}"
                     else:
                         msg = f"Gemini API bad request (HTTP 400): {err_body}"
+                    fallback = self._fallback_to_groq(
+                        msg,
+                        title=title,
+                        caption=caption,
+                        transcript=transcript,
+                        notes=notes,
+                        ocr_text=ocr_text,
+                        category=category,
+                        user_tags=user_tags,
+                    )
+                    if fallback is not None:
+                        return fallback
                     return GeminiAnalysisOutcome(success=False, error=msg, is_retryable=False)
 
                 # Transient rate limit (429) or server errors (500, 502, 503, 504)
@@ -241,13 +324,38 @@ class GeminiAnalyzer:
                         time.sleep(delay)
                         continue
                     else:
+                        gem_err = f"Gemini API transient HTTP {e.code} error after {attempt} attempts: {err_body}"
+                        fallback = self._fallback_to_groq(
+                            gem_err,
+                            title=title,
+                            caption=caption,
+                            transcript=transcript,
+                            notes=notes,
+                            ocr_text=ocr_text,
+                            category=category,
+                            user_tags=user_tags,
+                        )
+                        if fallback is not None:
+                            return fallback
                         return GeminiAnalysisOutcome(
                             success=False,
-                            error=f"Gemini API transient HTTP {e.code} error after {attempt} attempts: {err_body}",
+                            error=gem_err,
                             is_retryable=True,
                             retry_after_seconds=delay,
                         )
 
+                fallback = self._fallback_to_groq(
+                    f"Gemini HTTP {e.code}: {err_body}",
+                    title=title,
+                    caption=caption,
+                    transcript=transcript,
+                    notes=notes,
+                    ocr_text=ocr_text,
+                    category=category,
+                    user_tags=user_tags,
+                )
+                if fallback is not None:
+                    return fallback
                 return GeminiAnalysisOutcome(success=False, error=f"Gemini HTTP {e.code}: {err_body}", is_retryable=False)
 
             except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
@@ -257,15 +365,41 @@ class GeminiAnalyzer:
                     logger.warning("Retrying after network/timeout error in %.2fs...", delay)
                     time.sleep(delay)
                     continue
+                gem_err = f"Gemini API network/timeout error after {attempt} attempts: {e}"
+                fallback = self._fallback_to_groq(
+                    gem_err,
+                    title=title,
+                    caption=caption,
+                    transcript=transcript,
+                    notes=notes,
+                    ocr_text=ocr_text,
+                    category=category,
+                    user_tags=user_tags,
+                )
+                if fallback is not None:
+                    return fallback
                 return GeminiAnalysisOutcome(
                     success=False,
-                    error=f"Gemini API network/timeout error after {attempt} attempts: {e}",
+                    error=gem_err,
                     is_retryable=True,
                     retry_after_seconds=delay,
                 )
             except Exception as e:
                 logger.error("Unexpected error calling Gemini API: %s", e)
-                return GeminiAnalysisOutcome(success=False, error=f"Gemini API error: {e}", is_retryable=False)
+                gem_err = f"Gemini API error: {e}"
+                fallback = self._fallback_to_groq(
+                    gem_err,
+                    title=title,
+                    caption=caption,
+                    transcript=transcript,
+                    notes=notes,
+                    ocr_text=ocr_text,
+                    category=category,
+                    user_tags=user_tags,
+                )
+                if fallback is not None:
+                    return fallback
+                return GeminiAnalysisOutcome(success=False, error=gem_err, is_retryable=False)
 
     def _parse_gemini_response(
         self, resp_json: Dict[str, Any], model_name: Optional[str] = None

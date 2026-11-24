@@ -202,6 +202,7 @@ private fun ReelixNavHost(
                     repository = container.savedItemRepository,
                     shareIntake = container.shareIntakeUseCase,
                     scheduler = container.processingScheduler,
+                    cloudSyncRepository = container.cloudSyncRepository,
                 ),
             )
             HomeScreen(
@@ -220,6 +221,7 @@ private fun ReelixNavHost(
                 factory = SavedItemsViewModel.factory(
                     repository = container.savedItemRepository,
                     scheduler = container.processingScheduler,
+                    cloudSyncRepository = container.cloudSyncRepository,
                 ),
             )
             SavedItemsScreen(

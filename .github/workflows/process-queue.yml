@@ -84,6 +84,9 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ github.event.inputs.skip_ai != 'true' && secrets.GEMINI_API_KEY || '' }}
           GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3.6-flash' }}
+          GROQ_API_KEY_1: ${{ github.event.inputs.skip_ai != 'true' && secrets.GROQ_API_KEY_1 || '' }}
+          GROQ_API_KEY_2: ${{ github.event.inputs.skip_ai != 'true' && secrets.GROQ_API_KEY_2 || '' }}
+          GROQ_API_KEY_3: ${{ github.event.inputs.skip_ai != 'true' && secrets.GROQ_API_KEY_3 || '' }}
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}

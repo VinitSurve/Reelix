@@ -52,6 +52,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import app.reelix.cloud.CloudSyncRepository
 import app.reelix.core.url.SafeUrlOpener
 import app.reelix.data.repository.SavedItemRepository
 import app.reelix.domain.model.ItemListEntry
@@ -64,18 +65,29 @@ import app.reelix.processing.ProcessingScheduler
 import app.reelix.processing.WorkerQueueState
 import app.reelix.ui.components.SaveLinkDialog
 import app.reelix.ui.components.SavedItemCard
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class HomeViewModel(
     repository: SavedItemRepository,
     private val shareIntake: ShareIntakeUseCase,
     private val scheduler: ProcessingScheduler,
+    private val cloudSyncRepository: CloudSyncRepository? = null,
 ) : ViewModel() {
+
+    init {
+        if (cloudSyncRepository != null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { cloudSyncRepository.syncCompletedJobs() }
+            }
+        }
+    }
 
     val counts: StateFlow<LibraryCounts> = repository.observeCounts()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryCounts())
@@ -110,8 +122,18 @@ class HomeViewModel(
 
     fun syncNow() {
         viewModelScope.launch {
-            scheduler.scheduleImmediate(forceRunNow = true)
             _feedback.value = "Syncing vault with Google Drive..."
+            if (cloudSyncRepository != null) {
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        val synced = cloudSyncRepository.syncCompletedJobs()
+                        if (synced > 0) {
+                            _feedback.value = "Synced $synced item(s) from Google Drive"
+                        }
+                    }
+                }
+            }
+            scheduler.scheduleImmediate(forceRunNow = true)
         }
     }
 
@@ -124,10 +146,11 @@ class HomeViewModel(
             repository: SavedItemRepository,
             shareIntake: ShareIntakeUseCase,
             scheduler: ProcessingScheduler,
+            cloudSyncRepository: CloudSyncRepository? = null,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                HomeViewModel(repository, shareIntake, scheduler) as T
+                HomeViewModel(repository, shareIntake, scheduler, cloudSyncRepository) as T
         }
     }
 }

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 
 # Strictly restricted allowlist:
@@ -20,6 +20,10 @@ class WorkerConfig:
     # Google Gemini AI settings (Strictly restricted to gemini-3.6-flash and gemini-3.8-flash on Free Tier)
     gemini_api_key: Optional[str] = None
     gemini_model: str = DEFAULT_GEMINI_MODEL
+
+    # Groq AI fallback settings (Llama 3.3 70B Versatile / Llama 3.1 8B Instant with 3-key rotation)
+    groq_api_keys: List[str] = field(default_factory=list)
+    groq_model: str = "llama-3.3-70b-versatile"
 
     # Google Drive persistent storage settings (OAuth 2.0 on behalf of personal Google account)
     gdrive_client_id: Optional[str] = None
@@ -64,9 +68,22 @@ class WorkerConfig:
         work_dir = Path(work_dir_env)
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        groq_keys: List[str] = []
+        for env_var in ("GROQ_API_KEY_1", "GROQ_API_KEY_2", "GROQ_API_KEY_3"):
+            val = os.getenv(env_var)
+            if val and val.strip():
+                groq_keys.append(val.strip())
+        raw_extra = os.getenv("GROQ_API_KEYS")
+        if raw_extra:
+            for k in raw_extra.split(","):
+                if k.strip() and k.strip() not in groq_keys:
+                    groq_keys.append(k.strip())
+
         return cls(
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+            groq_api_keys=groq_keys,
+            groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
             gdrive_client_id=os.getenv("GDRIVE_CLIENT_ID"),
             gdrive_client_secret=os.getenv("GDRIVE_CLIENT_SECRET"),
             gdrive_refresh_token=os.getenv("GDRIVE_REFRESH_TOKEN"),

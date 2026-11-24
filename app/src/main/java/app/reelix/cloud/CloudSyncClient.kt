@@ -498,8 +498,8 @@ class GoogleDriveCloudClient(
                     if (resp.isSuccessful) {
                         val body = resp.body?.string().orEmpty()
                         val manifest = CloudJobManifest.fromJson(body)
-                        // Return settled & active manifests (COMPLETED, PARTIAL, FAILED, WAITING_RETRY, PROCESSING) for honest synchronization
-                        if (manifest.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY", "PROCESSING")) {
+                        // Return settled & active manifests (COMPLETED, PARTIAL, FAILED, WAITING_RETRY, PROCESSING, QUEUED) for honest synchronization
+                        if (manifest.status in listOf("COMPLETED", "PARTIAL", "FAILED", "WAITING_RETRY", "PROCESSING", "QUEUED")) {
                             settled.add(manifest)
                         }
                     }

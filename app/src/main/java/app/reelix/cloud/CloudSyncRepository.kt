@@ -247,6 +247,18 @@ class CloudSyncRepository(
 
         val userTags = db.tagDao().tagsForItem(itemId).map { it.name }
         val remoteManifest = cloudClient.fetchJobManifest(itemId)
+        if (remoteManifest != null && remoteManifest.status == "QUEUED") {
+            ReelixLog.d("Item $itemId is already confirmed QUEUED on Google Drive queue; avoiding redundant re-upload")
+            val confirmedNow = clock.now()
+            itemDao.updateProcessingStatus(
+                id = itemId,
+                status = ProcessingStatus.QUEUED,
+                nextAttemptAt = null,
+                lastError = null,
+                now = confirmedNow,
+            )
+            return@withContext true
+        }
         val manifest = if (remoteManifest != null && (remoteManifest.status == "PROCESSING" || remoteManifest.status == "COMPLETED")) {
             // Safe resubmit: preserve active or completed status and stage results
             ReelixLog.d("Preserving remote ${remoteManifest.status} status for item $itemId during resubmission")
@@ -508,14 +520,27 @@ class CloudSyncRepository(
                         }
                     }
                     "PROCESSING" -> {
+                        itemDao.updateProcessingStatus(
+                            id = manifest.itemId,
+                            status = ProcessingStatus.PROCESSING,
+                            nextAttemptAt = null,
+                            lastError = null,
+                            now = now,
+                        )
+                        // Sync granular running stages for accurate UI reflection
+                        if (manifest.stages.acquisition == "RUNNING") {
+                            itemDao.setExtractionStatus(manifest.itemId, StageStatus.RUNNING, now)
+                        }
+                        if (manifest.stages.audioExtraction == "RUNNING") {
+                            itemDao.setAudioExtractionStatus(manifest.itemId, StageStatus.RUNNING, now)
+                        }
+                        if (manifest.stages.transcription == "RUNNING") {
+                            itemDao.setTranscriptionStatus(manifest.itemId, StageStatus.RUNNING, now)
+                        }
+                        if (manifest.stages.geminiAnalysis == "RUNNING") {
+                            itemDao.setAnalysisStatus(manifest.itemId, StageStatus.RUNNING, now)
+                        }
                         if (item.processingStatus != ProcessingStatus.PROCESSING) {
-                            itemDao.updateProcessingStatus(
-                                id = manifest.itemId,
-                                status = ProcessingStatus.PROCESSING,
-                                nextAttemptAt = null,
-                                lastError = null,
-                                now = now,
-                            )
                             processingDao.insertEvent(
                                 ProcessingEventEntity(
                                     savedItemId = manifest.itemId,
@@ -524,6 +549,17 @@ class CloudSyncRepository(
                                     message = "Job claimed by cloud worker (${manifest.claimedBy ?: "active"}); processing in progress",
                                     createdAt = now,
                                 ),
+                            )
+                        }
+                    }
+                    "QUEUED" -> {
+                        if (item.processingStatus != ProcessingStatus.QUEUED) {
+                            itemDao.updateProcessingStatus(
+                                id = manifest.itemId,
+                                status = ProcessingStatus.QUEUED,
+                                nextAttemptAt = null,
+                                lastError = null,
+                                now = now,
                             )
                         }
                     }

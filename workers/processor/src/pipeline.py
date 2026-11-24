@@ -202,6 +202,7 @@ class CloudProcessingPipeline:
         self.gemini_analyzer = gemini_analyzer or GeminiAnalyzer(
             api_key=config.gemini_api_key,
             model=config.gemini_model,
+            groq_api_keys=config.groq_api_keys,
         )
         self.downloader = downloader or YtDlpDownloader()
         self.ocr_extractor = ocr_extractor or VisualTextExtractor()
