@@ -208,7 +208,7 @@ def run_diagnostics(
     try:
         # Query A: All untrashed files in jobs folder
         q_all = f"'{jobs_folder_id}' in parents and trashed = false"
-        all_res = service.files().list(q=q_all, fields="files(id, name, size, modifiedTime)").execute()
+        all_res = service.files().list(q=q_all, fields="files(id, name, size, createdTime, modifiedTime)").execute()
         all_files = all_res.get("files", [])
         report["total_files_in_jobs"] = len(all_files)
 
@@ -234,6 +234,8 @@ def run_diagnostics(
         for f in all_files:
             fname = f.get("name", "")
             fid = f.get("id", "")
+            created_time = f.get("createdTime", "")
+            mod_time = f.get("modifiedTime", "")
             if not fname.endswith(".json"):
                 print(f"  • Non-manifest file skipped: {fname} ({format_id(fid)})")
                 continue
@@ -247,6 +249,11 @@ def run_diagnostics(
                 claimed_by = data.get("claimed_by", "<none>")
                 retry_count = data.get("retry_count", 0)
                 original_url = data.get("original_url", "<no url>")
+                created_at = data.get("created_at")
+                updated_at = data.get("updated_at")
+                generation = data.get("generation", 1)
+                stages = data.get("stages", {})
+                caption = (data.get("caption") or "")[:60]
 
                 status_counts[status] = status_counts.get(status, 0) + 1
                 report["manifests"].append({
@@ -256,11 +263,31 @@ def run_diagnostics(
                     "claimed_by": claimed_by,
                     "retry_count": retry_count,
                     "original_url": original_url,
+                    "created_time": created_time,
+                    "modified_time": mod_time,
+                    "generation": generation,
                 })
-                print(f"  • [{status:12}] item={item_id} | retries={retry_count} | claimed_by={claimed_by} | url={original_url}")
+                print(f"  • [{status:12}] item={item_id} | gen={generation} | retries={retry_count} | DriveMod={mod_time} | url={original_url}")
+                print(f"      stages={stages} | caption='{caption}'")
             except Exception as parse_err:
                 status_counts["PARSE_ERROR"] = status_counts.get("PARSE_ERROR", 0) + 1
                 print(f"  • [PARSE_ERROR] file={fname} ({format_id(fid)}): {parse_err}")
+
+        # 7. Check recent files in other subfolders (media, transitions)
+        for sub_name in ["media", "transition_intents", "transitions", "audio"]:
+            try:
+                q_sub_files = f"name = '{sub_name}' and '{effective_root}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+                sf_res = service.files().list(q=q_sub_files, fields="files(id)").execute()
+                sf_list = sf_res.get("files", [])
+                if sf_list:
+                    sf_id = sf_list[0]["id"]
+                    q_f = f"'{sf_id}' in parents and trashed = false"
+                    recent_res = service.files().list(q=q_f, pageSize=10, orderBy="modifiedTime desc", fields="files(id, name, size, createdTime, modifiedTime)").execute()
+                    print(f"\nRecent files in {sub_name}/ ({len(recent_res.get('files', []))} listed):")
+                    for rf in recent_res.get("files", []):
+                        print(f"  • {rf.get('name')} (size={rf.get('size')}, mod={rf.get('modifiedTime')})")
+            except Exception as ex:
+                print(f"Could not inspect subfolder {sub_name}: {ex}")
 
         report["summary"] = status_counts
         print(f"\nManifest Status Summary:")
