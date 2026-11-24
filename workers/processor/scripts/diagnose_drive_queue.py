@@ -118,6 +118,23 @@ def run_diagnostics(
     # 1. Compare folder identities if Android folder info provided
     print("\n--- 1. FOLDER IDENTITY VERIFICATION ---")
     print(f"GitHub Actions GDRIVE_FOLDER_ID: {format_id(gdrive_folder_id or '')}")
+
+    # Check ALL files created or modified in Drive in the last 3 hours
+    print("\n--- 1b. RECENT DRIVE FILES (LAST 3 HOURS) ---")
+    try:
+        q_recent = "trashed = false and modifiedTime > '2026-11-24T14:00:00Z'"
+        recent_res = service.files().list(
+            q=q_recent,
+            pageSize=30,
+            orderBy="modifiedTime desc",
+            fields="files(id, name, mimeType, parents, createdTime, modifiedTime)"
+        ).execute()
+        rec_files = recent_res.get("files", [])
+        print(f"Total files touched in Drive in last 3 hours: {len(rec_files)}")
+        for rf in rec_files:
+            print(f"  • {rf.get('name')} | id={mask_id(rf.get('id', ''))} | mod={rf.get('modifiedTime')} | parents={rf.get('parents')}")
+    except Exception as ex:
+        print(f"Error querying recent files: {ex}")
     if android_folder_id:
         print(f"Android Reported Folder ID:    {format_id(android_folder_id)}")
         is_match = (gdrive_folder_id or "").strip() == android_folder_id.strip()
