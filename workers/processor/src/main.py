@@ -11,7 +11,7 @@ import sys
 import time
 
 from .config import WorkerConfig
-from .models import JobResults, JobStatus, StageStates, StageStatus, fold_transitions
+from .models import JobManifest, JobResults, JobStatus, StageStates, StageStatus, fold_transitions
 from .pipeline import CloudProcessingPipeline
 from .storage.drive_client import GoogleDriveStorageClient
 from .storage.firestore_client import FirestoreJobCoordinator

@@ -1008,6 +1008,14 @@ class TestPipeline(unittest.TestCase):
                 code_missing = main(["--item-id", "non-existent-item"])
                 self.assertEqual(1, code_missing)
 
+                # Valid shortcode not previously in storage dynamically creates manifest
+                with patch("workers.processor.src.pipeline.CloudProcessingPipeline.process_job", return_value=True):
+                    code_dynamic = main(["--item-id", "Dc_bjs4z0Y9"])
+                    self.assertEqual(0, code_dynamic)
+                    dyn_job = self.storage.get_job("Dc_bjs4z0Y9")
+                    self.assertIsNotNone(dyn_job)
+                    self.assertEqual("https://www.instagram.com/reel/Dc_bjs4z0Y9/", dyn_job.original_url)
+
     def test_pipeline_heartbeat_renewal_during_execution(self):
         job = JobManifest(
             item_id="item-hb-test",
