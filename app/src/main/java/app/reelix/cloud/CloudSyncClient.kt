@@ -446,7 +446,7 @@ class GoogleDriveCloudClient(
     }
 
     override suspend fun fetchJobManifest(itemId: String): CloudJobManifest? = withContext(Dispatchers.IO) {
-        val token = tokenProvider() ?: return@withContext null
+        var token = tokenProvider() ?: return@withContext null
         val configuredFolder = folderIdProvider()
         val rootFolderId = if (!configuredFolder.isNullOrBlank()) configuredFolder else ensureVaultFolder(token)
 
@@ -455,17 +455,27 @@ class GoogleDriveCloudClient(
             val fileId = findFileInFolder("${itemId}.json", jobsFolderId, token) ?: return@withContext null
 
             val getUrl = "https://www.googleapis.com/drive/v3/files/$fileId?alt=media"
-            val request = Request.Builder()
+            fun buildGetReq(tok: String) = Request.Builder()
                 .url(getUrl)
-                .addHeader("Authorization", "Bearer $token")
+                .addHeader("Authorization", "Bearer $tok")
                 .get()
                 .build()
 
-            client.newCall(request).execute().use { resp ->
-                if (!resp.isSuccessful) return@withContext null
-                val body = resp.body?.string() ?: return@withContext null
+            var resp = client.newCall(buildGetReq(token)).execute()
+            if (resp.code == 401 && tokenRefresher != null) {
+                resp.close()
+                val refreshed = tokenRefresher.invoke()
+                if (!refreshed.isNullOrBlank()) {
+                    token = refreshed
+                    resp = client.newCall(buildGetReq(token)).execute()
+                }
+            }
+
+            resp.use { response ->
+                if (!response.isSuccessful) return@withContext null
+                val body = response.body?.string() ?: return@withContext null
                 val parsed = CloudJobManifest.fromJson(body)
-                val headerEtag = resp.header("ETag")?.trim('"', ' ')?.takeIf { it.isNotBlank() }
+                val headerEtag = response.header("ETag")?.trim('"', ' ')?.takeIf { it.isNotBlank() }
                 if (parsed.etag == null && headerEtag != null) {
                     parsed.copy(etag = headerEtag)
                 } else {
@@ -479,7 +489,7 @@ class GoogleDriveCloudClient(
     }
 
     override suspend fun listCompletedJobs(): List<CloudJobManifest> = withContext(Dispatchers.IO) {
-        val token = tokenProvider() ?: return@withContext emptyList()
+        var token = tokenProvider() ?: return@withContext emptyList()
         val configuredFolder = folderIdProvider()
         val rootFolderId = if (!configuredFolder.isNullOrBlank()) configuredFolder else ensureVaultFolder(token)
 
@@ -490,13 +500,23 @@ class GoogleDriveCloudClient(
             do {
                 val pageQuery = if (pageToken != null) "&pageToken=$pageToken" else ""
                 val listUrl = "https://www.googleapis.com/drive/v3/files?q='${jobsFolderId}'+in+parents+and+trashed=false&fields=nextPageToken,files(id,name)&pageSize=50$pageQuery"
-                val request = Request.Builder()
+                fun buildListReq(tok: String) = Request.Builder()
                     .url(listUrl)
-                    .addHeader("Authorization", "Bearer $token")
+                    .addHeader("Authorization", "Bearer $tok")
                     .get()
                     .build()
 
-                pageToken = client.newCall(request).execute().use { resp ->
+                var listResp = client.newCall(buildListReq(token)).execute()
+                if (listResp.code == 401 && tokenRefresher != null) {
+                    listResp.close()
+                    val refreshed = tokenRefresher.invoke()
+                    if (!refreshed.isNullOrBlank()) {
+                        token = refreshed
+                        listResp = client.newCall(buildListReq(token)).execute()
+                    }
+                }
+
+                pageToken = listResp.use { resp ->
                     if (!resp.isSuccessful) return@use null
                     val json = JSONObject(resp.body?.string().orEmpty())
                     val arr = json.optJSONArray("files")
@@ -515,8 +535,17 @@ class GoogleDriveCloudClient(
             for ((id, name) in files) {
                 if (!name.endsWith(".json")) continue
                 val contentUrl = "https://www.googleapis.com/drive/v3/files/$id?alt=media"
-                val fetchReq = Request.Builder().url(contentUrl).addHeader("Authorization", "Bearer $token").get().build()
-                client.newCall(fetchReq).execute().use { resp ->
+                fun buildContentReq(tok: String) = Request.Builder().url(contentUrl).addHeader("Authorization", "Bearer $tok").get().build()
+                var fetchResp = client.newCall(buildContentReq(token)).execute()
+                if (fetchResp.code == 401 && tokenRefresher != null) {
+                    fetchResp.close()
+                    val refreshed = tokenRefresher.invoke()
+                    if (!refreshed.isNullOrBlank()) {
+                        token = refreshed
+                        fetchResp = client.newCall(buildContentReq(token)).execute()
+                    }
+                }
+                fetchResp.use { resp ->
                     if (resp.isSuccessful) {
                         val body = resp.body?.string().orEmpty()
                         val manifest = CloudJobManifest.fromJson(body)
@@ -909,7 +938,8 @@ class GoogleDriveCloudClient(
         return createOrGetVaultFolder().getOrThrow()
     }
 
-    private fun ensureSubfolder(name: String, parentId: String, token: String): String {
+    private suspend fun ensureSubfolder(name: String, parentId: String, initialToken: String): String {
+        var token = initialToken
         val found = findFolderInParent(name, parentId, token)
         if (found != null) return found
 
@@ -918,53 +948,105 @@ class GoogleDriveCloudClient(
             put("mimeType", "application/vnd.google-apps.folder")
             put("parents", org.json.JSONArray().put(parentId))
         }
-        val request = Request.Builder()
+        fun buildCreateReq(tok: String) = Request.Builder()
             .url("https://www.googleapis.com/drive/v3/files")
-            .addHeader("Authorization", "Bearer $token")
+            .addHeader("Authorization", "Bearer $tok")
             .post(meta.toString().toByteArray().toRequestBody("application/json".toMediaType()))
             .build()
-        client.newCall(request).execute().use { resp ->
-            val json = JSONObject(resp.body?.string().orEmpty())
-            return json.getString("id")
+
+        var resp = client.newCall(buildCreateReq(token)).execute()
+        if (resp.code == 401 && tokenRefresher != null) {
+            resp.close()
+            val refreshed = tokenRefresher.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+                val retryFound = findFolderInParent(name, parentId, token)
+                if (retryFound != null) return retryFound
+                resp = client.newCall(buildCreateReq(token)).execute()
+            }
+        }
+
+        resp.use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val errorMsg = parseDriveErrorMessage(response.code, body)
+                throw java.io.IOException("Google Drive ensureSubfolder failed for '$name' ($errorMsg)")
+            }
+            val json = JSONObject(body)
+            val id = json.optString("id")
+            if (id.isNullOrBlank()) {
+                throw java.io.IOException("Google Drive returned invalid or empty subfolder ID for '$name'")
+            }
+            return id
         }
     }
 
-    private fun findFolderInParent(name: String, parentId: String, token: String): String? {
+    private suspend fun findFolderInParent(name: String, parentId: String, initialToken: String): String? {
+        var token = initialToken
         val q = "name = '$name' and mimeType = 'application/vnd.google-apps.folder' and '$parentId' in parents and trashed = false"
         val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
-        val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $token").get().build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val json = JSONObject(resp.body?.string().orEmpty())
+        fun buildReq(tok: String) = Request.Builder().url(url).addHeader("Authorization", "Bearer $tok").get().build()
+        var resp = client.newCall(buildReq(token)).execute()
+        if (resp.code == 401 && tokenRefresher != null) {
+            resp.close()
+            val refreshed = tokenRefresher.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+                resp = client.newCall(buildReq(token)).execute()
+            }
+        }
+        resp.use { response ->
+            if (!response.isSuccessful) return null
+            val json = JSONObject(response.body?.string().orEmpty())
             val arr = json.optJSONArray("files") ?: return null
             if (arr.length() == 0) return null
-            return arr.getJSONObject(0).getString("id")
+            return arr.getJSONObject(0).optString("id").takeIf { it.isNotBlank() }
         }
     }
 
-    private fun findMediaFileByItemId(itemId: String, folderId: String, token: String): String? {
+    private suspend fun findMediaFileByItemId(itemId: String, folderId: String, initialToken: String): String? {
+        var token = initialToken
         val q = "'$folderId' in parents and appProperties has { key='reelix_item_id' and value='$itemId' } and trashed = false"
         val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id,name,appProperties)"
-        val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $token").get().build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val json = JSONObject(resp.body?.string().orEmpty())
+        fun buildReq(tok: String) = Request.Builder().url(url).addHeader("Authorization", "Bearer $tok").get().build()
+        var resp = client.newCall(buildReq(token)).execute()
+        if (resp.code == 401 && tokenRefresher != null) {
+            resp.close()
+            val refreshed = tokenRefresher.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+                resp = client.newCall(buildReq(token)).execute()
+            }
+        }
+        resp.use { response ->
+            if (!response.isSuccessful) return null
+            val json = JSONObject(response.body?.string().orEmpty())
             val arr = json.optJSONArray("files") ?: return null
             if (arr.length() == 0) return null
-            return arr.getJSONObject(0).getString("id")
+            return arr.getJSONObject(0).optString("id").takeIf { it.isNotBlank() }
         }
     }
 
-    private fun findFileInFolder(name: String, folderId: String, token: String): String? {
+    private suspend fun findFileInFolder(name: String, folderId: String, initialToken: String): String? {
+        var token = initialToken
         val q = "name = '$name' and '$folderId' in parents and trashed = false"
         val url = "https://www.googleapis.com/drive/v3/files?q=${URLEncoder.encode(q, "UTF-8")}&fields=files(id)"
-        val req = Request.Builder().url(url).addHeader("Authorization", "Bearer $token").get().build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val json = JSONObject(resp.body?.string().orEmpty())
+        fun buildReq(tok: String) = Request.Builder().url(url).addHeader("Authorization", "Bearer $tok").get().build()
+        var resp = client.newCall(buildReq(token)).execute()
+        if (resp.code == 401 && tokenRefresher != null) {
+            resp.close()
+            val refreshed = tokenRefresher.invoke()
+            if (!refreshed.isNullOrBlank()) {
+                token = refreshed
+                resp = client.newCall(buildReq(token)).execute()
+            }
+        }
+        resp.use { response ->
+            if (!response.isSuccessful) return null
+            val json = JSONObject(response.body?.string().orEmpty())
             val arr = json.optJSONArray("files") ?: return null
             if (arr.length() == 0) return null
-            return arr.getJSONObject(0).getString("id")
+            return arr.getJSONObject(0).optString("id").takeIf { it.isNotBlank() }
         }
     }
 }

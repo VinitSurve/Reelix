@@ -47,6 +47,9 @@ interface SettingsRepository {
     suspend fun clearCloudDriveCredentials() {
         setCloudDriveCredentials(accessToken = null, refreshToken = null, clientId = null, clientSecret = null)
     }
+    suspend fun invalidateCloudDriveAccessToken() {
+        clearCloudDriveCredentials()
+    }
     suspend fun refreshCloudDriveAccessToken(): String?
     suspend fun getValidDriveAccessToken(): String?
     suspend fun saveTestProbe(folderId: String, fileId: String, folderName: String) {
@@ -105,6 +108,7 @@ class DataStoreSettingsRepository(
         val lastTestProbeFolderId = stringPreferencesKey("last_test_probe_folder_id")
         val lastTestProbeFileId = stringPreferencesKey("last_test_probe_file_id")
         val lastTestProbeFolderName = stringPreferencesKey("last_test_probe_folder_name")
+        val cloudDriveTokenExpiresAt = longPreferencesKey("cloud_drive_token_expires_at")
     }
 
     override val settings: Flow<AppSettings> = dataStore.data
@@ -241,8 +245,10 @@ class DataStoreSettingsRepository(
     override suspend fun saveCloudDriveAccessToken(accessToken: String) {
         if (accessToken.isNotBlank()) {
             secretStore.put(CLOUD_DRIVE_TOKEN_ALIAS, accessToken.trim())
+            val expiry = System.currentTimeMillis() + 3300_000L // 55 mins (5m safety buffer)
             dataStore.edit { p ->
                 p[Keys.cloudProcessingEnabled] = p[Keys.cloudProcessingEnabled] ?: false
+                p[Keys.cloudDriveTokenExpiresAt] = expiry
             }
         }
     }
@@ -254,7 +260,13 @@ class DataStoreSettingsRepository(
         secretStore.remove(CLOUD_DRIVE_CLIENT_SECRET_ALIAS)
         dataStore.edit { p ->
             p[Keys.cloudProcessingEnabled] = false
+            p.remove(Keys.cloudDriveTokenExpiresAt)
         }
+    }
+
+    override suspend fun invalidateCloudDriveAccessToken() {
+        secretStore.remove(CLOUD_DRIVE_TOKEN_ALIAS)
+        dataStore.edit { it.remove(Keys.cloudDriveTokenExpiresAt) }
     }
 
     override suspend fun refreshCloudDriveAccessToken(): String? = withContext(Dispatchers.IO) {
@@ -262,7 +274,9 @@ class DataStoreSettingsRepository(
         if (context != null && googleDriveAuthManager != null) {
             val nativeToken = googleDriveAuthManager.silentRefresh(context)
             if (!nativeToken.isNullOrBlank()) {
+                val expiry = System.currentTimeMillis() + 3300_000L
                 secretStore.put(CLOUD_DRIVE_TOKEN_ALIAS, nativeToken)
+                dataStore.edit { it[Keys.cloudDriveTokenExpiresAt] = expiry }
                 ReelixLog.d("Successfully refreshed Google Drive token via native AuthorizationClient")
                 return@withContext nativeToken
             }
@@ -294,7 +308,9 @@ class DataStoreSettingsRepository(
                 val json = JSONObject(body)
                 val newAccessToken = json.optString("access_token")
                 if (newAccessToken.isNotBlank()) {
+                    val expiry = System.currentTimeMillis() + 3300_000L
                     secretStore.put(CLOUD_DRIVE_TOKEN_ALIAS, newAccessToken)
+                    dataStore.edit { it[Keys.cloudDriveTokenExpiresAt] = expiry }
                     ReelixLog.d("Successfully refreshed Google Drive OAuth access token")
                     return@withContext newAccessToken
                 }
@@ -308,8 +324,16 @@ class DataStoreSettingsRepository(
 
     override suspend fun getValidDriveAccessToken(): String? {
         val current = cloudDriveAccessToken()
-        if (!current.isNullOrBlank()) return current
-        return refreshCloudDriveAccessToken()
+        val expiresAt = dataStore.data.first()[Keys.cloudDriveTokenExpiresAt] ?: 0L
+        val isExpired = current.isNullOrBlank() || (expiresAt > 0L && System.currentTimeMillis() >= expiresAt)
+        if (!isExpired && !current.isNullOrBlank()) {
+            return current
+        }
+        val refreshed = refreshCloudDriveAccessToken()
+        if (!refreshed.isNullOrBlank()) {
+            return refreshed
+        }
+        return if (!current.isNullOrBlank()) current else null
     }
 
     override suspend fun recordRun(at: Long, summary: String) {
