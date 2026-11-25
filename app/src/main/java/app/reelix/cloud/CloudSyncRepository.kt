@@ -431,6 +431,14 @@ class CloudSyncRepository(
                     itemDao.setTranscriptionStatus(targetItemId, StageStatus.SUCCEEDED, now)
                 }
 
+                if (manifest.stages.acquisition == "SUCCEEDED" || manifest.status == "COMPLETED") {
+                    itemDao.setExtractionStatus(targetItemId, StageStatus.SUCCEEDED, now)
+                } else if (manifest.stages.acquisition == "SKIPPED") {
+                    itemDao.setExtractionStatus(targetItemId, StageStatus.SKIPPED, now)
+                } else if (manifest.stages.acquisition == "FAILED") {
+                    itemDao.setExtractionStatus(targetItemId, StageStatus.FAILED, now)
+                }
+
                 if (manifest.stages.audioExtraction == "SUCCEEDED") {
                     itemDao.setAudioExtractionStatus(targetItemId, StageStatus.SUCCEEDED, now)
                 } else if (manifest.stages.audioExtraction == "FAILED") {
@@ -506,6 +514,7 @@ class CloudSyncRepository(
                         if ((hasAnalysis || aiSkippedOrNotConfigured) && (!expectedAudio || hasTranscript)) {
                             // Truly completed (fully processed with AI or processed without AI analysis)
                             itemDao.markCompleted(targetItemId, now)
+                            itemDao.setExtractionStatus(targetItemId, StageStatus.SUCCEEDED, now)
                             indexer.reindex(targetItemId)
                             val message = if (hasAnalysis) {
                                 "Synchronized complete transcripts & Gemini analysis from GitHub Actions cloud worker"
