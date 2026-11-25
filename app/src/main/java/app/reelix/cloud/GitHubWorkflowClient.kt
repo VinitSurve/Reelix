@@ -23,6 +23,19 @@ sealed class WorkflowDispatchResult {
     data class Failure(val message: String, val statusCode: Int? = null) : WorkflowDispatchResult()
 }
 
+sealed class TokenValidationResult {
+    data class Success(
+        val username: String?,
+        val workflowName: String?,
+        val repoAccessible: Boolean,
+    ) : TokenValidationResult()
+
+    data class Failure(
+        val message: String,
+        val statusCode: Int? = null,
+    ) : TokenValidationResult()
+}
+
 /**
  * Client for triggering GitHub Actions workflows via the REST API (`workflow_dispatch`).
  *
@@ -172,6 +185,97 @@ open class GitHubWorkflowClient(
             ReelixLog.w("Failed to fetch latest workflow run info", e)
             null
         }
+    }
+
+    /**
+     * Validates a GitHub Personal Access Token against the repository and workflow.
+     *
+     * Queries `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}` to verify:
+     * 1. Token authentication succeeds (HTTP 200)
+     * 2. Token has permissions to access this repository and its Actions workflows
+     * 3. Fetches authenticated username if permitted by token scope
+     */
+    open suspend fun validateToken(
+        token: String,
+        repo: String = "VinitSurve/Reelix",
+        workflowId: String = "process-queue.yml",
+    ): TokenValidationResult = withContext(Dispatchers.IO) {
+        val trimmed = token.trim()
+        if (trimmed.isBlank()) {
+            return@withContext TokenValidationResult.Failure("Token cannot be blank.", 400)
+        }
+        val cleanRepo = repo.trim().removePrefix("https://github.com/").trim('/')
+        if (!cleanRepo.contains('/')) {
+            return@withContext TokenValidationResult.Failure("Invalid repository format '$cleanRepo'. Expected 'owner/repo'.", 400)
+        }
+        val cleanWorkflow = workflowId.trim().ifBlank { "process-queue.yml" }
+        val rootUrl = baseUrl.trimEnd('/')
+
+        val url = "$rootUrl/repos/$cleanRepo/actions/workflows/$cleanWorkflow"
+        val request = Request.Builder()
+            .url(url)
+            .get()
+            .header("Authorization", "Bearer $trimmed")
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .build()
+
+        try {
+            httpClient.newCall(request).execute().use { response ->
+                when (response.code) {
+                    200 -> {
+                        val body = response.body?.string().orEmpty()
+                        val workflowName = runCatching {
+                            JSONObject(body).optString("name").takeIf { it.isNotBlank() }
+                        }.getOrNull()
+                        val username = fetchUserLogin(trimmed)
+                        TokenValidationResult.Success(
+                            username = username,
+                            workflowName = workflowName,
+                            repoAccessible = true,
+                        )
+                    }
+                    401 -> TokenValidationResult.Failure(
+                        "Invalid or expired GitHub Personal Access Token (HTTP 401). Check the token.",
+                        401,
+                    )
+                    403 -> TokenValidationResult.Failure(
+                        "Token lacks required 'Actions: Read and write' permission on $cleanRepo (HTTP 403).",
+                        403,
+                    )
+                    404 -> TokenValidationResult.Failure(
+                        "Repository '$cleanRepo' or workflow '$cleanWorkflow' not accessible with this token (HTTP 404).",
+                        404,
+                    )
+                    else -> {
+                        val body = response.body?.string().orEmpty()
+                        val msg = parseErrorMessage(body) ?: "GitHub API returned HTTP ${response.code}"
+                        TokenValidationResult.Failure(msg, response.code)
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            TokenValidationResult.Failure("Network error checking token: ${e.message ?: e.javaClass.simpleName}")
+        } catch (e: Exception) {
+            TokenValidationResult.Failure("Unexpected error checking token: ${e.message ?: e.javaClass.simpleName}")
+        }
+    }
+
+    private fun fetchUserLogin(token: String): String? {
+        return runCatching {
+            val req = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/user")
+                .get()
+                .header("Authorization", "Bearer $token")
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    JSONObject(resp.body?.string().orEmpty()).optString("login").takeIf { it.isNotBlank() }
+                } else null
+            }
+        }.getOrNull()
     }
 
     private fun parseErrorMessage(body: String): String? {

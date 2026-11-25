@@ -3,6 +3,7 @@ package app.reelix
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import app.reelix.cloud.GitHubWorkflowClient
+import app.reelix.cloud.TokenValidationResult
 import app.reelix.cloud.WorkflowDispatchResult
 import app.reelix.cloud.WorkflowRunInfo
 import app.reelix.ui.screens.settings.SettingsViewModel
@@ -16,6 +17,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -328,5 +330,173 @@ class GitHubWorkflowClientTest {
 
         val feedbackMsg = viewModel.feedback.first { it != null }
         assertEquals("Background processing triggered locally.", feedbackMsg)
+    }
+
+    @Test
+    fun `validateToken returns success when workflow is found and user info is queried`() = runTest {
+        // Enqueue 200 for workflow endpoint
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("{\"id\":12345,\"name\":\"Process Reelix Queue\",\"state\":\"active\"}")
+        )
+        // Enqueue 200 for /user endpoint
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("{\"login\":\"VinitSurve\",\"id\":67890}")
+        )
+
+        val serverClient = GitHubWorkflowClient(
+            httpClient = OkHttpClient(),
+            baseUrl = server.url("/").toString(),
+        )
+
+        val result = serverClient.validateToken("ghp_validToken", "VinitSurve/Reelix", "process-queue.yml")
+        assertTrue(result is TokenValidationResult.Success)
+        val success = result as TokenValidationResult.Success
+        assertEquals("VinitSurve", success.username)
+        assertEquals("Process Reelix Queue", success.workflowName)
+        assertTrue(success.repoAccessible)
+    }
+
+    @Test
+    fun `validateToken returns failure on HTTP 401 unauthorized`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(401)
+                .setBody("{\"message\":\"Bad credentials\"}")
+        )
+
+        val serverClient = GitHubWorkflowClient(
+            httpClient = OkHttpClient(),
+            baseUrl = server.url("/").toString(),
+        )
+
+        val result = serverClient.validateToken("ghp_badToken", "VinitSurve/Reelix", "process-queue.yml")
+        assertTrue(result is TokenValidationResult.Failure)
+        val failure = result as TokenValidationResult.Failure
+        assertEquals(401, failure.statusCode)
+        assertTrue(failure.message.contains("Invalid or expired"))
+    }
+
+    @Test
+    fun `validateToken returns failure on HTTP 403 lack of actions write permission`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(403)
+                .setBody("{\"message\":\"Resource not accessible by personal access token\"}")
+        )
+
+        val serverClient = GitHubWorkflowClient(
+            httpClient = OkHttpClient(),
+            baseUrl = server.url("/").toString(),
+        )
+
+        val result = serverClient.validateToken("ghp_noPermToken", "VinitSurve/Reelix", "process-queue.yml")
+        assertTrue(result is TokenValidationResult.Failure)
+        val failure = result as TokenValidationResult.Failure
+        assertEquals(403, failure.statusCode)
+        assertTrue(failure.message.contains("Actions: Read and write"))
+    }
+
+    @Test
+    fun `SettingsViewModel runQueueNow opens token setup dialog when token is missing`() = runTest {
+        container.fakeSettings.update {
+            it.copy(
+                cloudProcessingEnabled = true,
+                hasCloudDriveToken = true,
+            )
+        }
+        val viewModel = SettingsViewModel(
+            settingsRepository = container.settingsRepository,
+            savedItemRepository = container.savedItemRepository,
+            scheduler = container.processingScheduler,
+            storageInspector = container.storageInspector,
+            modelManager = container.transcriptionModelManager,
+            cloudSyncRepository = null,
+            gitHubWorkflowClient = client,
+            appContext = context,
+        )
+
+        assertFalse(viewModel.showGitHubTokenDialog.value)
+        viewModel.runQueueNow()
+        ShadowLooper.idleMainLooper()
+
+        assertTrue(viewModel.showGitHubTokenDialog.value)
+    }
+
+    @Test
+    fun `SettingsViewModel validateAndSaveGitHubToken validates, stores in Keystore, and triggers pending queue run`() = runTest {
+        container.fakeSettings.update {
+            it.copy(
+                cloudProcessingEnabled = true,
+                hasCloudDriveToken = true,
+            )
+        }
+
+        var dispatchedToken = ""
+        val mockClient = object : GitHubWorkflowClient(OkHttpClient()) {
+            override suspend fun validateToken(
+                token: String,
+                repo: String,
+                workflowId: String,
+            ): TokenValidationResult {
+                return TokenValidationResult.Success(
+                    username = "VinitSurve",
+                    workflowName = "Process Reelix Queue",
+                    repoAccessible = true,
+                )
+            }
+
+            override suspend fun dispatchWorkflow(
+                repo: String,
+                workflowId: String,
+                ref: String,
+                token: String,
+            ): WorkflowDispatchResult {
+                dispatchedToken = token
+                return WorkflowDispatchResult.Success(
+                    WorkflowRunInfo(
+                        id = 776655L,
+                        htmlUrl = "https://github.com/VinitSurve/Reelix/actions/runs/776655",
+                        status = "queued",
+                        conclusion = null,
+                        createdAt = "2026-11-25T06:00:00Z",
+                    )
+                )
+            }
+        }
+
+        val viewModel = SettingsViewModel(
+            settingsRepository = container.settingsRepository,
+            savedItemRepository = container.savedItemRepository,
+            scheduler = container.processingScheduler,
+            storageInspector = container.storageInspector,
+            modelManager = container.transcriptionModelManager,
+            cloudSyncRepository = null,
+            gitHubWorkflowClient = mockClient,
+            appContext = context,
+        )
+
+        // 1. User clicks run queue without token -> prompts dialog
+        viewModel.runQueueNow()
+        ShadowLooper.idleMainLooper()
+        assertTrue(viewModel.showGitHubTokenDialog.value)
+
+        // 2. User enters valid token in dialog and saves
+        viewModel.validateAndSaveGitHubToken(
+            token = "ghp_verifiedToken999",
+            repo = "VinitSurve/Reelix",
+            workflowId = "process-queue.yml",
+            ref = "main",
+        )
+        ShadowLooper.idleMainLooper()
+
+        // 3. Dialog is dismissed, token is saved, workflow is dispatched!
+        assertFalse(viewModel.showGitHubTokenDialog.value)
+        assertEquals("ghp_verifiedToken999", container.settingsRepository.githubToken())
+        assertEquals("ghp_verifiedToken999", dispatchedToken)
+        assertEquals(776655L, container.fakeSettings.current().lastDispatchedRunId)
     }
 }

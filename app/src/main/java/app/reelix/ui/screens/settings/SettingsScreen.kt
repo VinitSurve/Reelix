@@ -92,6 +92,11 @@ import app.reelix.processing.WorkerQueueState
 import app.reelix.ui.components.ConfirmDeleteDialog
 import app.reelix.ui.components.Formatters
 import app.reelix.ui.components.Pill
+import app.reelix.ui.components.ReelixModalDialog
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import app.reelix.cloud.TokenValidationResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -168,6 +173,73 @@ class SettingsViewModel(
 
     private val _probeError = MutableStateFlow<String?>(null)
     val probeError: StateFlow<String?> = _probeError.asStateFlow()
+
+    private val _showGitHubTokenDialog = MutableStateFlow(false)
+    val showGitHubTokenDialog: StateFlow<Boolean> = _showGitHubTokenDialog.asStateFlow()
+
+    private val _isValidatingGitHubToken = MutableStateFlow(false)
+    val isValidatingGitHubToken: StateFlow<Boolean> = _isValidatingGitHubToken.asStateFlow()
+
+    private val _gitHubTokenValidationResult = MutableStateFlow<TokenValidationResult?>(null)
+    val gitHubTokenValidationResult: StateFlow<TokenValidationResult?> = _gitHubTokenValidationResult.asStateFlow()
+
+    private var pendingQueueRunAfterTokenSave = false
+
+    fun openGitHubTokenDialog(fromQueueRun: Boolean = false) {
+        pendingQueueRunAfterTokenSave = fromQueueRun
+        _gitHubTokenValidationResult.value = null
+        _showGitHubTokenDialog.value = true
+    }
+
+    fun dismissGitHubTokenDialog() {
+        _showGitHubTokenDialog.value = false
+        _gitHubTokenValidationResult.value = null
+        pendingQueueRunAfterTokenSave = false
+    }
+
+    fun validateAndSaveGitHubToken(
+        token: String,
+        repo: String,
+        workflowId: String,
+        ref: String,
+    ) {
+        viewModelScope.launch {
+            val trimmed = token.trim()
+            if (trimmed.isBlank()) {
+                _gitHubTokenValidationResult.value = TokenValidationResult.Failure("Please enter a GitHub Personal Access Token.")
+                return@launch
+            }
+            _isValidatingGitHubToken.value = true
+            _gitHubTokenValidationResult.value = null
+            try {
+                val cleanRepo = repo.trim().ifBlank { AppSettings.DEFAULT_GITHUB_REPO }
+                val cleanWorkflow = workflowId.trim().ifBlank { AppSettings.DEFAULT_GITHUB_WORKFLOW_ID }
+                val cleanRef = ref.trim().ifBlank { AppSettings.DEFAULT_GITHUB_REF }
+
+                val result = gitHubWorkflowClient.validateToken(
+                    token = trimmed,
+                    repo = cleanRepo,
+                    workflowId = cleanWorkflow,
+                )
+                _gitHubTokenValidationResult.value = result
+                if (result is TokenValidationResult.Success) {
+                    settingsRepository.setGitHubToken(trimmed)
+                    settingsRepository.setGitHubWorkflowConfig(cleanRepo, cleanWorkflow, cleanRef)
+                    _showGitHubTokenDialog.value = false
+                    val userNote = result.username?.let { " for @$it" }.orEmpty()
+                    _feedback.value = "GitHub token verified$userNote and saved securely."
+                    if (pendingQueueRunAfterTokenSave) {
+                        pendingQueueRunAfterTokenSave = false
+                        runQueueNow()
+                    }
+                }
+            } catch (e: Exception) {
+                _gitHubTokenValidationResult.value = TokenValidationResult.Failure("Validation error: ${e.message}")
+            } finally {
+                _isValidatingGitHubToken.value = false
+            }
+        }
+    }
 
     init {
         refreshStorage()
@@ -442,6 +514,7 @@ class SettingsViewModel(
                 if (current.cloudProcessingEnabled) {
                     val token = settingsRepository.githubToken()
                     if (token.isNullOrBlank()) {
+                        openGitHubTokenDialog(fromQueueRun = true)
                         _feedback.value = "GitHub Personal Access Token required to dispatch cloud worker. Please configure your token in Cloud settings."
                         return@launch
                     }
@@ -798,6 +871,9 @@ fun SettingsScreen(
     var githubWorkflowInput by remember(settings.githubWorkflowId) { mutableStateOf(settings.githubWorkflowId) }
     var githubRefInput by remember(settings.githubRef) { mutableStateOf(settings.githubRef) }
     val isDispatchingWorkflow by viewModel.isDispatchingWorkflow.collectAsStateWithLifecycle()
+    val showGitHubTokenDialog by viewModel.showGitHubTokenDialog.collectAsStateWithLifecycle()
+    val isValidatingGitHubToken by viewModel.isValidatingGitHubToken.collectAsStateWithLifecycle()
+    val gitHubTokenValidationResult by viewModel.gitHubTokenValidationResult.collectAsStateWithLifecycle()
     val isSyncingCloud by viewModel.isSyncingCloud.collectAsStateWithLifecycle()
     val isConnectingDrive by viewModel.isConnectingDrive.collectAsStateWithLifecycle()
     val isCreatingVault by viewModel.isCreatingVault.collectAsStateWithLifecycle()
@@ -863,7 +939,7 @@ fun SettingsScreen(
                         KeyValueLine(
                             "Last batch run",
                             settings.lastRunAt?.let {
-                                "${Formatters.formatDateTime(it)} (${settings.lastRunSummary ?: "ok"})"
+                                "${Formatters.formatDateTime(it)}\n(${settings.lastRunSummary ?: "ok"})"
                             } ?: "Not run yet",
                         )
                         if (settings.lastDispatchedRunId != null) {
@@ -1432,11 +1508,11 @@ fun SettingsScreen(
                                     modifier = Modifier.size(18.dp),
                                 )
                                 Text(
-                                    text = "GitHub token configured (stored encrypted in Keystore)",
+                                    text = "GitHub token configured (AES-256-GCM in Keystore)",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.weight(1f),
                                 )
-                                Spacer(Modifier.weight(1f))
                                 TextButton(
                                     onClick = viewModel::removeGitHubToken,
                                     modifier = Modifier.testTag("remove_github_token_button"),
@@ -1454,10 +1530,30 @@ fun SettingsScreen(
                                     text = "GitHub token not configured",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.weight(1f),
                                 )
                             }
                         }
-                        Spacer(Modifier.height(6.dp))
+                        Spacer(Modifier.height(8.dp))
+
+                        OutlinedButton(
+                            onClick = { viewModel.openGitHubTokenDialog(fromQueueRun = false) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("open_github_token_dialog_button"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Link,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                if (settings.hasGitHubToken) "Update & Test Token (Guided)"
+                                else "Set up GitHub Token (Guided)"
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
 
                         OutlinedTextField(
                             value = githubTokenInput,
@@ -1909,7 +2005,292 @@ fun SettingsScreen(
                 onDismiss = { showClearConfirm = false },
             )
         }
+
+        if (showGitHubTokenDialog) {
+            GitHubTokenConfigDialog(
+                initialRepo = settings.githubRepo.ifBlank { AppSettings.DEFAULT_GITHUB_REPO },
+                initialWorkflowId = settings.githubWorkflowId.ifBlank { AppSettings.DEFAULT_GITHUB_WORKFLOW_ID },
+                initialRef = settings.githubRef.ifBlank { AppSettings.DEFAULT_GITHUB_REF },
+                isValidating = isValidatingGitHubToken,
+                validationResult = gitHubTokenValidationResult,
+                onDismiss = viewModel::dismissGitHubTokenDialog,
+                onSaveAndVerify = { token, repo, workflowId, ref ->
+                    viewModel.validateAndSaveGitHubToken(token, repo, workflowId, ref)
+                },
+            )
+        }
     }
+}
+
+@Composable
+private fun GitHubTokenConfigDialog(
+    initialRepo: String,
+    initialWorkflowId: String,
+    initialRef: String,
+    isValidating: Boolean,
+    validationResult: TokenValidationResult?,
+    onDismiss: () -> Unit,
+    onSaveAndVerify: (token: String, repo: String, workflowId: String, ref: String) -> Unit,
+) {
+    var tokenInput by rememberSaveable { mutableStateOf("") }
+    var repoInput by rememberSaveable { mutableStateOf(initialRepo) }
+    var workflowInput by rememberSaveable { mutableStateOf(initialWorkflowId) }
+    var refInput by rememberSaveable { mutableStateOf(initialRef) }
+    var isPasswordVisible by rememberSaveable { mutableStateOf(false) }
+    var showAdvanced by rememberSaveable { mutableStateOf(false) }
+
+    val clipboard = LocalClipboardManager.current
+    val uriHandler = LocalUriHandler.current
+
+    ReelixModalDialog(
+        title = "Cloud Worker Dispatch Setup",
+        onDismissRequest = { if (!isValidating) onDismiss() },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                enabled = !isValidating,
+            ) {
+                Text("Cancel")
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSaveAndVerify(tokenInput, repoInput, workflowInput, refInput)
+                },
+                enabled = tokenInput.isNotBlank() && !isValidating,
+                modifier = Modifier.testTag("verify_and_save_token_button"),
+            ) {
+                if (isValidating) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Verifying...")
+                } else {
+                    Text("Verify & Save")
+                }
+            }
+        },
+        content = {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                item {
+                    Text(
+                        text = "To trigger cloud processing on demand, Reelix connects directly to GitHub Actions using a Personal Access Token (PAT).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.Top,
+                            modifier = Modifier.padding(10.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Info,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = "Encrypted with AES-256-GCM in hardware-backed Android Keystore. Excluded from backups and never logged.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                    ) {
+                        Text(
+                            text = "Recommended Scope (Fine-grained PAT):",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = "• Repository access: 'Only select repositories' -> $initialRepo\n• Repository permissions: Actions -> 'Read and write'\n• Or Classic PAT with 'repo' scope",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                item {
+                    OutlinedButton(
+                        onClick = {
+                            uriHandler.openUri("https://github.com/settings/tokens?type=beta")
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("create_token_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Link,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text("Create Token on GitHub")
+                    }
+                }
+
+                item {
+                    OutlinedTextField(
+                        value = tokenInput,
+                        onValueChange = { tokenInput = it.trim() },
+                        label = { Text("GitHub Token (PAT)") },
+                        placeholder = { Text("github_pat_... or ghp_...") },
+                        visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        singleLine = true,
+                        trailingIcon = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (tokenInput.isBlank()) {
+                                    IconButton(onClick = {
+                                        clipboard.getText()?.text?.let { tokenInput = it.trim() }
+                                    }) {
+                                        Icon(
+                                            imageVector = Icons.Outlined.ContentCopy,
+                                            contentDescription = "Paste from clipboard",
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
+                                }
+                                IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Info,
+                                        contentDescription = if (isPasswordVisible) "Hide token" else "Show token",
+                                        tint = if (isPasswordVisible) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("dialog_github_token_input"),
+                    )
+                }
+
+                if (validationResult != null) {
+                    item {
+                        when (validationResult) {
+                            is TokenValidationResult.Success -> {
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    ),
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(10.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Outlined.CheckCircle,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(20.dp),
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        val who = validationResult.username?.let { "@$it: " }.orEmpty()
+                                        Text(
+                                            text = "Token verified! ${who}Access to $repoInput granted.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        )
+                                    }
+                                }
+                            }
+                            is TokenValidationResult.Failure -> {
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                                    ),
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(10.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Outlined.ErrorOutline,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(20.dp),
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            text = validationResult.message,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onErrorContainer,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    TextButton(
+                        onClick = { showAdvanced = !showAdvanced },
+                        modifier = Modifier.padding(vertical = 0.dp),
+                    ) {
+                        Text(if (showAdvanced) "Hide Repository Settings" else "Show Repository Settings")
+                    }
+                }
+
+                if (showAdvanced) {
+                    item {
+                        OutlinedTextField(
+                            value = repoInput,
+                            onValueChange = { repoInput = it },
+                            label = { Text("Repository (owner/repo)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("dialog_github_repo_input"),
+                        )
+                    }
+                    item {
+                        OutlinedTextField(
+                            value = workflowInput,
+                            onValueChange = { workflowInput = it },
+                            label = { Text("Workflow File") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("dialog_github_workflow_input"),
+                        )
+                    }
+                    item {
+                        OutlinedTextField(
+                            value = refInput,
+                            onValueChange = { refInput = it },
+                            label = { Text("Branch / Ref") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("dialog_github_ref_input"),
+                        )
+                    }
+                }
+            }
+        },
+    )
 }
 
 @Composable
@@ -1955,19 +2336,48 @@ private fun ToggleRow(
 }
 
 @Composable
-private fun KeyValueLine(label: String, value: String) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 3.dp),
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.weight(1f),
-        )
-        Text(text = value, style = MaterialTheme.typography.labelLarge)
+private fun KeyValueLine(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
+    val isMultiline = value.contains('\n') || value.length > 24 || (label.length + value.length) > 36
+    if (isMultiline) {
+        Column(
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    } else {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.weight(1f))
+            Text(
+                text = value,
+                style = MaterialTheme.typography.labelLarge,
+                textAlign = TextAlign.End,
+            )
+        }
     }
 }
