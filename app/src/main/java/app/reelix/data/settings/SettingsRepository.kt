@@ -35,6 +35,10 @@ interface SettingsRepository {
     suspend fun testAiConnection(baseUrl: String, model: String, apiKey: String?): ConnectionTestResult
     fun cloudDriveAccessToken(): String?
     fun cloudDriveRefreshToken(): String?
+    fun githubToken(): String?
+    suspend fun setGitHubToken(token: String?)
+    suspend fun setGitHubWorkflowConfig(repo: String, workflowId: String, ref: String)
+    suspend fun recordWorkflowDispatch(runId: Long?, runUrl: String?)
     suspend fun setCloudDriveCredentials(
         accessToken: String?,
         refreshToken: String? = null,
@@ -109,6 +113,11 @@ class DataStoreSettingsRepository(
         val lastTestProbeFileId = stringPreferencesKey("last_test_probe_file_id")
         val lastTestProbeFolderName = stringPreferencesKey("last_test_probe_folder_name")
         val cloudDriveTokenExpiresAt = longPreferencesKey("cloud_drive_token_expires_at")
+        val githubRepo = stringPreferencesKey("github_repo")
+        val githubWorkflowId = stringPreferencesKey("github_workflow_id")
+        val githubRef = stringPreferencesKey("github_ref")
+        val lastDispatchedRunId = longPreferencesKey("last_dispatched_run_id")
+        val lastDispatchedRunUrl = stringPreferencesKey("last_dispatched_run_url")
     }
 
     override val settings: Flow<AppSettings> = dataStore.data
@@ -152,6 +161,12 @@ class DataStoreSettingsRepository(
             cloudDriveFolderId = p[Keys.cloudDriveFolderId] ?: defaults.cloudDriveFolderId,
             hasCloudDriveToken = secretStore.get(CLOUD_DRIVE_TOKEN_ALIAS) != null,
             hasCloudDriveRefreshToken = secretStore.get(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS) != null,
+            hasGitHubToken = secretStore.get(GITHUB_TOKEN_ALIAS) != null,
+            githubRepo = p[Keys.githubRepo] ?: defaults.githubRepo,
+            githubWorkflowId = p[Keys.githubWorkflowId] ?: defaults.githubWorkflowId,
+            githubRef = p[Keys.githubRef] ?: defaults.githubRef,
+            lastDispatchedRunId = p[Keys.lastDispatchedRunId],
+            lastDispatchedRunUrl = p[Keys.lastDispatchedRunUrl],
             lastRunAt = p[Keys.lastRunAt],
             lastRunSummary = p[Keys.lastRunSummary],
             lastTestProbeFolderId = probeFolderId,
@@ -180,6 +195,9 @@ class DataStoreSettingsRepository(
             p[Keys.lastTestProbeFolderId] = next.lastTestProbeFolderId.trim()
             p[Keys.lastTestProbeFileId] = next.lastTestProbeFileId.trim()
             p[Keys.lastTestProbeFolderName] = next.lastTestProbeFolderName.trim()
+            p[Keys.githubRepo] = next.githubRepo.trim()
+            p[Keys.githubWorkflowId] = next.githubWorkflowId.trim()
+            p[Keys.githubRef] = next.githubRef.trim()
         }
     }
 
@@ -355,12 +373,38 @@ class DataStoreSettingsRepository(
         return provider.testConnection()
     }
 
+    override fun githubToken(): String? = secretStore.get(GITHUB_TOKEN_ALIAS)
+
+    override suspend fun setGitHubToken(token: String?) = withContext(Dispatchers.IO) {
+        if (token.isNullOrBlank()) {
+            secretStore.remove(GITHUB_TOKEN_ALIAS)
+        } else {
+            secretStore.put(GITHUB_TOKEN_ALIAS, token.trim())
+        }
+    }
+
+    override suspend fun setGitHubWorkflowConfig(repo: String, workflowId: String, ref: String) {
+        update { it.copy(
+            githubRepo = repo.trim().ifBlank { AppSettings.DEFAULT_GITHUB_REPO },
+            githubWorkflowId = workflowId.trim().ifBlank { AppSettings.DEFAULT_GITHUB_WORKFLOW_ID },
+            githubRef = ref.trim().ifBlank { AppSettings.DEFAULT_GITHUB_REF },
+        ) }
+    }
+
+    override suspend fun recordWorkflowDispatch(runId: Long?, runUrl: String?) {
+        dataStore.edit { p ->
+            if (runId != null) p[Keys.lastDispatchedRunId] = runId
+            if (runUrl != null) p[Keys.lastDispatchedRunUrl] = runUrl
+        }
+    }
+
     override suspend fun clear() {
         secretStore.remove(API_KEY_ALIAS)
         secretStore.remove(CLOUD_DRIVE_TOKEN_ALIAS)
         secretStore.remove(CLOUD_DRIVE_REFRESH_TOKEN_ALIAS)
         secretStore.remove(CLOUD_DRIVE_CLIENT_ID_ALIAS)
         secretStore.remove(CLOUD_DRIVE_CLIENT_SECRET_ALIAS)
+        secretStore.remove(GITHUB_TOKEN_ALIAS)
         dataStore.edit { it.clear() }
     }
 
@@ -370,5 +414,6 @@ class DataStoreSettingsRepository(
         private const val CLOUD_DRIVE_REFRESH_TOKEN_ALIAS = "cloud_drive_refresh_token"
         private const val CLOUD_DRIVE_CLIENT_ID_ALIAS = "cloud_drive_client_id"
         private const val CLOUD_DRIVE_CLIENT_SECRET_ALIAS = "cloud_drive_client_secret"
+        private const val GITHUB_TOKEN_ALIAS = "github_token"
     }
 }

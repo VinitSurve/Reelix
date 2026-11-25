@@ -26,6 +26,12 @@ data class AppSettings(
     val cloudDriveFolderId: String = "",
     val hasCloudDriveToken: Boolean = false,
     val hasCloudDriveRefreshToken: Boolean = false,
+    val hasGitHubToken: Boolean = false,
+    val githubRepo: String = DEFAULT_GITHUB_REPO,
+    val githubWorkflowId: String = DEFAULT_GITHUB_WORKFLOW_ID,
+    val githubRef: String = DEFAULT_GITHUB_REF,
+    val lastDispatchedRunId: Long? = null,
+    val lastDispatchedRunUrl: String? = null,
     val lastRunAt: Long? = null,
     val lastRunSummary: String? = null,
     val lastTestProbeFolderId: String = "",
@@ -36,6 +42,10 @@ data class AppSettings(
     val maxMediaImportSizeBytes: Long get() = maxMediaImportSizeMb.toLong() * 1024 * 1024
 
     companion object {
+        const val DEFAULT_GITHUB_REPO = "VinitSurve/Reelix"
+        const val DEFAULT_GITHUB_WORKFLOW_ID = "process-queue.yml"
+        const val DEFAULT_GITHUB_REF = "main"
+
         const val DEFAULT_JOBS_PER_RUN = 10
         val JOBS_PER_RUN_RANGE = 1..50
         const val DEFAULT_MAX_MEDIA_SIZE_MB = 200

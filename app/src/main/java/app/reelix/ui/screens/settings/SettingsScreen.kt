@@ -30,6 +30,7 @@ import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.Button
@@ -111,6 +112,7 @@ class SettingsViewModel(
     private val cloudSyncClient: app.reelix.cloud.CloudSyncClient? = null,
     private val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager? = null,
     private val appContext: Context? = null,
+    private val gitHubWorkflowClient: app.reelix.cloud.GitHubWorkflowClient = app.reelix.cloud.GitHubWorkflowClient(),
 ) : ViewModel() {
 
     val settings: StateFlow<AppSettings> = settingsRepository.settings
@@ -139,6 +141,9 @@ class SettingsViewModel(
 
     private val _isSyncingCloud = MutableStateFlow(false)
     val isSyncingCloud: StateFlow<Boolean> = _isSyncingCloud.asStateFlow()
+
+    private val _isDispatchingWorkflow = MutableStateFlow(false)
+    val isDispatchingWorkflow: StateFlow<Boolean> = _isDispatchingWorkflow.asStateFlow()
 
     private val _isConnectingDrive = MutableStateFlow(false)
     val isConnectingDrive: StateFlow<Boolean> = _isConnectingDrive.asStateFlow()
@@ -390,10 +395,84 @@ class SettingsViewModel(
         }
     }
 
+    fun saveGitHubToken(token: String) {
+        viewModelScope.launch {
+            val trimmed = token.trim()
+            if (trimmed.isBlank()) {
+                settingsRepository.setGitHubToken(null)
+                _feedback.value = "GitHub token removed."
+            } else {
+                settingsRepository.setGitHubToken(trimmed)
+                _feedback.value = "GitHub token saved securely in Keystore."
+            }
+        }
+    }
+
+    fun removeGitHubToken() {
+        viewModelScope.launch {
+            settingsRepository.setGitHubToken(null)
+            _feedback.value = "GitHub token removed."
+        }
+    }
+
+    fun saveGitHubWorkflowConfig(repo: String, workflowId: String, ref: String) {
+        viewModelScope.launch {
+            settingsRepository.setGitHubWorkflowConfig(repo, workflowId, ref)
+            _feedback.value = "GitHub workflow configuration updated."
+        }
+    }
+
     fun runQueueNow() {
         viewModelScope.launch {
-            scheduler.scheduleImmediate(forceRunNow = true)
-            _feedback.value = "Background processing triggered."
+            if (_isDispatchingWorkflow.value) return@launch
+            _isDispatchingWorkflow.value = true
+            try {
+                // Step 1: Synchronize any finished jobs from Drive into local Room database
+                runCatching { cloudSyncRepository?.syncCompletedJobs() }
+
+                // Step 2: Upload any pending items waiting in local database into Drive jobs queue
+                runCatching { cloudSyncRepository?.uploadPendingDueItems() }
+
+                val current = settingsRepository.current()
+
+                // Step 3: Schedule local processing worker
+                scheduler.scheduleImmediate(forceRunNow = true)
+
+                // Step 4: If cloud processing is enabled, dispatch GitHub Actions cloud worker
+                if (current.cloudProcessingEnabled) {
+                    val token = settingsRepository.githubToken()
+                    if (token.isNullOrBlank()) {
+                        _feedback.value = "GitHub Personal Access Token required to dispatch cloud worker. Please configure your token in Cloud settings."
+                        return@launch
+                    }
+
+                    val repo = current.githubRepo.ifBlank { AppSettings.DEFAULT_GITHUB_REPO }
+                    val workflowId = current.githubWorkflowId.ifBlank { AppSettings.DEFAULT_GITHUB_WORKFLOW_ID }
+                    val ref = current.githubRef.ifBlank { AppSettings.DEFAULT_GITHUB_REF }
+
+                    _feedback.value = "Dispatching cloud worker on GitHub Actions..."
+                    when (val outcome = gitHubWorkflowClient.dispatchWorkflow(repo, workflowId, ref, token)) {
+                        is app.reelix.cloud.WorkflowDispatchResult.Success -> {
+                            val run = outcome.runInfo
+                            if (run != null) {
+                                settingsRepository.recordWorkflowDispatch(run.id, run.htmlUrl)
+                                _feedback.value = "Cloud worker dispatched: Run #${run.id} (${run.status})"
+                            } else {
+                                _feedback.value = "Cloud worker dispatched successfully on GitHub Actions ($ref)."
+                            }
+                        }
+                        is app.reelix.cloud.WorkflowDispatchResult.Failure -> {
+                            _feedback.value = "Failed to dispatch cloud worker: ${outcome.message}"
+                        }
+                    }
+                } else {
+                    _feedback.value = "Background processing triggered locally."
+                }
+            } catch (e: Exception) {
+                _feedback.value = "Error triggering queue: ${e.message ?: "Unknown error"}"
+            } finally {
+                _isDispatchingWorkflow.value = false
+            }
         }
     }
 
@@ -667,6 +746,7 @@ class SettingsViewModel(
             cloudSyncClient: app.reelix.cloud.CloudSyncClient? = null,
             googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager? = null,
             appContext: Context? = null,
+            gitHubWorkflowClient: app.reelix.cloud.GitHubWorkflowClient = app.reelix.cloud.GitHubWorkflowClient(),
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
@@ -680,6 +760,7 @@ class SettingsViewModel(
                     cloudSyncClient = cloudSyncClient,
                     googleDriveAuthManager = googleDriveAuthManager,
                     appContext = appContext,
+                    gitHubWorkflowClient = gitHubWorkflowClient,
                 ) as T
         }
     }
@@ -712,6 +793,11 @@ fun SettingsScreen(
     var cloudFolderId by remember(settings.cloudDriveFolderId) { mutableStateOf(settings.cloudDriveFolderId) }
     var cloudToken by rememberSaveable { mutableStateOf("") }
     var cloudRefreshToken by rememberSaveable { mutableStateOf("") }
+    var githubTokenInput by rememberSaveable { mutableStateOf("") }
+    var githubRepoInput by remember(settings.githubRepo) { mutableStateOf(settings.githubRepo) }
+    var githubWorkflowInput by remember(settings.githubWorkflowId) { mutableStateOf(settings.githubWorkflowId) }
+    var githubRefInput by remember(settings.githubRef) { mutableStateOf(settings.githubRef) }
+    val isDispatchingWorkflow by viewModel.isDispatchingWorkflow.collectAsStateWithLifecycle()
     val isSyncingCloud by viewModel.isSyncingCloud.collectAsStateWithLifecycle()
     val isConnectingDrive by viewModel.isConnectingDrive.collectAsStateWithLifecycle()
     val isCreatingVault by viewModel.isCreatingVault.collectAsStateWithLifecycle()
@@ -780,12 +866,29 @@ fun SettingsScreen(
                                 "${Formatters.formatDateTime(it)} (${settings.lastRunSummary ?: "ok"})"
                             } ?: "Not run yet",
                         )
+                        if (settings.lastDispatchedRunId != null) {
+                            KeyValueLine(
+                                "Last cloud run dispatched",
+                                "Run #${settings.lastDispatchedRunId}",
+                            )
+                        }
                         Spacer(Modifier.height(10.dp))
                         Button(
                             onClick = viewModel::runQueueNow,
+                            enabled = !isDispatchingWorkflow,
                             modifier = Modifier.fillMaxWidth().testTag("run_queue_now_button"),
                         ) {
-                            Text("Run processing queue now")
+                            if (isDispatchingWorkflow) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text("Dispatching cloud worker...")
+                            } else {
+                                Text("Run processing queue now")
+                            }
                         }
                     }
                 }
@@ -1298,6 +1401,125 @@ fun SettingsScreen(
                                     Text("Sync results now")
                                 }
                             }
+                        }
+
+                        Spacer(Modifier.height(14.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(10.dp))
+
+                        Text(
+                            text = "GitHub Actions Cloud Worker",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = "Configure a GitHub Personal Access Token (classic with repo scope, or fine-grained with actions:write) to trigger cloud queue processing on demand.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(8.dp))
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (settings.hasGitHubToken) {
+                                Icon(
+                                    imageVector = Icons.Outlined.CheckCircle,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                                Text(
+                                    text = "GitHub token configured (stored encrypted in Keystore)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                                Spacer(Modifier.weight(1f))
+                                TextButton(
+                                    onClick = viewModel::removeGitHubToken,
+                                    modifier = Modifier.testTag("remove_github_token_button"),
+                                ) {
+                                    Text("Remove")
+                                }
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Outlined.Info,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                                Text(
+                                    text = "GitHub token not configured",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+
+                        OutlinedTextField(
+                            value = githubTokenInput,
+                            onValueChange = { githubTokenInput = it },
+                            label = {
+                                Text(
+                                    if (settings.hasGitHubToken) "Replace GitHub Personal Access Token"
+                                    else "GitHub Personal Access Token (PAT)"
+                                )
+                            },
+                            placeholder = { Text("ghp_... or github_pat_...") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("github_token_input"),
+                        )
+                        Spacer(Modifier.height(8.dp))
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            OutlinedTextField(
+                                value = githubRepoInput,
+                                onValueChange = { githubRepoInput = it },
+                                label = { Text("Repository") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1.5f).testTag("github_repo_input"),
+                            )
+                            OutlinedTextField(
+                                value = githubRefInput,
+                                onValueChange = { githubRefInput = it },
+                                label = { Text("Branch") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f).testTag("github_ref_input"),
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+
+                        OutlinedTextField(
+                            value = githubWorkflowInput,
+                            onValueChange = { githubWorkflowInput = it },
+                            label = { Text("Workflow File") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("github_workflow_input"),
+                        )
+                        Spacer(Modifier.height(10.dp))
+
+                        Button(
+                            onClick = {
+                                if (githubTokenInput.isNotBlank()) {
+                                    viewModel.saveGitHubToken(githubTokenInput)
+                                    githubTokenInput = ""
+                                }
+                                viewModel.saveGitHubWorkflowConfig(
+                                    repo = githubRepoInput,
+                                    workflowId = githubWorkflowInput,
+                                    ref = githubRefInput,
+                                )
+                            },
+                            modifier = Modifier.testTag("save_github_config_button"),
+                        ) {
+                            Text("Save GitHub configuration")
                         }
                     }
                 }

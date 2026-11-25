@@ -125,10 +125,26 @@ class FakeSettingsRepository(
 
     override suspend fun getValidDriveAccessToken(): String? = cloudDriveAccessToken()
 
+    override fun githubToken(): String? = secrets.get("github_token")
+
+    override suspend fun setGitHubToken(token: String?) {
+        if (token.isNullOrBlank()) secrets.remove("github_token") else secrets.put("github_token", token.trim())
+        state.update { it.copy(hasGitHubToken = secrets.get("github_token") != null) }
+    }
+
+    override suspend fun setGitHubWorkflowConfig(repo: String, workflowId: String, ref: String) {
+        state.update { it.copy(githubRepo = repo, githubWorkflowId = workflowId, githubRef = ref) }
+    }
+
+    override suspend fun recordWorkflowDispatch(runId: Long?, runUrl: String?) {
+        state.update { it.copy(lastDispatchedRunId = runId, lastDispatchedRunUrl = runUrl) }
+    }
+
     override suspend fun clear() {
         secrets.remove("api_key")
         secrets.remove("cloud_drive_token")
         secrets.remove("cloud_drive_refresh_token")
+        secrets.remove("github_token")
         state.value = AppSettings()
     }
 }
@@ -330,6 +346,7 @@ class TestAppContainer(
 
     val fakeGoogleDriveAuthManager: FakeGoogleDriveAuthManager = FakeGoogleDriveAuthManager()
     override val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager = fakeGoogleDriveAuthManager
+    override val gitHubWorkflowClient: app.reelix.cloud.GitHubWorkflowClient = app.reelix.cloud.GitHubWorkflowClient()
 
     fun close() {
         database.close()

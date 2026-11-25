@@ -262,6 +262,7 @@ private fun ReelixNavHost(
                     cloudSyncClient = container.cloudSyncClient,
                     googleDriveAuthManager = container.googleDriveAuthManager,
                     appContext = context.applicationContext,
+                    gitHubWorkflowClient = container.gitHubWorkflowClient,
                 ),
             )
             SettingsScreen(viewModel = vm)

@@ -57,6 +57,7 @@ interface AppContainer {
     val googleDriveAuthManager: app.reelix.cloud.GoogleDriveAuthManager
     val cloudSyncClient: app.reelix.cloud.CloudSyncClient
     val cloudSyncRepository: app.reelix.cloud.CloudSyncRepository
+    val gitHubWorkflowClient: app.reelix.cloud.GitHubWorkflowClient
 }
 
 class DefaultAppContainer(
@@ -210,6 +211,12 @@ class DefaultAppContainer(
             settingsRepository = settingsRepository,
             indexer = searchIndexer,
             clock = clock,
+        )
+    }
+
+    override val gitHubWorkflowClient: app.reelix.cloud.GitHubWorkflowClient by lazy {
+        app.reelix.cloud.GitHubWorkflowClient(
+            httpClient = httpClient,
         )
     }
 }
