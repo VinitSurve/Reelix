@@ -197,6 +197,103 @@ class TestDownloader(unittest.TestCase):
         self.assertEqual(res.status, DownloadStatus.UNAVAILABLE)
         self.assertIn("not found or empty", res.error_message)
 
+    def test_single_image_download_and_classification(self):
+        mock_ydl = self._make_mock_ydl()
+        img_file = self.output_dir / "item_img_1.jpg"
+        # Write valid JPEG magic bytes
+        img_file.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 200)
+
+        mock_ydl.extract_info.return_value = {
+            "title": "Single Image Title",
+            "description": "Educational Image Post",
+            "thumbnails": [
+                {"url": "https://example.com/thumb_small.jpg", "width": 150, "height": 150},
+                {"url": "https://example.com/thumb_large.jpg", "width": 1080, "height": 1350},
+            ],
+            "vcodec": "none",
+            "formats": [],
+        }
+
+        downloader = YtDlpDownloader(ydl_factory=lambda opts: mock_ydl)
+        res = downloader.download("https://www.instagram.com/p/ImgPost/", self.output_dir, "item_img")
+
+        self.assertEqual(res.status, DownloadStatus.SUCCESS)
+        self.assertTrue(res.is_success)
+        self.assertEqual(res.post_type.value, "IMAGE_POST")
+        self.assertEqual(len(res.media_items), 1)
+        self.assertEqual(res.media_items[0].media_type, "IMAGE")
+        self.assertEqual(res.media_items[0].mime_type, "image/jpeg")
+        self.assertEqual(res.media_path, img_file)
+
+    def test_carousel_image_download_preserves_order(self):
+        mock_ydl = self._make_mock_ydl()
+        file1 = self.output_dir / "item_car_1.jpg"
+        file2 = self.output_dir / "item_car_2.jpg"
+        file3 = self.output_dir / "item_car_3.jpg"
+        for f in (file1, file2, file3):
+            f.write_bytes(b"\xff\xd8\xff\xe0" + b"\x01" * 100)
+
+        mock_ydl.extract_info.return_value = {
+            "title": "3-Slide Carousel",
+            "description": "Multi-image post",
+            "entries": [
+                {"thumbnails": [{"url": "http://example.com/1.jpg"}]},
+                {"thumbnails": [{"url": "http://example.com/2.jpg"}]},
+                {"thumbnails": [{"url": "http://example.com/3.jpg"}]},
+            ],
+        }
+
+        downloader = YtDlpDownloader(ydl_factory=lambda opts: mock_ydl)
+        res = downloader.download("https://www.instagram.com/p/Carousel3/", self.output_dir, "item_car")
+
+        self.assertEqual(res.status, DownloadStatus.SUCCESS)
+        self.assertTrue(res.is_success)
+        self.assertEqual(res.post_type.value, "CAROUSEL")
+        self.assertEqual(len(res.media_items), 3)
+        self.assertEqual([m.index for m in res.media_items], [0, 1, 2])
+        self.assertEqual([m.file_name for m in res.media_items], ["item_car_1.jpg", "item_car_2.jpg", "item_car_3.jpg"])
+        self.assertEqual(res.media_path, file1)
+
+    def test_mixed_media_carousel_classification(self):
+        mock_ydl = self._make_mock_ydl()
+        file1 = self.output_dir / "item_mix_1.jpg"
+        file2 = self.output_dir / "item_mix_2.mp4"
+        file1.write_bytes(b"\xff\xd8\xff\xe0" + b"\x02" * 100)
+        file2.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x03" * 200)
+
+        mock_ydl.extract_info.return_value = {
+            "title": "Mixed Carousel",
+            "entries": [
+                {"thumbnails": [{"url": "http://example.com/img.jpg"}]},
+                {"formats": [{"url": "http://example.com/vid.mp4", "vcodec": "h264", "ext": "mp4"}]},
+            ],
+        }
+
+        downloader = YtDlpDownloader(ydl_factory=lambda opts: mock_ydl)
+        res = downloader.download("https://www.instagram.com/p/MixedPost/", self.output_dir, "item_mix")
+
+        self.assertEqual(res.status, DownloadStatus.SUCCESS)
+        self.assertEqual(res.post_type.value, "MIXED_CAROUSEL")
+        self.assertEqual(len(res.media_items), 2)
+        self.assertEqual(res.media_items[0].media_type, "IMAGE")
+        self.assertEqual(res.media_items[1].media_type, "VIDEO")
+        # Primary path prioritizes video for downstream audio extraction
+        self.assertEqual(res.media_path, file2)
+
+    def test_file_validation_magic_bytes(self):
+        downloader = YtDlpDownloader()
+        jpg_p = self.output_dir / "valid.jpg"
+        jpg_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 30)
+        self.assertTrue(downloader._validate_media_file(jpg_p, "image"))
+
+        corrupt_jpg = self.output_dir / "corrupt.jpg"
+        corrupt_jpg.write_bytes(b"not an image file")
+        self.assertFalse(downloader._validate_media_file(corrupt_jpg, "image"))
+
+        mp4_p = self.output_dir / "valid.mp4"
+        mp4_p.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 30)
+        self.assertTrue(downloader._validate_media_file(mp4_p, "video"))
+
 
 if __name__ == "__main__":
     unittest.main()

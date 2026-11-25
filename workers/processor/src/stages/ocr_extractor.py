@@ -35,6 +35,111 @@ class VisualTextExtractor:
     def is_available(self) -> bool:
         return shutil.which(self.tesseract_bin) is not None and shutil.which(self.ffmpeg_bin) is not None
 
+    def is_tesseract_available(self) -> bool:
+        return shutil.which(self.tesseract_bin) is not None
+
+    def extract_image(
+        self,
+        image_path: Path,
+        timeout_seconds: int = 30,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> OcrExtractionOutcome:
+        """Extracts on-screen text directly from a static image file using Tesseract."""
+        if not image_path.exists() or image_path.stat().st_size == 0:
+            return OcrExtractionOutcome(success=False, error=f"Image file does not exist or is empty: {image_path}")
+
+        if is_cancelled and is_cancelled():
+            return OcrExtractionOutcome(success=False, error="OCR extraction cancelled")
+
+        if not self.is_tesseract_available():
+            logger.info("Tesseract binary not installed; skipping image OCR")
+            return OcrExtractionOutcome(success=True, text="", error=None)
+
+        try:
+            resolved_image = image_path.resolve()
+            ocr_proc = subprocess.run(
+                [self.tesseract_bin, str(resolved_image), "stdout", "--oem", "1", "-l", "eng"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout_seconds,
+                check=False,
+            )
+            extracted_lines: List[str] = []
+            seen_normalized = set()
+
+            if ocr_proc.returncode == 0 and ocr_proc.stdout:
+                for line in ocr_proc.stdout.splitlines():
+                    cleaned = line.strip()
+                    norm = re.sub(r"[^\w\s]", "", cleaned).strip().lower()
+                    if len(norm) >= 2 and norm not in seen_normalized:
+                        seen_normalized.add(norm)
+                        extracted_lines.append(cleaned)
+
+            combined = "\n".join(extracted_lines).strip()
+            return OcrExtractionOutcome(
+                success=True,
+                text=combined,
+                frames_processed=1,
+            )
+        except Exception as e:
+            logger.warning("Error running OCR on image %s: %s", image_path.name, e)
+            return OcrExtractionOutcome(success=True, text="", error=str(e))
+
+    def extract_carousel(
+        self,
+        items: List[Any],
+        output_dir: Path,
+        timeout_seconds: int = 60,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> OcrExtractionOutcome:
+        """Extracts on-screen text across an ordered list of carousel items (images and/or videos)."""
+        if not items:
+            return OcrExtractionOutcome(success=True, text="", frames_processed=0)
+
+        slide_texts: List[str] = []
+        total_frames = 0
+
+        for idx, item in enumerate(items):
+            if is_cancelled and is_cancelled():
+                return OcrExtractionOutcome(success=False, error="OCR extraction cancelled")
+
+            # item can be a Path or a MediaItem object
+            file_path = getattr(item, "local_path", None)
+            if not file_path and isinstance(item, Path):
+                file_path = item
+            elif not file_path and hasattr(item, "file_name"):
+                file_path = output_dir / item.file_name
+
+            if not file_path or not Path(file_path).exists():
+                continue
+
+            path_obj = Path(file_path)
+            media_type = getattr(item, "media_type", "").upper()
+            is_image = media_type == "IMAGE" or path_obj.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+
+            if is_image:
+                slide_res = self.extract_image(path_obj, timeout_seconds=timeout_seconds, is_cancelled=is_cancelled)
+            else:
+                slide_res = self.extract(path_obj, output_dir, timeout_seconds=timeout_seconds, is_cancelled=is_cancelled)
+
+            total_frames += slide_res.frames_processed
+            item_text = slide_res.text.strip()
+            if hasattr(item, "ocr_text"):
+                item.ocr_text = item_text
+
+            if item_text:
+                m_label = "Image" if is_image else "Video"
+                slide_texts.append(f"Slide {idx + 1} ({m_label}):\n{item_text}")
+
+        combined_text = "\n\n".join(slide_texts).strip()
+        logger.info("Carousel OCR extracted text across %d items (%d frames/images processed)", len(items), total_frames)
+        return OcrExtractionOutcome(
+            success=True,
+            text=combined_text,
+            frames_processed=total_frames,
+        )
+
     def extract(
         self,
         input_video: Path,
@@ -44,10 +149,14 @@ class VisualTextExtractor:
         is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> OcrExtractionOutcome:
         if not input_video.exists() or input_video.stat().st_size == 0:
-            return OcrExtractionOutcome(success=False, error="Input video file does not exist or is empty")
+            return OcrExtractionOutcome(success=False, error="Input media file does not exist or is empty")
 
         if is_cancelled and is_cancelled():
             return OcrExtractionOutcome(success=False, error="OCR extraction cancelled")
+
+        # Route static images directly to extract_image
+        if input_video.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            return self.extract_image(input_video, timeout_seconds=timeout_seconds, is_cancelled=is_cancelled)
 
         if not self.is_available():
             logger.info("Visual text extraction unavailable (ffmpeg or tesseract not installed); skipping OCR")

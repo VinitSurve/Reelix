@@ -289,6 +289,8 @@ class SavedItemRepository(
             },
             events = events.map { ProcessingEventInfo(it.stage, it.status, it.message, it.createdAt) },
             generation = item.lastSyncedGeneration,
+            postType = item.postType,
+            mediaItems = app.reelix.domain.model.MediaItemInfo.listFromJson(item.mediaItemsJson),
         )
     }
 
@@ -422,6 +424,8 @@ class SavedItemRepository(
         thumbnailPath = item.thumbnailPath,
         createdAt = item.createdAt,
         generation = item.lastSyncedGeneration,
+        postType = item.postType,
+        mediaItemCount = item.mediaItemCount,
     )
 
     private fun ProcessingResultEntity.toInfo() = AiResultInfo(

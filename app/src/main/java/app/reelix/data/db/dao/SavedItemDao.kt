@@ -281,4 +281,18 @@ interface SavedItemDao {
 
     @Query("SELECT id FROM saved_items WHERE analysisStatus = 'NOT_CONFIGURED' OR analysisStatus = 'FAILED'")
     suspend fun idsAwaitingAnalysisProvider(): List<String>
+
+    @Query(
+        """
+        UPDATE saved_items SET postType = :postType, mediaItemCount = :itemCount,
+            mediaItemsJson = :itemsJson, updatedAt = :now WHERE id = :id
+        """,
+    )
+    suspend fun updateMultiMediaDetails(
+        id: String,
+        postType: String,
+        itemCount: Int,
+        itemsJson: String?,
+        now: Long,
+    )
 }

@@ -68,6 +68,57 @@ class TestVisualTextExtractor(unittest.TestCase):
         self.assertEqual(res.text.count("Step 1: Boil Water"), 1)
         self.assertEqual(res.frames_processed, 2)
 
+    @patch("shutil.which")
+    @patch("subprocess.run")
+    def test_extract_single_image(self, mock_run, mock_which):
+        mock_which.return_value = "/usr/bin/tesseract"
+        mock_run.return_value = MagicMock(returncode=0, stdout="Code Repository:\ngithub.com/vinit/repo\n")
+
+        img_file = self.test_dir / "sample_img.jpg"
+        img_file.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 50)
+
+        res = self.extractor.extract_image(img_file)
+        self.assertTrue(res.success)
+        self.assertIn("Code Repository:", res.text)
+        self.assertIn("github.com/vinit/repo", res.text)
+        self.assertEqual(res.frames_processed, 1)
+
+    @patch("shutil.which")
+    @patch("subprocess.run")
+    def test_extract_carousel_preserves_slide_order(self, mock_run, mock_which):
+        mock_which.return_value = "/usr/bin/tesseract"
+
+        def side_effect(cmd, **kwargs):
+            target = cmd[1]
+            if "slide_1" in target:
+                return MagicMock(returncode=0, stdout="Slide 1 Content: AI Models\n")
+            elif "slide_2" in target:
+                return MagicMock(returncode=0, stdout="Slide 2 Content: Prompt Engineering\n")
+            return MagicMock(returncode=0, stdout="")
+
+        mock_run.side_effect = side_effect
+
+        file1 = self.test_dir / "slide_1.jpg"
+        file2 = self.test_dir / "slide_2.jpg"
+        file1.write_bytes(b"\xff\xd8\xff\xe0" + b"\x01" * 50)
+        file2.write_bytes(b"\xff\xd8\xff\xe0" + b"\x02" * 50)
+
+        from workers.processor.src.models import MediaItem
+        items = [
+            MediaItem(index=0, media_type="IMAGE", file_name="slide_1.jpg"),
+            MediaItem(index=1, media_type="IMAGE", file_name="slide_2.jpg"),
+        ]
+
+        res = self.extractor.extract_carousel(items, self.test_dir)
+        self.assertTrue(res.success)
+        self.assertIn("Slide 1 (Image):", res.text)
+        self.assertIn("AI Models", res.text)
+        self.assertIn("Slide 2 (Image):", res.text)
+        self.assertIn("Prompt Engineering", res.text)
+        self.assertTrue(res.text.index("Slide 1") < res.text.index("Slide 2"))
+        self.assertEqual(items[0].ocr_text, "Slide 1 Content: AI Models")
+        self.assertEqual(items[1].ocr_text, "Slide 2 Content: Prompt Engineering")
+
 
 if __name__ == "__main__":
     unittest.main()

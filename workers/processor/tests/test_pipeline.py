@@ -1383,6 +1383,76 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(StageStatus.SUCCEEDED, updated.stages.transcription)
         self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
 
+    def test_image_carousel_pipeline_skips_audio_and_completes(self):
+        from workers.processor.src.models import MediaItem, PostMediaType
+
+        item_id = "item-carousel-123"
+        job = JobManifest(
+            item_id=item_id,
+            source="SHARE",
+            original_url="https://www.instagram.com/p/CarouselPoc/",
+            created_at=1000,
+            updated_at=1000,
+            caption="Carousel test caption",
+        )
+        self.storage.update_job(job)
+
+        slide1 = self.test_dir / f"{item_id}_1.jpg"
+        slide2 = self.test_dir / f"{item_id}_2.jpg"
+        slide1.write_bytes(b"\xff\xd8\xff\xe0" + b"\x01" * 100)
+        slide2.write_bytes(b"\xff\xd8\xff\xe0" + b"\x02" * 100)
+
+        items = [
+            MediaItem(index=0, media_type="IMAGE", file_name=f"{item_id}_1.jpg", mime_type="image/jpeg", size_bytes=slide1.stat().st_size),
+            MediaItem(index=1, media_type="IMAGE", file_name=f"{item_id}_2.jpg", mime_type="image/jpeg", size_bytes=slide2.stat().st_size),
+        ]
+
+        carousel_dl = FakeDownloader(
+            outcome=DownloadResult(
+                status=DownloadStatus.SUCCESS,
+                media_path=slide1,
+                mime_type="image/jpeg",
+                file_name=slide1.name,
+                size_bytes=slide1.stat().st_size,
+                post_type=PostMediaType.CAROUSEL,
+                media_items=items,
+                local_media_paths=[slide1, slide2],
+                total_size_bytes=slide1.stat().st_size + slide2.stat().st_size,
+                caption="Carousel test caption",
+            )
+        )
+
+        class FakeCarouselOcr:
+            def extract(self, *args, **kwargs):
+                return OcrExtractionOutcome(success=True, text="Sample OCR")
+            def extract_carousel(self, items, output_dir, **kwargs):
+                return OcrExtractionOutcome(success=True, text="Slide 1: AI\n\nSlide 2: ML", frames_processed=2)
+
+        extractor = FakeExtractor()
+        pipeline = CloudProcessingPipeline(
+            config=self.config,
+            storage=self.storage,
+            downloader=carousel_dl,
+            audio_extractor=extractor,
+            transcriber=FakeTranscriber(),
+            ocr_extractor=FakeCarouselOcr(),
+            gemini_analyzer=FakeAnalyzer(),
+        )
+
+        success = pipeline.process_job(job)
+        self.assertTrue(success, "Pipeline must succeed on image carousel")
+
+        updated = self.storage.get_job(item_id)
+        self.assertEqual(JobStatus.COMPLETED, updated.status)
+        self.assertEqual("CAROUSEL", updated.post_type)
+        self.assertEqual(2, len(updated.media_items))
+        # Verify audio extraction and transcription were marked SKIPPED (not FAILED)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.audio_extraction)
+        self.assertEqual(StageStatus.SKIPPED, updated.stages.transcription)
+        self.assertEqual(0, extractor.called, "Audio extractor must NOT be invoked on image carousel")
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.ocr)
+        self.assertEqual(StageStatus.SUCCEEDED, updated.stages.gemini_analysis)
+        self.assertIn("Slide 1: AI", updated.results.ocr_text)
 
 if __name__ == "__main__":
     unittest.main()

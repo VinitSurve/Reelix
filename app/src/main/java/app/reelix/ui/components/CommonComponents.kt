@@ -229,6 +229,25 @@ fun SavedItemCard(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Pill(text = entry.contentType.label)
+                // Show post-type badge for non-reel content
+                when {
+                    entry.postType == "CAROUSEL" || entry.postType == "MIXED_CAROUSEL" -> {
+                        Spacer(Modifier.width(6.dp))
+                        Pill(
+                            text = "Carousel · ${entry.mediaItemCount}",
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                    entry.postType == "IMAGE_POST" -> {
+                        Spacer(Modifier.width(6.dp))
+                        Pill(
+                            text = "Image",
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                }
                 if (entry.generation > 1) {
                     Spacer(Modifier.width(6.dp))
                     Pill(

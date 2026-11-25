@@ -38,7 +38,7 @@ abstract class ReelixDatabase : RoomDatabase() {
     abstract fun searchDao(): SearchDao
 
     companion object {
-        const val VERSION = 3
+        const val VERSION = 4
         const val NAME = "reelix.db"
 
         /** Explicit migration from schema v1 to v2: adds media & extended AI fields, recreates FTS. */
@@ -79,7 +79,16 @@ abstract class ReelixDatabase : RoomDatabase() {
             }
         }
 
-        val MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
+        /** Migration v3 to v4: adds multi-media post type and carousel item tracking. */
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `saved_items` ADD COLUMN `postType` TEXT NOT NULL DEFAULT 'REEL'")
+                db.execSQL("ALTER TABLE `saved_items` ADD COLUMN `mediaItemCount` INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE `saved_items` ADD COLUMN `mediaItemsJson` TEXT DEFAULT NULL")
+            }
+        }
+
+        val MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
 
         fun build(context: Context): ReelixDatabase =
             Room.databaseBuilder(context.applicationContext, ReelixDatabase::class.java, NAME)

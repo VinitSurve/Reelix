@@ -311,6 +311,33 @@ fun ItemDetailScreen(
                         SectionCard {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Pill(text = item.contentType.label)
+                                // Show carousel/image post type when it differs from generic "Reel"
+                                when {
+                                    item.postType == "CAROUSEL" || item.postType == "MIXED_CAROUSEL" -> {
+                                        Spacer(Modifier.width(6.dp))
+                                        Pill(
+                                            text = "Carousel · ${item.mediaItems.size} slides",
+                                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        )
+                                    }
+                                    item.postType == "IMAGE_POST" -> {
+                                        Spacer(Modifier.width(6.dp))
+                                        Pill(
+                                            text = "Image Post",
+                                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        )
+                                    }
+                                    item.postType == "VIDEO_POST" -> {
+                                        Spacer(Modifier.width(6.dp))
+                                        Pill(
+                                            text = "Video Post",
+                                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        )
+                                    }
+                                }
                                 if (item.copyIndex > 0) {
                                     Spacer(Modifier.width(6.dp))
                                     Pill(text = "Copy #${item.copyIndex + 1}")
@@ -564,29 +591,42 @@ fun ItemDetailScreen(
                         }
                     }
 
-                    // 6. Transcript (Offline Whisper or User-provided)
-                    item(key = "transcript_section") {
-                        SectionCard {
-                            val hasGenerated = !item.generatedTranscript.isNullOrBlank()
-                            val hasUser = !item.userTranscript.isNullOrBlank()
-                            val transcriptKind = if (hasUser) ProvenanceKind.USER else if (hasGenerated) ProvenanceKind.TRANSCRIPTION else ProvenanceKind.EXTRACTED
-                            SectionHeader(
-                                title = "Transcript",
-                                provenance = transcriptKind,
-                            )
-                            val text = item.effectiveTranscript
-                            if (text.isNullOrBlank()) {
-                                Text(
-                                    text = "No transcript available (${item.transcriptionStatus.label.lowercase()}). To transcribe locally, share a video/audio file and import a Whisper model in Settings.",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    // 6. Transcript — hidden for image-only posts (skipped stage)
+                    val isImageOnlyPost = item.postType == "IMAGE_POST" ||
+                        (item.postType == "CAROUSEL" && item.mediaItems.isNotEmpty() && item.mediaItems.all { it.mediaType == app.reelix.domain.model.MediaItemType.IMAGE })
+                    val isTranscriptSkipped = item.transcriptionStatus == app.reelix.domain.model.StageStatus.SKIPPED
+                    if (!isImageOnlyPost || !isTranscriptSkipped || !item.effectiveTranscript.isNullOrBlank()) {
+                        item(key = "transcript_section") {
+                            SectionCard {
+                                val hasGenerated = !item.generatedTranscript.isNullOrBlank()
+                                val hasUser = !item.userTranscript.isNullOrBlank()
+                                val transcriptKind = if (hasUser) ProvenanceKind.USER else if (hasGenerated) ProvenanceKind.TRANSCRIPTION else ProvenanceKind.EXTRACTED
+                                SectionHeader(
+                                    title = "Transcript",
+                                    provenance = transcriptKind,
                                 )
-                            } else {
-                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text(
-                                        text = text,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                    )
+                                val text = item.effectiveTranscript
+                                if (text.isNullOrBlank()) {
+                                    if (isTranscriptSkipped) {
+                                        Text(
+                                            text = "Transcription is not applicable for this image post.",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    } else {
+                                        Text(
+                                            text = "No transcript available (${item.transcriptionStatus.label.lowercase()}). To transcribe locally, share a video/audio file and import a Whisper model in Settings.",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                } else {
+                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(
+                                            text = text,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -604,6 +644,40 @@ fun ItemDetailScreen(
                                     text = item.ocrText,
                                     style = MaterialTheme.typography.bodyMedium,
                                 )
+                            }
+                        }
+                    }
+
+                    // 6c. Carousel slide summary (image/video count breakdown)
+                    if (item.mediaItems.size > 1) {
+                        item(key = "carousel_section") {
+                            SectionCard {
+                                SectionHeader(
+                                    title = "Carousel · ${item.mediaItems.size} slides",
+                                    provenance = ProvenanceKind.MEDIA,
+                                )
+                                val imageCount = item.mediaItems.count { it.mediaType == app.reelix.domain.model.MediaItemType.IMAGE }
+                                val videoCount = item.mediaItems.count { it.mediaType == app.reelix.domain.model.MediaItemType.VIDEO }
+                                val typeDesc = when {
+                                    imageCount > 0 && videoCount > 0 -> "$imageCount image${if (imageCount > 1) "s" else ""}, $videoCount video${if (videoCount > 1) "s" else ""}"
+                                    imageCount > 0 -> "$imageCount image${if (imageCount > 1) "s" else ""}"
+                                    videoCount > 0 -> "$videoCount video${if (videoCount > 1) "s" else ""}"
+                                    else -> "${item.mediaItems.size} items"
+                                }
+                                Text(
+                                    text = typeDesc,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                val slidesWithOcr = item.mediaItems.filter { !it.ocrText.isNullOrBlank() }
+                                if (slidesWithOcr.isNotEmpty()) {
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(
+                                        text = "${slidesWithOcr.size} slide${if (slidesWithOcr.size > 1) "s" else ""} with extracted text — see OCR section above.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                             }
                         }
                     }

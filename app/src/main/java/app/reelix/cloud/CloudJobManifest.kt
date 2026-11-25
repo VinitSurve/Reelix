@@ -35,6 +35,8 @@ data class CloudJobManifest(
     val nextRetryAt: Long? = null,
     val errorMessage: String? = null,
     val media: CloudMediaInfo? = null,
+    val mediaItems: List<CloudMediaItem> = emptyList(),
+    val postType: String = "REEL",
     val stages: CloudStageStates = CloudStageStates(),
     val results: CloudJobResults = CloudJobResults(),
     val projectionVersion: Long = 1L,
@@ -85,6 +87,11 @@ data class CloudJobManifest(
             m.put("size_bytes", media.sizeBytes)
             if (media.durationMs != null) m.put("duration_ms", media.durationMs)
             root.put("media", m)
+        }
+
+        root.put("post_type", postType)
+        if (mediaItems.isNotEmpty()) {
+            root.put("media_items", JSONArray(mediaItems.map { it.toJson() }))
         }
 
         val st = JSONObject()
@@ -219,6 +226,12 @@ data class CloudJobManifest(
                 activeAttemptId = actId,
                 lastTransitionId = lastTransId,
                 lastTransitionHash = lastTransHash,
+                postType = root.optString("post_type", "REEL").ifBlank { "REEL" },
+                mediaItems = run {
+                    val arr = root.optJSONArray("media_items")
+                    if (arr != null) (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let { CloudMediaItem.fromJson(it) } }
+                    else emptyList()
+                },
             )
         }
 
@@ -230,6 +243,42 @@ data class CloudJobManifest(
             }
             return list
         }
+    }
+}
+
+/** A single slide/item in a carousel post as recorded in the cloud manifest. */
+data class CloudMediaItem(
+    val index: Int,
+    val mediaType: String,
+    val fileName: String? = null,
+    val mimeType: String? = null,
+    val driveFileId: String? = null,
+    val sizeBytes: Long? = null,
+    val durationMs: Long? = null,
+    val ocrText: String? = null,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("index", index)
+        put("media_type", mediaType)
+        fileName?.let { put("file_name", it) }
+        mimeType?.let { put("mime_type", it) }
+        driveFileId?.let { put("drive_file_id", it) }
+        sizeBytes?.let { put("size_bytes", it) }
+        durationMs?.let { put("duration_ms", it) }
+        ocrText?.let { put("ocr_text", it) }
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject) = CloudMediaItem(
+            index = obj.optInt("index", 0),
+            mediaType = obj.optString("media_type", "UNKNOWN").uppercase(),
+            fileName = obj.optString("file_name").takeIf { it.isNotBlank() },
+            mimeType = obj.optString("mime_type").takeIf { it.isNotBlank() },
+            driveFileId = obj.optString("drive_file_id").takeIf { it.isNotBlank() },
+            sizeBytes = if (obj.has("size_bytes")) obj.optLong("size_bytes") else null,
+            durationMs = if (obj.has("duration_ms")) obj.optLong("duration_ms") else null,
+            ocrText = obj.optString("ocr_text").takeIf { it.isNotBlank() },
+        )
     }
 }
 

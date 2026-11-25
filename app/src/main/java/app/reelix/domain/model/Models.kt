@@ -1,6 +1,8 @@
 package app.reelix.domain.model
 
 import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
 
 /** A validated Instagram link. [originalUrl] is preserved verbatim; [normalizedUrl] is used for de-duplication. */
 data class InstagramLink(
@@ -80,6 +82,9 @@ data class ItemListEntry(
     val thumbnailPath: String?,
     val createdAt: Long,
     val generation: Int = 1,
+    // Multi-media (v4)
+    val postType: String = "REEL",
+    val mediaItemCount: Int = 1,
 ) {
     val isTranscribed: Boolean get() = transcriptionStatus == StageStatus.SUCCEEDED
     val isAiEnriched: Boolean get() = analysisStatus == StageStatus.SUCCEEDED
@@ -198,6 +203,9 @@ data class ItemDetails(
     val stages: List<StageInfo>,
     val events: List<ProcessingEventInfo>,
     val generation: Int = 1,
+    // Multi-media (v4)
+    val postType: String = "REEL",
+    val mediaItems: List<MediaItemInfo> = emptyList(),
 ) {
     val displayTitle: String?
         get() = userTitle?.takeIf { it.isNotBlank() }
@@ -213,6 +221,80 @@ data class ItemDetails(
     val isAiEnriched: Boolean get() = analysisStatus == StageStatus.SUCCEEDED
     val isNeedsAttention: Boolean get() = processingStatus == ProcessingStatus.NEEDS_ATTENTION
 }
+
+// ─── Multi-media types ───────────────────────────────────────────────────────
+
+/** Type of a single slide/item in a multi-media post. */
+enum class MediaItemType { IMAGE, VIDEO, UNKNOWN }
+
+/** Serialisable info about one slide in a carousel or single-media post. */
+data class MediaItemInfo(
+    val index: Int,
+    val mediaType: MediaItemType,
+    val fileName: String?,
+    val mimeType: String?,
+    val driveFileId: String?,
+    val sizeBytes: Long?,
+    val width: Int?,
+    val height: Int?,
+    val durationMs: Long?,
+    val contentHash: String?,
+    val ocrText: String?,
+    val localPath: String?,
+    val originalUrl: String?,
+    val thumbnailUrl: String?,
+) {
+    companion object {
+        fun fromJson(obj: JSONObject): MediaItemInfo = MediaItemInfo(
+            index = obj.optInt("index", 0),
+            mediaType = when (obj.optString("media_type", "UNKNOWN").uppercase()) {
+                "IMAGE" -> MediaItemType.IMAGE
+                "VIDEO" -> MediaItemType.VIDEO
+                else -> MediaItemType.UNKNOWN
+            },
+            fileName = obj.optString("file_name").takeIf { it.isNotBlank() },
+            mimeType = obj.optString("mime_type").takeIf { it.isNotBlank() },
+            driveFileId = obj.optString("drive_file_id").takeIf { it.isNotBlank() },
+            sizeBytes = if (obj.has("size_bytes")) obj.optLong("size_bytes") else null,
+            width = if (obj.has("width")) obj.optInt("width") else null,
+            height = if (obj.has("height")) obj.optInt("height") else null,
+            durationMs = if (obj.has("duration_ms")) obj.optLong("duration_ms") else null,
+            contentHash = obj.optString("content_hash").takeIf { it.isNotBlank() },
+            ocrText = obj.optString("ocr_text").takeIf { it.isNotBlank() },
+            localPath = obj.optString("local_path").takeIf { it.isNotBlank() },
+            originalUrl = obj.optString("original_url").takeIf { it.isNotBlank() },
+            thumbnailUrl = obj.optString("thumbnail_url").takeIf { it.isNotBlank() },
+        )
+
+        fun listFromJson(json: String?): List<MediaItemInfo> {
+            if (json.isNullOrBlank()) return emptyList()
+            return try {
+                val arr = JSONArray(json)
+                (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let { fromJson(it) } }
+            } catch (_: Exception) { emptyList() }
+        }
+    }
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("index", index)
+        put("media_type", mediaType.name)
+        fileName?.let { put("file_name", it) }
+        mimeType?.let { put("mime_type", it) }
+        driveFileId?.let { put("drive_file_id", it) }
+        sizeBytes?.let { put("size_bytes", it) }
+        width?.let { put("width", it) }
+        height?.let { put("height", it) }
+        durationMs?.let { put("duration_ms", it) }
+        contentHash?.let { put("content_hash", it) }
+        ocrText?.let { put("ocr_text", it) }
+        localPath?.let { put("local_path", it) }
+        originalUrl?.let { put("original_url", it) }
+        thumbnailUrl?.let { put("thumbnail_url", it) }
+    }
+}
+
+fun List<MediaItemInfo>.toJsonString(): String =
+    JSONArray(map { it.toJson() }).toString()
 
 /** Editable, user-owned metadata. */
 data class UserMetadata(

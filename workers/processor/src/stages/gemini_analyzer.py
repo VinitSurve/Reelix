@@ -10,6 +10,7 @@ import re
 import socket
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import urllib.request
 import urllib.error
@@ -159,6 +160,34 @@ class GeminiAnalyzer:
         jitter = 0.8 + 0.4 * random.random()
         return min(self.max_delay_seconds, backoff * jitter)
 
+    @staticmethod
+    def _encode_image_part(image_path: Path, max_dimension: int = 1024) -> Optional[Dict[str, Any]]:
+        """Encodes an image file as base64 inlineData for Gemini multimodal input, downsampling if large."""
+        try:
+            import base64
+            import io
+            from PIL import Image
+
+            with Image.open(image_path) as img:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                w, h = img.size
+                if max(w, h) > max_dimension:
+                    scale = max_dimension / max(w, h)
+                    img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85, optimize=True)
+                encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return {
+                    "inlineData": {
+                        "mimeType": "image/jpeg",
+                        "data": encoded,
+                    }
+                }
+        except Exception as e:
+            logger.warning("Failed encoding image %s for Gemini multimodal analysis: %s", image_path, e)
+            return None
+
     def analyze(
         self,
         title: Optional[str] = None,
@@ -168,6 +197,7 @@ class GeminiAnalyzer:
         ocr_text: Optional[str] = None,
         category: Optional[str] = None,
         user_tags: Optional[List[str]] = None,
+        image_paths: Optional[List[Path]] = None,
     ) -> GeminiAnalysisOutcome:
         if not self.api_key:
             fallback = self._fallback_to_groq(
@@ -204,23 +234,39 @@ class GeminiAnalyzer:
         if transcript:
             content_parts.append(f"Audio Transcript:\n{transcript}")
 
+        # If images are provided, encode them into multimodal inlineData parts
+        image_parts: List[Dict[str, Any]] = []
+        if image_paths:
+            for p in image_paths[:10]:
+                p_obj = Path(p)
+                if p_obj.exists() and p_obj.stat().st_size > 0:
+                    part = self._encode_image_part(p_obj)
+                    if part:
+                        image_parts.append(part)
+
+        if image_parts and not content_parts:
+            content_parts.append("Analyze the provided visual image(s) from this Instagram post. Provide structured insights, key takeaways, and summary.")
+
         combined_text = "\n\n".join(content_parts).strip()
-        if not combined_text:
+        if not combined_text and not image_parts:
             return GeminiAnalysisOutcome(
                 success=False,
-                error="No text (transcript, caption, notes, or OCR text) available for analysis",
+                error="No text (transcript, caption, notes, or OCR text) or images available for analysis",
                 is_retryable=False,
             )
 
         current_model = self.model
         alt_model = "gemini-3.8-flash" if current_model == "gemini-3.6-flash" else "gemini-3.6-flash"
 
+        contents_parts: List[Dict[str, Any]] = []
+        contents_parts.extend(image_parts)
+        if combined_text:
+            contents_parts.append({"text": combined_text})
+
         payload = {
             "contents": [
                 {
-                    "parts": [
-                        {"text": combined_text}
-                    ]
+                    "parts": contents_parts,
                 }
             ],
             "systemInstruction": {

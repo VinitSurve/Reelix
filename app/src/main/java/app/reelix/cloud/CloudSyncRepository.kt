@@ -511,6 +511,20 @@ class CloudSyncRepository(
                         val hasTranscript = manifest.results.transcript?.isNotBlank() == true
                         val aiSkippedOrNotConfigured = manifest.stages.geminiAnalysis in listOf("SKIPPED", "NOT_CONFIGURED", "UNAVAILABLE")
 
+                        // Persist multi-media metadata when present
+                        if (manifest.mediaItems.isNotEmpty() || manifest.postType != "REEL") {
+                            val itemsJson = if (manifest.mediaItems.isNotEmpty()) {
+                                org.json.JSONArray(manifest.mediaItems.map { it.toJson() }).toString()
+                            } else null
+                            itemDao.updateMultiMediaDetails(
+                                id = targetItemId,
+                                postType = manifest.postType,
+                                itemCount = manifest.mediaItems.size.coerceAtLeast(1),
+                                itemsJson = itemsJson,
+                                now = now,
+                            )
+                        }
+
                         if ((hasAnalysis || aiSkippedOrNotConfigured) && (!expectedAudio || hasTranscript)) {
                             // Truly completed (fully processed with AI or processed without AI analysis)
                             itemDao.markCompleted(targetItemId, now)

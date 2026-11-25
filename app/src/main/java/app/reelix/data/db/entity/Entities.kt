@@ -73,6 +73,10 @@ data class SavedItemEntity(
     val lastSyncedGeneration: Int = 1,
     val lastSyncedAttemptEpoch: Int = 1,
     val lastSyncedProjectionVersion: Long = 0L,
+    // Multi-media support (v4)
+    val postType: String = "REEL",
+    val mediaItemCount: Int = 1,
+    val mediaItemsJson: String? = null,
 )
 
 @Entity(

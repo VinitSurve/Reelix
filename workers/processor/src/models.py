@@ -47,6 +47,78 @@ class TransitionType(str, Enum):
     HEARTBEAT = "HEARTBEAT"
 
 
+class PostMediaType(str, Enum):
+    REEL = "REEL"
+    VIDEO_POST = "VIDEO_POST"
+    IMAGE_POST = "IMAGE_POST"
+    CAROUSEL = "CAROUSEL"
+    MIXED_CAROUSEL = "MIXED_CAROUSEL"
+    UNKNOWN = "UNKNOWN"
+
+
+class MediaItemType(str, Enum):
+    IMAGE = "IMAGE"
+    VIDEO = "VIDEO"
+
+
+@dataclass
+class MediaItem:
+    index: int
+    media_type: str = "IMAGE"  # "IMAGE" or "VIDEO"
+    file_name: str = ""
+    mime_type: str = "image/jpeg"
+    drive_file_id: Optional[str] = None
+    size_bytes: int = 0
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration_ms: Optional[int] = None
+    content_hash: Optional[str] = None
+    ocr_text: Optional[str] = None
+    download_status: str = "COMPLETED"
+    original_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    error_message: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "media_type": self.media_type,
+            "file_name": self.file_name,
+            "mime_type": self.mime_type,
+            "drive_file_id": self.drive_file_id,
+            "size_bytes": self.size_bytes,
+            "width": self.width,
+            "height": self.height,
+            "duration_ms": self.duration_ms,
+            "content_hash": self.content_hash,
+            "ocr_text": self.ocr_text,
+            "download_status": self.download_status,
+            "original_url": self.original_url,
+            "thumbnail_url": self.thumbnail_url,
+            "error_message": self.error_message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> MediaItem:
+        return cls(
+            index=data.get("index", 0),
+            media_type=data.get("media_type", "IMAGE"),
+            file_name=data.get("file_name", ""),
+            mime_type=data.get("mime_type", "image/jpeg"),
+            drive_file_id=data.get("drive_file_id"),
+            size_bytes=data.get("size_bytes", 0),
+            width=data.get("width"),
+            height=data.get("height"),
+            duration_ms=data.get("duration_ms"),
+            content_hash=data.get("content_hash"),
+            ocr_text=data.get("ocr_text"),
+            download_status=data.get("download_status", "COMPLETED"),
+            original_url=data.get("original_url"),
+            thumbnail_url=data.get("thumbnail_url"),
+            error_message=data.get("error_message"),
+        )
+
+
 class StageStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -335,6 +407,9 @@ class JobManifest:
     next_retry_at: Optional[int] = None
     error_message: Optional[str] = None
     media: Optional[MediaInfo] = None
+    post_type: str = PostMediaType.REEL.value
+    media_items: List[MediaItem] = field(default_factory=list)
+    total_media_size_bytes: int = 0
     stages: StageStates = field(default_factory=StageStates)
     stage_details: Dict[str, StageDetail] = field(default_factory=dict)
     artifacts: Dict[str, ArtifactRef] = field(default_factory=dict)
@@ -416,6 +491,9 @@ class JobManifest:
         d["projection_version"] = self.projection_version
         d["last_transition_id"] = self.last_transition_id
         d["last_transition_hash"] = self.last_transition_hash
+        d["post_type"] = self.post_type
+        d["media_items"] = [it.to_dict() for it in self.media_items]
+        d["total_media_size_bytes"] = self.total_media_size_bytes
         return d
 
     def to_json(self, indent: Optional[int] = 2) -> str:
@@ -451,6 +529,28 @@ class JobManifest:
         generation = data.get("generation", 1)
         historical_generations = data.get("historical_generations", [])
 
+        post_type = data.get("post_type", PostMediaType.REEL.value)
+        raw_items = data.get("media_items", [])
+        media_items = [MediaItem.from_dict(it) for it in raw_items]
+        total_media_size_bytes = data.get("total_media_size_bytes", 0)
+
+        # Backward compatibility: synthesize media_items from media if not provided
+        if not media_items and media is not None:
+            media_items = [
+                MediaItem(
+                    index=0,
+                    media_type="VIDEO" if "video" in (media.mime_type or "video/mp4") else "IMAGE",
+                    file_name=media.file_name,
+                    mime_type=media.mime_type,
+                    drive_file_id=media.drive_file_id,
+                    size_bytes=media.size_bytes,
+                    duration_ms=media.duration_ms,
+                    content_hash=media.content_hash,
+                )
+            ]
+            if not total_media_size_bytes:
+                total_media_size_bytes = media.size_bytes
+
         return cls(
             schema_version=schema_version,
             record_revision=record_revision,
@@ -477,6 +577,9 @@ class JobManifest:
             next_retry_at=data.get("next_retry_at"),
             error_message=data.get("error_message"),
             media=media,
+            post_type=post_type,
+            media_items=media_items,
+            total_media_size_bytes=total_media_size_bytes,
             stages=stages,
             stage_details=stage_details,
             artifacts=artifacts,
@@ -617,6 +720,12 @@ def fold_transitions(
             st = StageStatus(t.payload.get("status", StageStatus.SUCCEEDED.value))
             if "media" in t.payload:
                 manifest.media = MediaInfo.from_dict(t.payload["media"])
+            if "media_items" in t.payload:
+                manifest.media_items = [MediaItem.from_dict(m) for m in t.payload["media_items"]]
+            if "post_type" in t.payload:
+                manifest.post_type = t.payload["post_type"]
+            if "total_media_size_bytes" in t.payload:
+                manifest.total_media_size_bytes = t.payload["total_media_size_bytes"]
             manifest.stages.acquisition = st
             manifest.record_stage_update("acquisition", st, now_ms=t.created_at)
         elif t.transition_type == TransitionType.AUDIO_EXTRACTED:

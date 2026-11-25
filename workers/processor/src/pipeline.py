@@ -301,8 +301,15 @@ class CloudProcessingPipeline:
             payload: Dict[str, Any] = {"status": status.value}
             if artifact:
                 payload["artifact"] = artifact.to_dict()
-            if stage == "acquisition" and job.media:
-                payload["media"] = asdict(job.media) if hasattr(job.media, "__dataclass_fields__") else {}
+            if stage == "acquisition":
+                if job.media:
+                    payload["media"] = asdict(job.media) if hasattr(job.media, "__dataclass_fields__") else {}
+                if job.media_items:
+                    payload["media_items"] = [it.to_dict() for it in job.media_items]
+                if job.post_type:
+                    payload["post_type"] = job.post_type
+                if job.total_media_size_bytes:
+                    payload["total_media_size_bytes"] = job.total_media_size_bytes
             elif stage == "transcription" and job.results.transcript:
                 payload["transcript"] = job.results.transcript
                 payload["transcript_model"] = job.results.transcript_model
@@ -578,7 +585,7 @@ class CloudProcessingPipeline:
                                 logger.warning("Aborting job %s: worker lease lost before media upload", job.item_id)
                                 return False
                             media_hash = compute_file_sha256(dl_res.media_path)
-                            logger.info("Uploading acquired media to persistent storage (sha256=%s)...", media_hash)
+                            logger.info("Uploading acquired primary media to persistent storage (sha256=%s)...", media_hash)
                             drive_file_id = self.storage.upload_media(
                                 local_media_path=dl_res.media_path,
                                 item_id=job.item_id,
@@ -600,6 +607,29 @@ class CloudProcessingPipeline:
                                 duration_ms=dl_res.duration_ms,
                                 content_hash=media_hash,
                             )
+                            job.post_type = dl_res.post_type.value
+                            job.media_items = dl_res.media_items
+                            job.total_media_size_bytes = dl_res.total_size_bytes or dl_res.size_bytes
+
+                            # Upload additional carousel items if present
+                            for m in job.media_items:
+                                if m.index == 0 or m.file_name == job.media.file_name:
+                                    m.drive_file_id = drive_file_id
+                                else:
+                                    m_path = job_dir / m.file_name
+                                    if m_path.exists():
+                                        m_hash = compute_file_sha256(m_path)
+                                        m_drive_id = self.storage.upload_media(
+                                            local_media_path=m_path,
+                                            item_id=job.item_id,
+                                            mime_type=m.mime_type,
+                                            original_file_name=m.file_name,
+                                            content_hash=m_hash,
+                                            generation=job.generation,
+                                            attempt_epoch=active_epoch,
+                                        )
+                                        m.drive_file_id = m_drive_id
+
                             if not job.caption and dl_res.caption:
                                 job.caption = dl_res.caption
                             local_media_path = dl_res.media_path
@@ -669,7 +699,17 @@ class CloudProcessingPipeline:
                             return False
 
                 # 1. Media Retrieval & Audio Extraction
-                if job.media is None:
+                has_video_items = any(m.media_type == "VIDEO" for m in job.media_items) if job.media_items else (bool(job.media and "video" in (job.media.mime_type or "video/mp4").lower()))
+
+                if not has_video_items:
+                    logger.info("Job %s has no video media items (image-only post); skipping audio extraction and transcription", job.item_id)
+                    if job.stages.audio_extraction != StageStatus.SUCCEEDED and job.stages.audio_extraction != StageStatus.SKIPPED:
+                        if not self._update_stage(job, "audio_extraction", StageStatus.SKIPPED):
+                            return False
+                    if job.stages.transcription != StageStatus.SUCCEEDED and job.stages.transcription != StageStatus.SKIPPED:
+                        if not self._update_stage(job, "transcription", StageStatus.SKIPPED):
+                            return False
+                elif job.media is None:
                     if job.stages.audio_extraction == StageStatus.PENDING:
                         if not self._update_stage(job, "audio_extraction", StageStatus.SKIPPED):
                             return False
@@ -760,28 +800,41 @@ class CloudProcessingPipeline:
                             return False
 
                 # 1b. On-Screen Visual Text (OCR) Extraction
-                if local_media_path and local_media_path.exists() and not job.results.ocr_text:
+                if not job.results.ocr_text:
                     if not self._heartbeat(job):
                         logger.warning("Aborting job %s: lost lease before OCR extraction", job.item_id)
                         return False
+                    ocr_outcome = None
                     try:
-                        ocr_outcome = self.ocr_extractor.extract(
-                            local_media_path,
-                            job_dir,
-                            is_cancelled=self._is_cancelled,
-                        )
-                    except TypeError as te:
-                        if "is_cancelled" in str(te):
-                            ocr_outcome = self.ocr_extractor.extract(
-                                local_media_path,
+                        if job.media_items and len(job.media_items) > 1:
+                            logger.info("Running carousel OCR across %d items for %s", len(job.media_items), job.item_id)
+                            ocr_outcome = self.ocr_extractor.extract_carousel(
+                                job.media_items,
                                 job_dir,
+                                is_cancelled=self._is_cancelled,
                             )
-                        else:
-                            raise
+                        elif local_media_path and local_media_path.exists():
+                            try:
+                                ocr_outcome = self.ocr_extractor.extract(
+                                    local_media_path,
+                                    job_dir,
+                                    is_cancelled=self._is_cancelled,
+                                )
+                            except TypeError as te:
+                                if "is_cancelled" in str(te):
+                                    ocr_outcome = self.ocr_extractor.extract(
+                                        local_media_path,
+                                        job_dir,
+                                    )
+                                else:
+                                    raise
+                    except Exception as e:
+                        logger.warning("Error during OCR extraction on job %s: %s", job.item_id, e)
+
                     if self._is_cancelled(job):
                         logger.warning("Aborting job %s: worker lease lost during OCR extraction", job.item_id)
                         return False
-                    if ocr_outcome.text:
+                    if ocr_outcome and ocr_outcome.text:
                         logger.info("Extracted %d chars of visual on-screen text via OCR", len(ocr_outcome.text))
                         job.results.ocr_text = ocr_outcome.text
                         if not self._update_stage(job, "ocr", StageStatus.SUCCEEDED):
@@ -835,7 +888,7 @@ class CloudProcessingPipeline:
                     bool(t and t.strip())
                     for t in [job.results.transcript, job.caption, job.user_notes, job.results.ocr_text]
                 )
-                if job.media is None and not usable_text:
+                if job.media is None and not job.media_items and not usable_text:
                     logger.info(
                         "Job %s has no media, caption, notes, or OCR text; manual input required",
                         job.item_id,
@@ -861,15 +914,33 @@ class CloudProcessingPipeline:
                     caption = job.caption
                     notes = job.user_notes
 
-                    ai_res = self.gemini_analyzer.analyze(
-                        title=title,
-                        caption=caption,
-                        transcript=transcript_text,
-                        notes=notes,
-                        ocr_text=job.results.ocr_text,
-                        category=job.category,
-                        user_tags=job.user_tags,
-                    )
+                    image_paths = []
+                    if job.media_items:
+                        image_paths = [job_dir / m.file_name for m in job.media_items if m.media_type == "IMAGE" and (job_dir / m.file_name).exists()]
+                    elif local_media_path and local_media_path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                        image_paths = [local_media_path]
+
+                    try:
+                        ai_res = self.gemini_analyzer.analyze(
+                            title=title,
+                            caption=caption,
+                            transcript=transcript_text,
+                            notes=notes,
+                            ocr_text=job.results.ocr_text,
+                            category=job.category,
+                            user_tags=job.user_tags,
+                            image_paths=image_paths if image_paths else None,
+                        )
+                    except TypeError:
+                        ai_res = self.gemini_analyzer.analyze(
+                            title=title,
+                            caption=caption,
+                            transcript=transcript_text,
+                            notes=notes,
+                            ocr_text=job.results.ocr_text,
+                            category=job.category,
+                            user_tags=job.user_tags,
+                        )
                     if self._is_cancelled(job):
                         logger.warning("Aborting job %s: worker lease lost during Gemini analysis", job.item_id)
                         return False
@@ -911,6 +982,7 @@ class CloudProcessingPipeline:
                 has_acquisition_settled = (
                     job.stages.acquisition in (StageStatus.SUCCEEDED, StageStatus.SKIPPED)
                     or job.media is not None
+                    or len(job.media_items) > 0
                 )
                 has_audio_settled = (
                     job.stages.audio_extraction in (StageStatus.SUCCEEDED, StageStatus.SKIPPED)

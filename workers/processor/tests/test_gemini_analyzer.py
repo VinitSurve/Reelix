@@ -315,6 +315,57 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertEqual(self.analyzer.max_retries, mock_urlopen.call_count)
         self.assertEqual(self.analyzer.max_retries - 1, mock_sleep.call_count)
 
+    @patch("urllib.request.urlopen")
+    def test_multimodal_image_analysis_payload(self, mock_urlopen):
+        from pathlib import Path
+        import tempfile
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            img_path = Path(td) / "test_slide.jpg"
+            img = Image.new("RGB", (200, 200), color="blue")
+            img.save(img_path, format="JPEG")
+
+            mock_resp = MagicMock()
+            expected_json = {
+                "summary": "Slide shows AI concepts",
+                "detailed_summary": "Slide-by-slide interpretation",
+                "main_topic": "AI",
+                "category": "Tech",
+                "keywords": ["ai"],
+                "tags": ["tech"],
+                "key_takeaways": ["Takeaway 1"],
+                "important_concepts": ["Concept 1"],
+                "actionable_steps": ["Step 1"],
+            }
+            gemini_payload = {
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps(expected_json)}]}}
+                ]
+            }
+            mock_resp.read.return_value = json.dumps(gemini_payload).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            res = self.analyzer.analyze(
+                caption="Testing multimodal carousel",
+                ocr_text="Slide 1: AI Intro",
+                image_paths=[img_path],
+            )
+            self.assertTrue(res.success)
+            self.assertEqual(res.result.main_topic, "AI")
+            self.assertEqual(mock_urlopen.call_count, 1)
+
+            # Inspect payload sent to urllib
+            req_arg = mock_urlopen.call_args[0][0]
+            sent_payload = json.loads(req_arg.data.decode("utf-8"))
+            contents = sent_payload["contents"][0]["parts"]
+            # First part is inlineData for image
+            self.assertIn("inlineData", contents[0])
+            self.assertEqual(contents[0]["inlineData"]["mimeType"], "image/jpeg")
+            # Second part is text prompt
+            self.assertIn("text", contents[1])
+
 
 if __name__ == "__main__":
     unittest.main()
